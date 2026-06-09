@@ -3,7 +3,7 @@
 /**
  * consulta-estoque.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Servidor HTTP standalone para consulta de itens PARADOS em estoque:
+ * Servidor HTTP standalone para consulta de itens em estoque:
  *   • Estoque mínimo 5 unidades
  *   • Sem filtro de ano de venda
  *   • Descrição NÃO contém palavras de config.json → proibidos
@@ -473,7 +473,7 @@ async function carregarItens() {
     _carregando  = true;
     _erroConexao = null;
 
-    logTs("Conectando ao banco: " + FDB_HOST + ":" + FDB_PATH);
+    logTs("Conectando ao banco: " + _cfgVivo.fbHost + ":" + _cfgVivo.fbPath);
 
     return new Promise(resolve => {
         Firebird.attach({
@@ -738,6 +738,12 @@ function gerarHTML() {
   --hdr-h:57px;--ctrl-h:67px;--stats-h:28px
 }
 body{font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--txt);font-size:14px;min-height:100vh}
+
+/* ─ USER CONFING ─────────────────────────────────────────────────────────────── */
+th.th-est {padding: 0 5px;}
+th.th-prc {padding: 0 22px;}
+th.th-bar {padding: 0 14px;}
+th.th-desc {padding: 0 11px;}
 
 /* ─ HEADER ─────────────────────────────────────────────────────────────── */
 .hdr{background:var(--bg2);border-bottom:1px solid var(--brd);padding:10px 20px;
@@ -1914,8 +1920,7 @@ function renderTabela() {
         tw.innerHTML =
             '<div class="msg">' +
             '<h3>Nenhum item encontrado</h3>' +
-            '<p>N\u00e3o h\u00e1 itens com estoque positivo, sem venda em ' + _S.anoAtual +
-            ' e fora da lista de proibidos.</p></div>';
+            '<p>N\u00e3o h\u00e1 itens com estoque positivo fora da lista de proibidos.</p></div>';
         if (stats) stats.innerHTML = "0 itens";
         return;
     }
@@ -1931,19 +1936,19 @@ function renderTabela() {
     var nUso = _nUsadosVis; // já calculado em filtrar() — sem filter() extra sobre _vis
     if (stats) {
         var s = "<strong>" + nVis + "</strong> iten" + (nVis === 1 ? "" : "s") + " vis\u00edv" + (nVis === 1 ? "el" : "eis");
-    s += " &nbsp;&bull;&nbsp; <strong>" + _itens.length + "</strong> no banco";
-    if (nUso > 0) {
-        s += ' &nbsp;&bull;&nbsp; <span style="color:var(--uso-txt)">' + nUso + ' usados</span>';
-    }
-    if (temPrc) {
-        if (acimaAtivo()) {
-            s += ' &nbsp;&bull;&nbsp; <span style="color:var(--grn)">R$' + prcN.toFixed(2).replace(".",",") + ' a R$' + (prcN+40).toFixed(2).replace(".",",") + '</span>';
-        } else {
-            s += ' &nbsp;&bull;&nbsp; <span style="color:var(--grn)">=\u00a0R$' + prcN.toFixed(2).replace(".",",") + ' (exato)</span>';
+        s += " &nbsp;&bull;&nbsp; <strong>" + _itens.length + "</strong> no banco";
+        if (nUso > 0) {
+            s += ' &nbsp;&bull;&nbsp; <span style="color:var(--uso-txt)">' + nUso + ' usados</span>';
         }
-        if (gruparAtivo()) s += ' &nbsp;&bull;&nbsp; <span style="color:var(--acc)">agrupamento ativo</span>';
-    }
-    stats.innerHTML = s;
+        if (temPrc) {
+            if (acimaAtivo()) {
+                s += ' &nbsp;&bull;&nbsp; <span style="color:var(--grn)">R$' + prcN.toFixed(2).replace(".",",") + ' a R$' + (prcN+40).toFixed(2).replace(".",",") + '</span>';
+            } else {
+                s += ' &nbsp;&bull;&nbsp; <span style="color:var(--grn)">=\u00a0R$' + prcN.toFixed(2).replace(".",",") + ' (exato)</span>';
+            }
+            if (gruparAtivo()) s += ' &nbsp;&bull;&nbsp; <span style="color:var(--acc)">agrupamento ativo</span>';
+        }
+        stats.innerHTML = s;
     }
 
     // Sem resultados após filtro
@@ -2356,18 +2361,42 @@ function _cfgGetVal(id) {
     return el ? el.value : '';
 }
 
-function _carregarConfigs() {
-    var st = document.getElementById('cfgStatus');
+function _carregarConfigs(tentativa) {
+    var MAX_TENT = 3;
+    tentativa = (typeof tentativa === 'number' && tentativa > 0) ? tentativa : 1;
+
+    var st  = document.getElementById('cfgStatus');
     var btn = document.getElementById('cfgSalvarBtn');
-    if (st)  { st.textContent = 'Carregando...'; st.className = 'cfg-status'; }
+    if (st)  { st.textContent = tentativa > 1 ? ('Tentativa ' + tentativa + ' de ' + MAX_TENT + '...') : 'Carregando...'; st.className = 'cfg-status'; }
     if (btn) btn.disabled = true;
 
     apiFetch('/api/config').then(function(r) {
-        if (btn) btn.disabled = false;
-        if (!r || !r.ok) {
+        // Falha de rede (servidor nao respondeu) — tenta novamente com backoff linear
+        if (!r) {
+            if (tentativa < MAX_TENT) {
+                if (st) st.textContent = 'Sem resposta, aguardando... (' + tentativa + '/' + MAX_TENT + ')';
+                setTimeout(function() { _carregarConfigs(tentativa + 1); }, 600 * tentativa);
+                return;
+            }
+            // Esgotou tentativas — exibe botao de retry manual
+            if (btn) btn.disabled = false;
+            if (st) {
+                st.className = 'cfg-status er';
+                st.innerHTML = 'Servidor n\u00e3o respondeu. ' +
+                    '<button class="btn btn-s btn-sm" style="margin-left:8px;padding:2px 10px;font-size:11px" ' +
+                    'onclick="_carregarConfigs(1)">Tentar novamente</button>';
+            }
+            return;
+        }
+        // Resposta com erro HTTP
+        if (!r.ok) {
+            if (btn) btn.disabled = false;
             if (st) { st.textContent = 'Erro ao carregar configura\u00e7\u00f5es.'; st.className = 'cfg-status er'; }
             return;
         }
+
+        if (btn) btn.disabled = false;
+
         // Preenche os campos com os valores atuais
         _cfgSetVal('cfgFbHost',  r.fbHost       || '');
         _cfgSetVal('cfgFbPort',  r.fbPort       != null ? r.fbPort  : '');
@@ -2529,14 +2558,33 @@ function lerBody(req, maxBytes) {
 // SERVIDOR HTTP
 // ─────────────────────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-    const urlParsed = new URL(req.url || "/", "http://localhost:" + PORTA);
-    const rota      = urlParsed.pathname;
+    // URL parsing fora do try/catch principal causa unhandled async rejection se req.url
+    // for malformado — Node.js aborta a conexao TCP e o browser recebe "Failed to fetch".
+    // Tratado em bloco proprio para garantir resposta em qualquer cenario.
+    let urlParsed, rota;
+    try {
+        urlParsed = new URL(req.url || "/", "http://localhost:" + PORTA);
+        rota = urlParsed.pathname;
+    } catch (_) {
+        if (!res.headersSent) {
+            res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+            res.end("Bad Request");
+        }
+        return;
+    }
 
-    // Segurança: evita headers duplicados
+    // Segurança: evita headers duplicados + protege JSON.stringify contra campos nao-serializaveis
     const json = (data, status) => {
         if (res.headersSent) return;
+        let body;
+        try {
+            body = typeof data === "string" ? data : JSON.stringify(data);
+        } catch (e) {
+            body = JSON.stringify({ ok: false, erro: "Serializacao falhou: " + String(e.message || e) });
+            status = 500;
+        }
         res.writeHead(status || 200, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(typeof data === "string" ? data : JSON.stringify(data));
+        res.end(body);
     };
     const erro = (msg, status) => json({ ok: false, erro: msg }, status || 500);
 

@@ -1,12 +1,12 @@
 @echo off
 chcp 65001 > nul
-title Consulta Estoque Parado
+title Consulta Estoque
 
 cd /d "%~dp0"
 
 echo.
 echo  ================================================
-echo   Consulta de Estoque Parado
+echo   Consulta de Estoque
 echo   Porta: 7888
 echo  ================================================
 echo.
