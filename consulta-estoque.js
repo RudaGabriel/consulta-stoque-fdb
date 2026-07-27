@@ -2,31 +2,35 @@
 
 /**
  * consulta-estoque.js
- * ─────────────────────────────────────────────────────────────────────────────
- * Servidor HTTP standalone para consulta de itens em estoque:
- *   • Estoque mínimo 5 unidades
- *   • Sem filtro de ano de venda
- *   • Descrição NÃO contém palavras de config.json → proibidos
- *   • Ordenado: maior estoque primeiro
- *   • Limite: até 2000 itens únicos
  *
- * Recursos da interface:
- *   • Busca por descrição (filtro instantâneo)
- *   • Busca por faixa de preço: [valor-5, valor+40] → indica itens com
- *     desconto potencial para o valor que o cliente tem disponível
- *   • Botão "Usar" por item → move para o final da fila (persiste em
- *     usados-estoque.json entre reinicializações)
- *   • Botão "Resetar usados" → limpa toda a fila de usados
- *   • Botão "Atualizar" → recarrega dados frescos do banco
+ * @version 5.17.0
+ * @changelog
+ *   5.17.0 - 2026-07-25 - BUG REAL corrigido: alerta "código não existe
+ *     mais no banco" disparava para códigos que EXISTEM e têm estoque
+ *     real, quando o código digitado na lista personalizada tinha MENOS
+ *     de 5 dígitos (ex.: "8883" em vez de "08883"). Causa: as correções
+ *     anteriores (v5.11.0/v5.12.0) só sabiam REMOVER zeros à esquerda pra
+ *     comparar formas — nunca ACRESCENTAR. Como a regra de negócio deste
+ *     catálogo é códigos sempre com exatamente 5 dígitos (7403 -> 07403,
+ *     703 -> 00703, 8883 -> 08883), um código digitado mais curto nunca
+ *     gerava a variante de busca preenchida, então a consulta dedicada
+ *     nunca tentava "08883" — só "8883", que não existe no banco assim.
+ *     Nova função _codigoPadrao5Digitos() (servidor) /
+ *     _codigoPadrao5DigitosCliente() (cliente) preenche com zeros à
+ *     esquerda até completar 5 dígitos; usada tanto na consulta dedicada
+ *     quanto na reconciliação de resultado (servidor) e no fallback de
+ *     matching do pool do Modo Automático (cliente). Mantidas as duas
+ *     formas de normalização anteriores (sem-zeros) como buscas
+ *     adicionais, para não regredir casos já cobertos antes.
  *
+ * Servidor de relatório de estoque disponível (Firebird + Node.js).
  * NÃO depende de gerar-relatorio-html.js nem servidor-relatorio.js.
  * Lê config.json apenas para: fbHost, fdbPath, proibidos, appName.
- * Porta padrão: 7735 (configurável via config.json → portaEstoque)
+ * Porta padrão: 7888 (configurável via config.json → portaEstoque)
  *
  * Para iniciar:
  *   node consulta-estoque.js
  *   Acesse: http://localhost:7888
- * ─────────────────────────────────────────────────────────────────────────────
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,22 +56,37 @@ const http = require("http");
 // ─────────────────────────────────────────────────────────────────────────────
 const CONFIG_PATH = path.join(__dirname, "config.json");
 const USADOS_PATH = path.join(__dirname, "usados-estoque.json");
+const LISTA_PERSONALIZADA_PATH = path.join(__dirname, "lista-personalizada.json");
 const ANO_ATUAL   = new Date().getFullYear();
 const MAX_ITENS   = 2000;
+const LIMITE_SESSAO_BUSCA = 1000; // itens por "sessão" de busca estendida (Modo Automático) — evita travar o navegador
+const SQL_LIMIT_BRUTO     = 200000; // teto do SELECT FIRST — muito acima do maxItens configurável (máx 5000)
+                                     // pra garantir que o banco devolva o catálogo inteiro de uma vez
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UTILITÁRIOS
 // ─────────────────────────────────────────────────────────────────────────────
 function p2(n) { return String(n).padStart(2, "0"); }
 
-function logTs(msg) {
+// nivel: 'info' (default, stdout) | 'erro' (stderr — convenção Unix, permite
+// redirecionar/monitorar erros separadamente do log normal, ex:
+// `node consulta-estoque.js 2>erros.log`). Retrocompatível: chamadas
+// existentes sem o 2º argumento continuam indo para stdout como sempre.
+function logTs(msg, nivel) {
     const d = new Date();
-    process.stdout.write(
-        "[" + p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds()) + "] " +
-        String(msg) + "\n"
-    );
+    const linha = "[" + p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds()) + "] " +
+        String(msg) + "\n";
+    if (nivel === "erro") process.stderr.write(linha);
+    else process.stdout.write(linha);
 }
+// Atalho semântico para logTs(msg, "erro") — usar ao logar falhas reais.
+function logErro(msg) { logTs(msg, "erro"); }
 
+// NOTA (achado #1 da revisão 2026-07-11): idêntica a esc() (linha ~2796, dentro
+// do <script> client-side). Não são duplicação por descuido — escH() roda no
+// processo Node (server-side) e esc() roda no browser; sem bundler/import entre
+// os dois runtimes, cada lado precisa da própria cópia. Se corrigir um bug de
+// escaping aqui, replicar em esc() também.
 function escH(s) {
     return String(s == null ? "" : s)
         .replace(/&/g,  "&amp;")
@@ -138,8 +157,13 @@ const PORTA = (() => {
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DETECÇÃO DO FDB (mesma lógica do servidor-relatorio.js)
+// DETECÇÃO DO FDB
+// Prioridade: (1) FDB local no disco, (2) config.json, (3) scan de rede na
+// subnet local pela porta Firebird (3050) — resultado é salvo no config.json
+// para que o próximo startup não precise escanear novamente.
 // ─────────────────────────────────────────────────────────────────────────────
+const net = require("net");
+
 function detectarFdb() {
     const pf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
     const pf   = process.env["ProgramFiles"]      || "C:\\Program Files";
@@ -160,20 +184,136 @@ function detectarFdb() {
             }
         } catch (_) {}
     }
-    // Fallback via config.json (se existir na mesma pasta)
+
+    // Tenta ler o caminho da .FDB do INI do SmallSoft (evita hardcode do path)
+    const iniCandidatos = [
+        pf86 + "\\SmallSoft\\Small Commerce\\Small.ini",
+        pf86 + "\\SmallSoft\\Small Commerce\\SmallCommerce.ini",
+        pf   + "\\SmallSoft\\Small Commerce\\Small.ini",
+        "C:\\SmallSoft\\Small Commerce\\Small.ini"
+    ];
+    let fdbPathDoIni = null;
+    for (const ini of iniCandidatos) {
+        try {
+            const iniText = fs.readFileSync(ini, "utf8");
+            const m = iniText.match(/(?:Database|Banco|FDB)\s*=\s*([^\r\n]+)/i);
+            if (m && m[1].trim().toUpperCase().endsWith(".FDB")) {
+                fdbPathDoIni = m[1].trim();
+                logTs("FDB path lido do INI: " + fdbPathDoIni);
+                break;
+            }
+        } catch (_) {}
+    }
+
+    // config.json prevalece — é a memória da última descoberta bem-sucedida
     if (cfg.fbHost && String(cfg.fbHost).trim()) {
         const host   = String(cfg.fbHost).trim();
-        const dbPath = (cfg.fdbPath && String(cfg.fdbPath).trim())
-            ? String(cfg.fdbPath).trim()
-            : "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB";
+        const dbPath = fdbPathDoIni
+            || (cfg.fdbPath && String(cfg.fdbPath).trim()
+                ? String(cfg.fdbPath).trim()
+                : "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB");
         logTs("FDB via config.json: " + host + ":" + dbPath);
         return { host, dbPath };
     }
-    // Fallback hardcoded (padrao da instalacao — sem config.json)
-    const host   = "192.168.1.65";
-    const dbPath = "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB";
-    logTs("FDB padrao hardcoded: " + host + ":" + dbPath);
+
+    // Nenhuma fonte definida — usa padrão e agenda scan de rede em background.
+    // O scan não bloqueia o startup: o servidor sobe imediatamente com o padrão
+    // e atualizará _cfgVivo + salva no config.json quando encontrar o servidor.
+    const dbPath = fdbPathDoIni
+        || "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB";
+    const host   = "192.168.1.65"; // padrão; scan atualizará se errado
+    logTs("FDB sem config.json — usando padrão: " + host + ":" + dbPath);
     return { host, dbPath };
+}
+
+// Verifica se uma porta TCP está aberta num host, com timeout curto
+function _portaAberta(host, porta, timeoutMs) {
+    return new Promise(function(resolve) {
+        const sock = new net.Socket();
+        var done = false;
+        const fim = function(ok) {
+            if (done) return;
+            done = true;
+            sock.destroy();
+            resolve(ok);
+        };
+        sock.setTimeout(timeoutMs || 400);
+        sock.once("connect", function() { fim(true); });
+        sock.once("timeout", function() { fim(false); });
+        sock.once("error",   function() { fim(false); });
+        sock.connect(porta, host);
+    });
+}
+
+// Escaneia a subnet /24 derivada de um IP local, buscando Firebird na porta dada.
+// Retorna o primeiro IP que responder (ou null).
+async function _escanearSubnet(portaFirebird) {
+    // Descobre o IP local pra montar a base da subnet
+    const { networkInterfaces } = require("os");
+    const ifaces = networkInterfaces();
+    let base = null;
+    for (const nome of Object.keys(ifaces)) {
+        for (const iface of ifaces[nome]) {
+            if (!iface.internal && iface.family === "IPv4") {
+                const partes = iface.address.split(".");
+                base = partes.slice(0, 3).join("."); // ex: "192.168.1"
+                break;
+            }
+        }
+        if (base) break;
+    }
+    if (!base) return null;
+
+    logTs("Scan de rede: procurando Firebird na subnet " + base + ".0/24 porta " + portaFirebird + "...");
+
+    // Varre em lotes de 20 hosts em paralelo pra terminar em ~4s no pior caso
+    const LOTE = 20;
+    for (let inicio = 1; inicio <= 254; inicio += LOTE) {
+        const hosts = [];
+        for (let i = inicio; i < Math.min(inicio + LOTE, 255); i++) {
+            hosts.push(base + "." + i);
+        }
+        const resultados = await Promise.all(hosts.map(h => _portaAberta(h, portaFirebird)));
+        for (let i = 0; i < hosts.length; i++) {
+            if (resultados[i]) {
+                logTs("Firebird encontrado: " + hosts[i] + ":" + portaFirebird);
+                return hosts[i];
+            }
+        }
+    }
+    return null;
+}
+
+// Chamado no startup (e opcionalmente ao falhar uma conexão): tenta descobrir
+// o host Firebird na rede e atualiza _cfgVivo + config.json automaticamente.
+async function autoDetectarHost() {
+    const PORTA_FB = _cfgVivo ? _cfgVivo.fbPort : 3050;
+    const hostEncontrado = await _escanearSubnet(PORTA_FB);
+    if (!hostEncontrado) {
+        logTs("AVISO scan: nenhum host com Firebird encontrado na rede local.");
+        return;
+    }
+    if (_cfgVivo && _cfgVivo.fbHost === hostEncontrado) {
+        logTs("Scan: host já configurado (" + hostEncontrado + ") — sem mudança.");
+        return;
+    }
+    logTs("Scan: atualizando fbHost para " + hostEncontrado);
+    if (_cfgVivo) _cfgVivo.fbHost = hostEncontrado;
+    // Persiste no config.json para não precisar escanear no próximo startup
+    try {
+        let cfgAtual = {};
+        try { cfgAtual = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8").replace(/^\uFEFF/, "")); } catch (_) {}
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(Object.assign({}, cfgAtual, { fbHost: hostEncontrado }), null, 2), "utf8");
+        logTs("config.json atualizado com fbHost=" + hostEncontrado);
+    } catch (e) {
+        logTs("AVISO: falha ao salvar config.json após scan: " + e.message);
+    }
+    // Recarrega com o novo host descoberto
+    if (!_loadLock && !_carregando) {
+        setImmediate(function() {
+            carregarItens().catch(function(e) { logErro("ERRO reload pós-scan: " + (e.message || e)); });
+        });
+    }
 }
 
 const { host: FDB_HOST, dbPath: FDB_PATH } = detectarFdb();
@@ -182,6 +322,10 @@ const { host: FDB_HOST, dbPath: FDB_PATH } = detectarFdb();
 // ESTADO GLOBAL
 // ─────────────────────────────────────────────────────────────────────────────
 let _itensBrutos    = [];               // Itens filtrados e carregados do banco
+let _lpEstoquesReais = {};              // {codigo: {estoque, descricao}} — SOMENTE códigos
+                                         // da lista personalizada, capturados direto de
+                                         // r.rows (ver carregarItens()), sem o corte de
+                                         // maxItens/estoqueMinimo/proibidos.
 let _itensOrdenados = [];               // Fila de exibição: não-usados + usados
 let _usados         = Object.create(null); // { "CODIGO": true }
 let _usadosCount    = 0;               // Contador explícito — evita Object.keys(_usados).length
@@ -192,7 +336,20 @@ let _ultimaAtualiz  = null;
 let _camposLog      = "";
 let _loadLock       = false;            // Previne carregamentos simultâneos
 let _htmlCache      = null;             // Cache do HTML estático — gerado apenas 1 vez
+// ── ESTOQUE ENGINE (embutido) ─────────────────────────────────────────────
+// Antes era lido de estoque-engine.js em runtime via fs.readFileSync — se esse
+// arquivo não fosse copiado junto pro servidor, TODO o Agrupar e o Combinar
+// paravam de funcionar silenciosamente (engine ausente = funções undefined).
+// Essa era a causa real do bug "Agrupar não funciona mais": em qualquer
+// deploy que copiasse só consulta-estoque.js, o require/readFileSync do
+// engine falhava e _engineSrc virava um comentário vazio.
+// Agora o código do engine vive embutido aqui como string, injetado direto
+// no HTML — um único arquivo, zero dependência externa para rodar.
+const _ENGINE_SRC = "/**\n * estoque-engine.js\n *\n * @version 1.3.0\n * @changelog\n *   1.3.0 - 2026-07-10 - Modo Agrupar (encontrarGruposAsync) não funcionava\n *     corretamente com a fase extra de subset-sum (DP) introduzida na v1.1.0.\n *     Revertido para o algoritmo da versão anterior comprovadamente estável\n *     (mesma lógica testada e usada em produção antes da extração para este\n *     módulo): apenas pares e triplas, com índices estritamente crescentes\n *     (a<b / a<b<c — sem duplicar o mesmo conjunto de itens em ordens\n *     diferentes) e limite de candidatos/resultados para nunca travar o\n *     browser. Roda em um único setTimeout (sem chunking multi-fase, sem\n *     necessidade de guard de geração entre fases internas — só no início/\n *     fim, mais simples e com muito menos superfície para bugs). Continua\n *     filtrando por estoqueMinimo/proibidos ANTES de montar os candidatos\n *     (correção que a v1.1.0 trouxe e que continua válida) e mantém a\n *     deduplicação final por assinatura de códigos como trava de segurança.\n *     Efeito colateral aceito: combinações de 4+ itens deixam de ser\n *     buscadas (eram uma tentativa de melhoria que se mostrou não confiável)\n *     — o modo Agrupar volta a cobrir pares e triplas, como na versão que\n *     funcionava.\n *\n * ARQUITETURA:\n *   - UMD wrapper: expõe via module.exports (Node) ou window globals (browser)\n *   - Funções puras: nenhuma lê/escreve globais — toda dependência é parâmetro\n *   - Os únicos \"globals\" usados são o fallback em _ehProibidoCliente e\n *     _termosSemMatch, que aceitam o valor explícito como 1º opção\n *   - encontrarGruposAsync / encontrarCombinacoesComRepeticaoAsync aceitam um\n *     objeto de geração externo e um callback de status opcionais\n *\n * USO NOS TESTES:\n *   const engine = require('./estoque-engine.js');\n *   const { _qtdMaximaDisponivel } = engine;\n *\n * USO NO BROWSER (via script inline pelo servidor):\n *   // Todas as funções ficam globais automaticamente via UMD\n *   _qtdMaximaDisponivel(item, usos, parada, piso);\n */\n\n/* global window, _S, _itens */\n(function (root, factory) {\n    \"use strict\";\n    if (typeof module !== \"undefined\" && module.exports) {\n        // Node.js — require()\n        module.exports = factory();\n    } else {\n        // Browser — expõe tudo como global (igual ao comportamento anterior)\n        var api = factory();\n        for (var k in api) {\n            if (Object.prototype.hasOwnProperty.call(api, k)) root[k] = api[k];\n        }\n    }\n}(typeof globalThis !== \"undefined\" ? globalThis : this, function () {\n    \"use strict\";\n\n    // ── Constantes exportadas ─────────────────────────────────────────────────\n    // Centralizadas aqui para que testes e servidor usem sempre os mesmos valores.\n    var FLOAT_EPS              = 0.005;  // tolerância float (~meio centavo)\n    var FAIXA_COMBINAR         = 40;     // tolerância acima do valor-alvo no modo Combinar\n    var FAIXA_EXCEDENTE_LP     = 99999;  // sentinela \"sem teto\" para busca de excedente\n    var PRECO_SENTINEL_ZERADO  = 0.01;   // preço sentinela de item \"zerado\" no ERP legado\n    var MAX_COMBINAR_RESULTADOS = 20;    // máx. combinações retornadas pelo modo Combinar\n\n    // ── _qtdMaximaDisponivel ──────────────────────────────────────────────────\n    // Quantas unidades de um item ainda podem ser usadas sem violar nenhum\n    // dos três pisos de estoque (parada, mínimo ou zero absoluto).\n    //\n    // Três conceitos de piso, como camadas independentes:\n    //   1. Estoque de parada (estoqueParadaPorCod[codigo]) — prevalece quando definido.\n    //   2. Estoque mínimo (pisoPadrao) — usado quando não há parada específica.\n    //   3. Zero absoluto — trava incondicional; nunca retorna valor que tornaria\n    //      o estoque simulado negativo, mesmo que piso ou dados venham inválidos.\n    function _qtdMaximaDisponivel(item, usosAcumulados, estoqueParadaPorCod, pisoPadrao) {\n        if (!item) return 0;\n        var estoqueAtual = Number(item.estoque || 0);\n        if (!Number.isFinite(estoqueAtual) || estoqueAtual < 0) return 0;\n        var usados = (usosAcumulados && usosAcumulados[item.codigo]) || 0;\n        if (!Number.isFinite(usados) || usados < 0) usados = 0;\n        var limite   = estoqueParadaPorCod ? estoqueParadaPorCod[item.codigo] : null;\n        var pisoBase = (typeof pisoPadrao === \"number\" && Number.isFinite(pisoPadrao)) ? pisoPadrao : 0;\n        var piso     = (limite != null && !isNaN(limite)) ? Number(limite) : pisoBase;\n        if (!Number.isFinite(piso) || piso < 0) piso = 0;\n        var restante = estoqueAtual - usados - piso;\n        return restante > 0 ? Math.floor(restante) : 0;\n    }\n\n    // ── _grupoRespeitaLimites ─────────────────────────────────────────────────\n    // Trava final: verifica se um grupo de itens (podendo repetir códigos)\n    // respeita, código a código, a quantidade máxima calculada por\n    // _qtdMaximaDisponivel. Usado antes de aceitar uma combinação no fallback\n    // de força bruta de _autoEncontrarMelhorComRepeticao.\n    function _grupoRespeitaLimites(grupo, usosAcumulados, estoqueParadaPorCod, pisoPadrao) {\n        if (!grupo || !grupo.length) return true;\n        var contagem = {};\n        var refs     = {};\n        for (var gi = 0; gi < grupo.length; gi++) {\n            var cod = grupo[gi].codigo;\n            contagem[cod] = (contagem[cod] || 0) + 1;\n            refs[cod] = grupo[gi];\n        }\n        for (var cod2 in contagem) {\n            if (!Object.prototype.hasOwnProperty.call(contagem, cod2)) continue;\n            if (contagem[cod2] > _qtdMaximaDisponivel(refs[cod2], usosAcumulados, estoqueParadaPorCod, pisoPadrao)) {\n                return false;\n            }\n        }\n        return true;\n    }\n\n    // ── _autoEncontrarMelhor (modo padrão — sem repetição de código) ──────────\n    // Busca em 4 fases: item exato → par exato → tripla exata → melhor match\n    // em [valor, valor+40]. Nunca usa o mesmo código mais de uma vez.\n    function _autoEncontrarMelhor(disponiveis, valor, faixaExtra) {\n        if (!valor || valor <= 0 || !disponiveis || !disponiveis.length) return null;\n        var _extra  = (typeof faixaExtra === \"number\" && faixaExtra >= 0) ? faixaExtra : 0;\n        var EPS     = FLOAT_EPS;\n        var alvoMax = valor + 40 + _extra;\n        var candsExatos = [];\n        var candsFaixa  = [];\n        for (var _ci = 0; _ci < disponiveis.length; _ci++) {\n            var _item = disponiveis[_ci];\n            var _cp   = Number(_item.preco || 0);\n            if (_cp <= 0) continue;\n            _item._p = _cp;\n            if (_cp <= alvoMax + EPS) {\n                candsFaixa.push(_item);\n                if (_cp <= valor + EPS) candsExatos.push(_item);\n            }\n        }\n        if (!candsFaixa.length) return null;\n\n        // Fase 1: item único exato\n        for (var _f1 = 0; _f1 < candsExatos.length; _f1++) {\n            if (Math.abs(candsExatos[_f1]._p - valor) <= EPS) {\n                return { itens: [candsExatos[_f1]], soma: +candsExatos[_f1]._p.toFixed(2), diff: 0 };\n            }\n        }\n\n        // Mapa preço→itens (centavos) para lookup O(1) de complemento\n        var _precoMap = Object.create(null);\n        for (var _pmi = 0; _pmi < candsExatos.length; _pmi++) {\n            var _pKey = Math.round(candsExatos[_pmi]._p * 100);\n            if (!_precoMap[_pKey]) _precoMap[_pKey] = [];\n            _precoMap[_pKey].push(candsExatos[_pmi]);\n        }\n\n        // Fase 2: par exato\n        for (var _f2 = 0; _f2 < candsExatos.length; _f2++) {\n            var _pa2  = candsExatos[_f2]._p;\n            var _pb2  = valor - _pa2;\n            if (_pb2 <= EPS) continue;\n            var _lista2 = _precoMap[Math.round(_pb2 * 100)];\n            if (!_lista2) continue;\n            for (var _li2 = 0; _li2 < _lista2.length; _li2++) {\n                if (_lista2[_li2].codigo === candsExatos[_f2].codigo) continue;\n                var _soma2 = _pa2 + _lista2[_li2]._p;\n                if (Math.abs(_soma2 - valor) <= EPS) {\n                    return { itens: [candsExatos[_f2], _lista2[_li2]], soma: +_soma2.toFixed(2), diff: 0 };\n                }\n            }\n        }\n\n        // Fase 3: tripla exata (O(n²) + hash para 3º)\n        var _tripCands = candsExatos.filter(function(i) { return i._p < valor - EPS; });\n        if (_tripCands.length > 200) _tripCands = _tripCands.slice(0, 200);\n        outer3ex:\n        for (var _a3 = 0; _a3 < _tripCands.length; _a3++) {\n            var _pa3 = _tripCands[_a3]._p;\n            for (var _b3 = _a3 + 1; _b3 < _tripCands.length; _b3++) {\n                var _ab3 = _pa3 + _tripCands[_b3]._p;\n                if (_ab3 >= valor - EPS) continue;\n                var _lista3 = _precoMap[Math.round((valor - _ab3) * 100)];\n                if (!_lista3) continue;\n                for (var _li3 = 0; _li3 < _lista3.length; _li3++) {\n                    var _c3 = _lista3[_li3];\n                    if (_c3.codigo === _tripCands[_a3].codigo || _c3.codigo === _tripCands[_b3].codigo) continue;\n                    var _soma3 = _ab3 + _c3._p;\n                    if (Math.abs(_soma3 - valor) <= EPS) {\n                        return { itens: [_tripCands[_a3], _tripCands[_b3], _c3], soma: +_soma3.toFixed(2), diff: 0 };\n                    }\n                }\n            }\n        }\n\n        // Fase 4: melhor match em [valor, valor+40]\n        candsFaixa.sort(function(a, b) { return Math.abs(a._p - valor) - Math.abs(b._p - valor); });\n        if (candsFaixa.length > 80) candsFaixa = candsFaixa.slice(0, 80);\n        var _melhor = null;\n        function _atualizar(grupo, soma) {\n            var diff = +(soma - valor).toFixed(2);\n            if (diff < -EPS || diff > 40 + _extra + EPS) return;\n            if (!_melhor || diff < _melhor.diff) {\n                _melhor = { itens: grupo.slice(), soma: +soma.toFixed(2), diff: diff };\n            }\n        }\n        for (var _s4 = 0; _s4 < candsFaixa.length; _s4++) {\n            _atualizar([candsFaixa[_s4]], candsFaixa[_s4]._p);\n            if (_melhor && _melhor.diff < EPS) return _melhor;\n        }\n        outer2f:\n        for (var _a4 = 0; _a4 < candsFaixa.length; _a4++) {\n            for (var _b4 = _a4 + 1; _b4 < candsFaixa.length; _b4++) {\n                var _s2f = candsFaixa[_a4]._p + candsFaixa[_b4]._p;\n                if (_s2f > alvoMax + EPS) continue;\n                _atualizar([candsFaixa[_a4], candsFaixa[_b4]], _s2f);\n                if (_melhor && _melhor.diff < EPS) break outer2f;\n            }\n        }\n        if (_melhor && _melhor.diff < EPS) return _melhor;\n        outer3f:\n        for (var _a5 = 0; _a5 < candsFaixa.length; _a5++) {\n            var _pa5 = candsFaixa[_a5]._p;\n            for (var _b5 = _a5 + 1; _b5 < candsFaixa.length; _b5++) {\n                var _ab5 = _pa5 + candsFaixa[_b5]._p;\n                if (_ab5 > alvoMax + EPS) continue;\n                for (var _c5 = _b5 + 1; _c5 < candsFaixa.length; _c5++) {\n                    var _s3f = _ab5 + candsFaixa[_c5]._p;\n                    if (_s3f > alvoMax + EPS) continue;\n                    _atualizar([candsFaixa[_a5], candsFaixa[_b5], candsFaixa[_c5]], _s3f);\n                    if (_melhor && _melhor.diff < EPS) break outer3f;\n                }\n            }\n        }\n        return _melhor;\n    }\n\n    // ── _autoEncontrarMelhorComRepeticao (lista personalizada / Combinar) ─────\n    // DP bounded-knapsack via binary splitting + fallback de força bruta.\n    // O mesmo item pode aparecer mais de uma vez, nunca ultrapassando\n    // _qtdMaximaDisponivel(item, usosAcumulados, estoqueParadaPorCod, pisoPadrao).\n    function _autoEncontrarMelhorComRepeticao(pool, valor, faixaExtra, usosAcumulados, estoqueParadaPorCod, pisoPadrao) {\n        usosAcumulados      = usosAcumulados      || {};\n        estoqueParadaPorCod = estoqueParadaPorCod || {};\n        if (!valor || valor <= 0 || !pool || !pool.length) return null;\n        var _extra  = (typeof faixaExtra === \"number\" && faixaExtra >= 0) ? faixaExtra : 0;\n        var EPS     = FLOAT_EPS;\n        var alvoMax = valor + 40 + _extra;\n\n        var cands = [];\n        for (var _ci = 0; _ci < pool.length; _ci++) {\n            var _cp = Number(pool[_ci].preco || 0);\n            if (_cp > 0 && _qtdMaximaDisponivel(pool[_ci], usosAcumulados, estoqueParadaPorCod, pisoPadrao) > 0) {\n                cands.push(pool[_ci]);\n            }\n        }\n        if (!cands.length) return null;\n        if (cands.length > 30) cands = cands.slice(0, 30);\n\n        // Teto do DP exato (bounded-knapsack). Acima disso o custo O(moedas×cents)\n        // fica caro demais para rodar síncrono no meio de _buscarProxima — nesses\n        // casos (valores altos) cai no fallback guloso logo abaixo, que sempre\n        // consegue formar uma soma (ainda que não ótima) somando vários itens.\n        var DP_MAX_CENTS = 120000; // R$1200 — antes 60000 (R$600), por isso valores\n                                    // altos nunca eram encontrados: o DP nem rodava\n                                    // e o força-bruta antigo (máx. 4 itens) raramente\n                                    // alcança somas grandes.\n        var alvoCents   = Math.round(valor * 100);\n        var maxCents    = Math.round(alvoMax * 100);\n\n        if (alvoCents > 0 && maxCents > 0 && maxCents <= DP_MAX_CENTS) {\n            var moedas = [];\n            for (var _pc = 0; _pc < cands.length; _pc++) {\n                var _precoC  = Math.round(Number(cands[_pc].preco) * 100);\n                if (_precoC <= 0 || _precoC > maxCents) continue;\n                var _limQtd  = _qtdMaximaDisponivel(cands[_pc], usosAcumulados, estoqueParadaPorCod, pisoPadrao);\n                if (_limQtd <= 0) continue;\n                var _restQtd = _limQtd;\n                var _bloco   = 1;\n                while (_restQtd > 0) {\n                    var _qtdBloco = Math.min(_bloco, _restQtd);\n                    moedas.push({ item: cands[_pc], qtd: _qtdBloco, custo: _precoC * _qtdBloco });\n                    _restQtd -= _qtdBloco;\n                    _bloco   *= 2;\n                }\n            }\n            if (moedas.length > 150) moedas = moedas.slice(0, 150);\n\n            if (moedas.length) {\n                var dp = new Array(maxCents + 1);\n                for (var _zi = 0; _zi <= maxCents; _zi++) dp[_zi] = null;\n                dp[0] = { count: 0, lastMoeda: -1, prevV: -1 };\n                for (var mIdx = 0; mIdx < moedas.length; mIdx++) {\n                    var moeda = moedas[mIdx];\n                    for (var v = maxCents; v >= moeda.custo; v--) {\n                        if (dp[v - moeda.custo]) {\n                            var cnt = dp[v - moeda.custo].count + moeda.qtd;\n                            if (!dp[v] || cnt < dp[v].count) {\n                                dp[v] = { count: cnt, lastMoeda: mIdx, prevV: v - moeda.custo };\n                            }\n                        }\n                    }\n                }\n                var melhorV = dp[alvoCents] ? alvoCents : -1;\n                if (melhorV < 0) {\n                    for (var v2 = alvoCents + 1; v2 <= maxCents; v2++) {\n                        if (dp[v2]) { melhorV = v2; break; }\n                    }\n                }\n                if (melhorV >= 0) {\n                    var itensResult = [];\n                    var cur = melhorV;\n                    var _guard = 0;\n                    while (cur > 0 && dp[cur] && _guard < 5000) {\n                        var _mu = moedas[dp[cur].lastMoeda];\n                        for (var _rep = 0; _rep < _mu.qtd; _rep++) itensResult.push(_mu.item);\n                        cur = dp[cur].prevV;\n                        _guard++;\n                    }\n                    if (itensResult.length) {\n                        var sf = melhorV / 100;\n                        return { itens: itensResult, soma: +sf.toFixed(2), diff: +(sf - valor).toFixed(2) };\n                    }\n                }\n            }\n        }\n\n        // ── Fallback guloso (valores acima do teto do DP, ex: DP_MAX_CENTS) ──────\n        // Para valores altos o força-bruta abaixo (até 4 itens) quase nunca alcança\n        // a soma-alvo — por isso \"valores altos nunca eram achados\". O guloso monta\n        // a combinação item a item (maior preço que ainda cabe primeiro), respeitando\n        // _qtdMaximaDisponivel a cada passo, até cair dentro de [valor, valor+faixa]\n        // ou esgotar candidatos. Não é sempre a soma ótima, mas encontra uma\n        // combinação válida onde o DP e o força-bruta de poucos itens falhavam.\n        if (maxCents > DP_MAX_CENTS) {\n            var _usosG = {};\n            for (var _ug in usosAcumulados) if (Object.prototype.hasOwnProperty.call(usosAcumulados, _ug)) _usosG[_ug] = usosAcumulados[_ug];\n            var _gulosos = cands.slice().sort(function(x, y) { return Number(y.preco) - Number(x.preco); });\n            var _somaG = 0;\n            var _itensG = [];\n            var _guardG = 0;\n            var _restanteCents = maxCents;\n            while (_restanteCents > 0 && _guardG < 2000) {\n                _guardG++;\n                var _achouAlgum = false;\n                for (var _gi = 0; _gi < _gulosos.length; _gi++) {\n                    var _git = _gulosos[_gi];\n                    var _gpc = Math.round(Number(_git.preco) * 100);\n                    if (_gpc <= 0 || _gpc > _restanteCents) continue;\n                    if (_qtdMaximaDisponivel(_git, _usosG, estoqueParadaPorCod, pisoPadrao) <= 0) continue;\n                    _itensG.push(_git);\n                    _usosG[_git.codigo] = (_usosG[_git.codigo] || 0) + 1;\n                    _somaG += _gpc;\n                    _restanteCents = maxCents - _somaG;\n                    _achouAlgum = true;\n                    if (_somaG >= alvoCents) break;\n                    break; // reavalia do maior candidato novamente (limites de qtd mudam)\n                }\n                if (!_achouAlgum) break;\n                if (_somaG >= alvoCents) break;\n            }\n            if (_itensG.length && _somaG >= alvoCents - EPS * 100 && _somaG <= maxCents + EPS * 100) {\n                var sfG = _somaG / 100;\n                return { itens: _itensG, soma: +sfG.toFixed(2), diff: +(sfG - valor).toFixed(2) };\n            }\n            // Não fechou dentro da faixa com o guloso — cai para o força-bruta\n            // abaixo, que ainda pode achar uma combinação pequena e exata.\n        }\n\n        // Fallback força bruta (até 4 itens, com repetição)\n        var sorted = cands.slice().sort(function(x, y) { return Number(x.preco) - Number(y.preco); });\n        var n = sorted.length;\n        var precos = sorted.map(function(i) { return Number(i.preco); });\n        var _melhorR = null;\n        function _atualizarR(grupo, soma) {\n            var diff = +(soma - valor).toFixed(2);\n            if (diff < -EPS || diff > 40 + _extra + EPS) return;\n            if (!_grupoRespeitaLimites(grupo, usosAcumulados, estoqueParadaPorCod, pisoPadrao)) return;\n            if (!_melhorR || diff < _melhorR.diff) {\n                _melhorR = { itens: grupo.slice(), soma: +soma.toFixed(2), diff: diff };\n            }\n        }\n        for (var s1 = 0; s1 < n; s1++) {\n            if (precos[s1] > alvoMax + EPS) break;\n            _atualizarR([sorted[s1]], precos[s1]);\n            if (_melhorR && _melhorR.diff < EPS) return _melhorR;\n        }\n        for (var a2 = 0; a2 < n; a2++) {\n            if (precos[a2] > alvoMax + EPS) break;\n            for (var b2 = a2; b2 < n; b2++) {\n                var s2 = precos[a2] + precos[b2];\n                if (s2 > alvoMax + EPS) break;\n                _atualizarR([sorted[a2], sorted[b2]], s2);\n                if (_melhorR && _melhorR.diff < EPS) return _melhorR;\n            }\n        }\n        for (var a3 = 0; a3 < n; a3++) {\n            if (precos[a3] > alvoMax + EPS) break;\n            for (var b3 = a3; b3 < n; b3++) {\n                var ab3 = precos[a3] + precos[b3];\n                if (ab3 > alvoMax + EPS) break;\n                for (var c3 = b3; c3 < n; c3++) {\n                    var s3 = ab3 + precos[c3];\n                    if (s3 > alvoMax + EPS) break;\n                    _atualizarR([sorted[a3], sorted[b3], sorted[c3]], s3);\n                    if (_melhorR && _melhorR.diff < EPS) return _melhorR;\n                }\n            }\n        }\n        for (var a4 = 0; a4 < n; a4++) {\n            if (precos[a4] > alvoMax + EPS) break;\n            for (var b4 = a4; b4 < n; b4++) {\n                var ab4 = precos[a4] + precos[b4];\n                if (ab4 > alvoMax + EPS) break;\n                for (var c4 = b4; c4 < n; c4++) {\n                    var abc4 = ab4 + precos[c4];\n                    if (abc4 > alvoMax + EPS) break;\n                    for (var d4 = c4; d4 < n; d4++) {\n                        var s4 = abc4 + precos[d4];\n                        if (s4 > alvoMax + EPS) break;\n                        _atualizarR([sorted[a4], sorted[b4], sorted[c4], sorted[d4]], s4);\n                        if (_melhorR && _melhorR.diff < EPS) return _melhorR;\n                    }\n                }\n            }\n        }\n        return _melhorR;\n    }\n\n    // ── _ehProibidoCliente ────────────────────────────────────────────────────\n    // Verifica se a descrição de um item contém termo da lista de proibidos.\n    // Aceita as listas explicitamente (preferido nos testes); como fallback\n    // em contexto browser lê window._S se as listas não forem fornecidas.\n    function _ehProibidoCliente(descricao, proibidosEmbutidos, proibidosExtra) {\n        if (!descricao) return false;\n        var upper = String(descricao).toUpperCase();\n        /* global window, _S */\n        var lista  = proibidosEmbutidos != null ? proibidosEmbutidos\n                   : (typeof _S !== \"undefined\" && _S.proibidosEmbutidos ? _S.proibidosEmbutidos : []);\n        var extras = proibidosExtra != null ? proibidosExtra\n                   : (typeof _S !== \"undefined\" && _S.proibidosExtra    ? _S.proibidosExtra    : []);\n        for (var i = 0; i < lista.length; i++) {\n            if (lista[i] && upper.indexOf(String(lista[i]).toUpperCase()) !== -1) return true;\n        }\n        for (var j = 0; j < extras.length; j++) {\n            if (extras[j] && upper.indexOf(String(extras[j]).toUpperCase()) !== -1) return true;\n        }\n        return false;\n    }\n\n    // ── _validarResultadoPadrao ───────────────────────────────────────────────\n    // Camada defensiva: rejeita resultado que viola código duplicado, estoque\n    // mínimo ou itens proibidos. Aceita listas de proibidos explicitamente\n    // (para testes determinísticos) com fallback para globais no browser.\n    function _validarResultadoPadrao(resultado, estoqueMinimo, usosAcumulados, pisoPadrao, proibidosEmbutidos, proibidosExtra) {\n        if (!resultado || !resultado.itens || !resultado.itens.length) return null;\n        var permiteRepeticao = !!usosAcumulados;\n        var vistos = Object.create(null);\n        for (var i = 0; i < resultado.itens.length; i++) {\n            var it = resultado.itens[i];\n            if (vistos[it.codigo] && !permiteRepeticao) return null;\n            vistos[it.codigo] = true;\n            if (Number(it.estoque || 0) < Number(estoqueMinimo || 0)) return null;\n            if (_ehProibidoCliente(it.descricao, proibidosEmbutidos, proibidosExtra)) return null;\n        }\n        if (permiteRepeticao && !_grupoRespeitaLimites(resultado.itens, usosAcumulados, null, pisoPadrao)) {\n            return null;\n        }\n        return resultado;\n    }\n\n    // ── _validarResultadoLista ────────────────────────────────────────────────\n    // Equivalente de _validarResultadoPadrao para a lista personalizada.\n    // Não verifica proibidos/estoqueMinimo (by design — lista personalizada\n    // é escolha manual do usuário). Só verifica piso de estoque/zero absoluto.\n    function _validarResultadoLista(resultado, usosAcumulados, estoqueParadaPorCod) {\n        if (!resultado || !resultado.itens || !resultado.itens.length) return null;\n        if (!_grupoRespeitaLimites(resultado.itens, usosAcumulados, estoqueParadaPorCod)) {\n            return null;\n        }\n        return resultado;\n    }\n\n    // ── _formatarCodigosCompactado ────────────────────────────────────────────\n    // Agrupa itens repetidos: [\"A\",\"A\",\"B\"] → \"2*A B\"\n    function _formatarCodigosCompactado(itens) {\n        var contagem = {};\n        var ordem    = [];\n        itens.forEach(function(it) {\n            if (!contagem[it.codigo]) { contagem[it.codigo] = 0; ordem.push(it.codigo); }\n            contagem[it.codigo]++;\n        });\n        return ordem.map(function(cod) {\n            return contagem[cod] > 1 ? (contagem[cod] + \"*\" + cod) : cod;\n        }).join(\" \");\n    }\n\n    // ── _diffTermosFaltantes ──────────────────────────────────────────────────\n    // Subtração O(termos) usando um Set já calculado — evita re-varrer _itens.\n    function _diffTermosFaltantes(termos, encontradosSet) {\n        if (!encontradosSet) return termos;\n        return termos.filter(function(t) { return !encontradosSet.has(t); });\n    }\n\n    // ── _itemBateAlgumTermo ───────────────────────────────────────────────────\n    // Verdadeiro se o item bate com qualquer termo (union search).\n    function _itemBateAlgumTermo(it, termos) {\n        for (var i = 0; i < termos.length; i++) {\n            var t = termos[i];\n            if (it._descUp.indexOf(t) !== -1 || it._codUp.indexOf(t) !== -1 || it._barUp.indexOf(t) !== -1) {\n                return true;\n            }\n        }\n        return false;\n    }\n\n    // ── _termosSemMatch ───────────────────────────────────────────────────────\n    // Quais termos não têm nenhum item correspondente em itensArr.\n    // Aceita itensArr explícito (testes) ou faz fallback para o global _itens.\n    function _termosSemMatch(termos, itensArr) {\n        /* global _itens */\n        var catalogo = itensArr != null ? itensArr\n                     : (typeof _itens !== \"undefined\" ? _itens : []);\n        return termos.filter(function(termo) {\n            for (var i = 0; i < catalogo.length; i++) {\n                var it = catalogo[i];\n                if (it._descUp.indexOf(termo) !== -1 || it._codUp.indexOf(termo) !== -1 || it._barUp.indexOf(termo) !== -1) {\n                    return false;\n                }\n            }\n            return true;\n        });\n    }\n\n    // ── encontrarGruposAsync ──────────────────────────────────────────────────\n    // Combinações de 2-3 itens DISTINTOS que somam ao valor-alvo (modo Agrupar).\n    // Algoritmo restaurado da versão anterior comprovadamente estável (ver\n    // changelog v1.3.0): pares e triplas com índices estritamente crescentes\n    // (a<b / a<b<c — nunca repete o mesmo conjunto de itens em ordem\n    // diferente), rodando em UM ÚNICO setTimeout (sem chunking multi-fase).\n    // gen: objeto { valor: number } — incrementar cancela resultado tardio.\n    // onStatus: callback opcional (msg) para atualizar UI sem referência a DOM.\n    // cfg (opcional, 6º parâmetro): { estoqueMinimo, proibidosEmbutidos, proibidosExtra, maxResultados }\n    //   - estoqueMinimo: piso de estoque que cada item candidato deve respeitar (default 0)\n    //   - proibidosEmbutidos/proibidosExtra: listas repassadas para _ehProibidoCliente\n    //   - maxResultados: quantos grupos retornar no máximo (default 20)\n    function encontrarGruposAsync(itens, valor, onDone, gen, onStatus, cfg) {\n        if (!itens || !itens.length || !valor || valor <= 0) { if (onDone) onDone([]); return; }\n        cfg = cfg || {};\n        var estoqueMinimo      = typeof cfg.estoqueMinimo   === \"number\" ? cfg.estoqueMinimo   : 0;\n        var proibidosEmbutidos = cfg.proibidosEmbutidos != null ? cfg.proibidosEmbutidos : null;\n        var proibidosExtra     = cfg.proibidosExtra     != null ? cfg.proibidosExtra     : null;\n        var maxResultados      = typeof cfg.maxResultados === \"number\" ? cfg.maxResultados : 20;\n        var minhaGen = gen ? gen.valor++ : null; // guarda geração atual antes de incrementar\n\n        var alvoMin = valor;\n        var alvoMax = valor + FAIXA_COMBINAR;\n        var EPS     = FLOAT_EPS;\n\n        setTimeout(function() {\n            // Descarta resultado obsoleto: uma busca mais nova já foi disparada\n            // enquanto esta esperava o setTimeout (gen.valor mudou nesse meio-tempo).\n            if (gen && minhaGen !== null && gen.valor - 1 !== minhaGen) { return; }\n            if (onStatus) onStatus(\"Calculando combinações...\");\n\n            // Candidatos: preço válido dentro da faixa, não usado, estoque mínimo\n            // respeitado e não proibido — tudo filtrado ANTES de montar pares/triplas.\n            var cands = itens.filter(function(it) {\n                var p = Number(it.preco || 0);\n                if (!(p > PRECO_SENTINEL_ZERADO && p <= alvoMax + EPS && !it.usado)) return false;\n                if (Number(it.estoque || 0) < estoqueMinimo) return false;\n                if (_ehProibidoCliente(it.descricao, proibidosEmbutidos, proibidosExtra)) return false;\n                return true;\n            });\n            // Limita candidatos para não explodir O(n³) nas triplas\n            if (cands.length > 250) cands = cands.slice(0, 250);\n\n            // Pré-extrai preços numéricos uma única vez (evita Number() repetido nos loops internos)\n            var precos = new Array(cands.length);\n            for (var _pi = 0; _pi < cands.length; _pi++) precos[_pi] = Number(cands[_pi].preco);\n\n            var grupos  = [];\n            var LIMITE  = Math.max(maxResultados, 30); // teto de coleta antes de ordenar/cortar\n\n            // ── Pares — índices estritamente crescentes (a<b): cada conjunto\n            //    {A,B} é gerado UMA única vez, nunca como (A,B) e depois (B,A). ──\n            for (var a = 0; a < cands.length && grupos.length < LIMITE; a++) {\n                var pa = precos[a];\n                for (var b = a + 1; b < cands.length && grupos.length < LIMITE; b++) {\n                    var soma2 = pa + precos[b];\n                    if (soma2 >= alvoMin - EPS && soma2 <= alvoMax + EPS) {\n                        grupos.push({ itens: [cands[a], cands[b]], soma: +soma2.toFixed(2), diff: +(soma2 - valor).toFixed(2) });\n                    }\n                }\n            }\n\n            // ── Triplas — apenas se ainda precisamos de mais grupos; índices\n            //    estritamente crescentes (a<b<c) pela mesma razão dos pares. ──\n            if (grupos.length < LIMITE) {\n                for (var a2 = 0; a2 < cands.length && grupos.length < LIMITE; a2++) {\n                    var pa2 = precos[a2];\n                    if (pa2 >= alvoMax + EPS) continue;\n                    for (var b2 = a2 + 1; b2 < cands.length && grupos.length < LIMITE; b2++) {\n                        var ab2 = pa2 + precos[b2];\n                        if (ab2 >= alvoMax + EPS) continue;\n                        for (var c2 = b2 + 1; c2 < cands.length && grupos.length < LIMITE; c2++) {\n                            var soma3 = ab2 + precos[c2];\n                            if (soma3 >= alvoMin - EPS && soma3 <= alvoMax + EPS) {\n                                grupos.push({ itens: [cands[a2], cands[b2], cands[c2]], soma: +soma3.toFixed(2), diff: +(soma3 - valor).toFixed(2) });\n                            }\n                        }\n                    }\n                }\n            }\n\n            // ── Deduplicação por assinatura ────────────────────────────────────\n            // Trava de segurança extra: mesmo com índices crescentes já evitando\n            // permutações do mesmo conjunto, garante 1 card por combinação\n            // distinta de itens (assinatura = códigos ordenados, não a ordem\n            // de inserção — {A,B} e {B,A} colapsam na mesma chave).\n            var vistos       = Object.create(null);\n            var gruposUnicos = [];\n            for (var gi = 0; gi < grupos.length; gi++) {\n                var cods = [];\n                for (var ci = 0; ci < grupos[gi].itens.length; ci++) cods.push(String(grupos[gi].itens[ci].codigo));\n                cods.sort();\n                var assinatura = cods.join(\"|\");\n                if (vistos[assinatura]) continue;\n                vistos[assinatura] = true;\n                gruposUnicos.push(grupos[gi]);\n            }\n\n            if (onStatus) onStatus(\"\");\n\n            // Ordena do mais próximo ao valor-alvo usando transformação de\n            // Schwartzian: pré-computa Math.abs uma única vez por elemento.\n            var resultado = gruposUnicos\n                .map(function(g) { return { g: g, d: Math.abs(g.soma - valor) }; })\n                .sort(function(x, y) { return x.d - y.d; })\n                .slice(0, maxResultados)\n                .map(function(x) { return x.g; });\n            if (onDone) onDone(resultado);\n        }, 0);\n    }\n\n    // ── encontrarCombinacoesComRepeticaoAsync ─────────────────────────────────\n    // Modo Combinar: mesmo item pode aparecer múltiplas vezes (qtd×item).\n    // gen: objeto { valor: number } — incrementar cancela resultado tardio.\n    // onStatus: callback opcional (msg) em vez de document.getElementById.\n    function encontrarCombinacoesComRepeticaoAsync(itens, valor, onDone, cfg) {\n        cfg = cfg || {};\n        var estoqueMinimo   = typeof cfg.estoqueMinimo   === \"number\" ? cfg.estoqueMinimo   : 0;\n        var maxResultados   = typeof cfg.maxResultados   === \"number\" ? cfg.maxResultados   : MAX_COMBINAR_RESULTADOS;\n        var faixaCombinar   = typeof cfg.faixaCombinar   === \"number\" ? cfg.faixaCombinar   : FAIXA_COMBINAR;\n        var precoSentinel   = typeof cfg.precoSentinel   === \"number\" ? cfg.precoSentinel   : PRECO_SENTINEL_ZERADO;\n        var onStatus        = typeof cfg.onStatus        === \"function\" ? cfg.onStatus      : null;\n        var gen             = cfg.gen || null;\n        var minhaGen        = gen ? gen.valor++ : null;\n\n        if (!itens || !itens.length || !valor || valor <= 0) { if (onDone) onDone([]); return; }\n        if (onStatus) onStatus(\"Calculando...\");\n\n        var pool = itens.filter(function(it) {\n            return Number(it.preco || 0) > precoSentinel && Number(it.estoque || 0) > 0 && !it.usado;\n        });\n\n        var usosSimulados = {};\n        var resultados    = [];\n\n        function _buscarProxima() {\n            if (gen && minhaGen !== null && gen.valor - 1 !== minhaGen) return;\n            if (resultados.length >= maxResultados) { _entregar(); return; }\n\n            var poolAtual = pool.filter(function(it) {\n                return (Number(it.estoque || 0) - (usosSimulados[it.codigo] || 0) - estoqueMinimo) > 0;\n            });\n            if (!poolAtual.length) { _entregar(); return; }\n\n            var resultado = _autoEncontrarMelhorComRepeticao(poolAtual, valor, faixaCombinar, usosSimulados, null, estoqueMinimo);\n            if (!resultado || !resultado.itens || !resultado.itens.length) { _entregar(); return; }\n\n            resultado.itens.forEach(function(it) {\n                usosSimulados[it.codigo] = (usosSimulados[it.codigo] || 0) + 1;\n            });\n            resultados.push(resultado);\n            setTimeout(_buscarProxima, 0);\n        }\n\n        function _entregar() {\n            if (gen && minhaGen !== null && gen.valor - 1 !== minhaGen) return;\n            if (onStatus) {\n                var n = resultados.length;\n                onStatus(n ? n + \" combinação\" + (n > 1 ? \"ões\" : \"\") + \" encontrada\" + (n > 1 ? \"s\" : \"\") : \"\");\n            }\n            if (onDone) onDone(resultados);\n        }\n\n        setTimeout(_buscarProxima, 0);\n    }\n\n    // ── API pública ───────────────────────────────────────────────────────────\n    return {\n        // Constantes\n        FLOAT_EPS              : FLOAT_EPS,\n        FAIXA_COMBINAR         : FAIXA_COMBINAR,\n        FAIXA_EXCEDENTE_LP     : FAIXA_EXCEDENTE_LP,\n        PRECO_SENTINEL_ZERADO  : PRECO_SENTINEL_ZERADO,\n        MAX_COMBINAR_RESULTADOS: MAX_COMBINAR_RESULTADOS,\n        // Funções puras de estoque\n        _qtdMaximaDisponivel               : _qtdMaximaDisponivel,\n        _grupoRespeitaLimites              : _grupoRespeitaLimites,\n        _autoEncontrarMelhor               : _autoEncontrarMelhor,\n        _autoEncontrarMelhorComRepeticao   : _autoEncontrarMelhorComRepeticao,\n        _ehProibidoCliente                 : _ehProibidoCliente,\n        _validarResultadoPadrao            : _validarResultadoPadrao,\n        _validarResultadoLista             : _validarResultadoLista,\n        _formatarCodigosCompactado         : _formatarCodigosCompactado,\n        _diffTermosFaltantes               : _diffTermosFaltantes,\n        _itemBateAlgumTermo                : _itemBateAlgumTermo,\n        _termosSemMatch                    : _termosSemMatch,\n        // Funções assíncronas de busca\n        encontrarGruposAsync                        : encontrarGruposAsync,\n        encontrarCombinacoesComRepeticaoAsync        : encontrarCombinacoesComRepeticaoAsync\n    };\n}));";
 let _itensAbaixoMin = 0;               // Itens abaixo do estoqueMinimo incluídos p/ completar a lista
+let _catalogoCompleto = [];            // TODOS os itens válidos do banco (sem o corte de maxItens) —
+                                        // populado a cada carregarItens(), usado pela busca estendida
+let _catalogoCursor   = 0;             // próximo índice de _catalogoCompleto a servir numa "sessão" de busca estendida
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG MUTÁVEL EM RUNTIME (/api/config aplica sem reiniciar, exceto porta e nome)
@@ -206,6 +363,7 @@ let _cfgVivo = {
     portaEstoque:   PORTA,
     appName:        APP_NAME,
     estoqueMinimo:  (() => { const v = parseFloat(cfg.estoqueMinimo); return (Number.isFinite(v) && v >= 0) ? v : 5; })(),
+    maxItens:       (() => { const v = parseInt(cfg.maxItens || "0", 10); return (v >= 100 && v <= 5000) ? v : MAX_ITENS; })(),
     proibidosExtra: Array.isArray(cfg.proibidos) ? cfg.proibidos.map(p => String(p).trim()) : []
 };
 
@@ -251,16 +409,67 @@ let _salvarTimer = null;
 function salvarUsados() {
     clearTimeout(_salvarTimer);
     _salvarTimer = setTimeout(() => {
-        try {
-            const arr = Object.keys(_usados);
-            fs.writeFileSync(USADOS_PATH, JSON.stringify(arr, null, 2), "utf8");
-        } catch (e) {
-            logTs("AVISO salvarUsados: " + e.message);
-        }
+        const arr = Object.keys(_usados);
+        fs.writeFile(USADOS_PATH, JSON.stringify(arr, null, 2), "utf8", function(e) {
+            if (e) logTs("AVISO salvarUsados: " + e.message);
+        });
     }, 600);
 }
 
 carregarUsados();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PERSISTÊNCIA DA LISTA PERSONALIZADA (modo automático)
+// Mesmo esquema usado para usados-estoque.json: lida uma vez no startup e
+// gravada (com pequeno debounce) a cada alteração feita pelo cliente via
+// POST /api/lista-personalizada — assim ela sobrevive a reinicializações do
+// servidor e a F5 na página, em vez de viver só na memória do navegador.
+// ─────────────────────────────────────────────────────────────────────────────
+let _listaPersonalizada = []; // [{codigo, estoqueParada}, ...] — estoqueParada pode ser null
+
+// Nunca confia cegamente no que vem do disco ou do POST do cliente: valida e
+// normaliza item a item, descartando qualquer entrada malformada em vez de
+// deixar o resto do sistema (parser/HTML) quebrar com dado inesperado.
+function _sanitizarListaPersonalizada(arr) {
+    const MAX_ITENS_LP = 1000;
+    const out = [];
+    if (!Array.isArray(arr)) return out;
+    for (let i = 0; i < arr.length && out.length < MAX_ITENS_LP; i++) {
+        const it = arr[i];
+        if (!it || typeof it !== "object") continue;
+        const codigo = String(it.codigo == null ? "" : it.codigo).trim().slice(0, 50);
+        if (!codigo) continue;
+        let estoqueParada = null;
+        if (it.estoqueParada != null && it.estoqueParada !== "") {
+            const n = Number(it.estoqueParada);
+            if (Number.isFinite(n) && n >= 0) estoqueParada = n;
+        }
+        out.push({ codigo, estoqueParada });
+    }
+    return out;
+}
+
+function carregarListaPersonalizada() {
+    try {
+        const raw = fs.readFileSync(LISTA_PERSONALIZADA_PATH, "utf8").replace(/^\uFEFF/, "");
+        const arr = JSON.parse(raw);
+        _listaPersonalizada = _sanitizarListaPersonalizada(arr);
+        logTs("Lista personalizada carregada: " + _listaPersonalizada.length + " c\u00f3digo(s).");
+    } catch (_) { /* arquivo não existe ainda, OK */ }
+}
+
+let _salvarListaTimer = null;
+function salvarListaPersonalizadaDisco() {
+    clearTimeout(_salvarListaTimer);
+    _salvarListaTimer = setTimeout(() => {
+        const dados = _listaPersonalizada;
+        fs.writeFile(LISTA_PERSONALIZADA_PATH, JSON.stringify(dados, null, 2), "utf8", function(e) {
+            if (e) logTs("AVISO salvarListaPersonalizadaDisco: " + e.message);
+        });
+    }, 600);
+}
+
+carregarListaPersonalizada();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DECODER WINDOWS-1252 (igual ao gerar-relatorio-html.js)
@@ -436,6 +645,48 @@ function toISO(val) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// NORMALIZAR CÓDIGO NUMÉRICO
+// ─────────────────────────────────────────────────────────────────────────────
+// Alguns bancos guardam o código de produto como coluna NUMÉRICA (INTEGER/
+// BIGINT), não texto. Nesse caso, CAST(colCod AS VARCHAR) perde qualquer zero
+// à esquerda que o usuário tenha digitado ao cadastrar na lista personalizada
+// (ex.: "04567" no cadastro vira "4567" ao vir do banco) — uma comparação de
+// string exata (WHERE ... IN ('04567')) nunca bate contra "4567", fazendo um
+// código que existe e tem estoque parecer "excluído do banco". Esta função
+// normaliza um código puramente numérico removendo os zeros à esquerda, pra
+// permitir comparar as duas formas como equivalentes. Retorna null se o
+// código não é só dígitos (ex.: contém letras) — nesse caso não há
+// ambiguidade de zero à esquerda a resolver.
+function _normalizarCodigoNumerico(codigo) {
+    const s = String(codigo == null ? "" : codigo).trim();
+    if (!/^\d+$/.test(s)) return null;
+    const semZeros = s.replace(/^0+/, "");
+    return semZeros === "" ? "0" : semZeros; // "000" -> "0", nunca string vazia
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CÓDIGO PADRÃO DE 5 DÍGITOS
+// ─────────────────────────────────────────────────────────────────────────────
+// Regra de negócio confirmada: todo código deste catálogo tem exatamente 5
+// dígitos (ex.: 7403 -> 07403, 703 -> 00703, 8883 -> 08883). Diferente de
+// _normalizarCodigoNumerico() acima (que só REMOVE zeros à esquerda — útil
+// quando o banco tem MENOS dígitos que o digitado), esta função ACRESCENTA
+// zeros à esquerda até completar 5 dígitos — necessária quando o usuário
+// digita o código "encurtado" (sem os zeros de preenchimento) na lista
+// personalizada, mas o banco guarda a forma completa de 5 dígitos. Sem isso,
+// a busca só tentava a forma exata e a mais curta, nunca a preenchida —
+// "8883" nunca virava "08883" na tentativa de busca, gerando falso "código
+// não existe mais no banco" para itens que existem e têm estoque normal.
+// Códigos com 5+ dígitos voltam inalterados (nada a preencher). Retorna null
+// se não é só dígitos (mesma regra de _normalizarCodigoNumerico).
+function _codigoPadrao5Digitos(codigo) {
+    const s = String(codigo == null ? "" : codigo).trim();
+    if (!/^\d+$/.test(s)) return null;
+    if (s.length >= 5) return s;
+    return "0".repeat(5 - s.length) + s;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // VERIFICAR PROIBIDOS
 // ─────────────────────────────────────────────────────────────────────────────
 function ehProibido(descricao) {
@@ -476,23 +727,35 @@ async function carregarItens() {
     logTs("Conectando ao banco: " + _cfgVivo.fbHost + ":" + _cfgVivo.fbPath);
 
     return new Promise(resolve => {
-        Firebird.attach({
-            host:      _cfgVivo.fbHost,
-            port:      _cfgVivo.fbPort,
-            database:  _cfgVivo.fbPath,
-            user:      _cfgVivo.fbUser,
-            password:  _cfgVivo.fbPassword,
-            role:      null,
-            pageSize:  4096,
-            charset:   "UTF8",
-            isolation: Firebird.ISOLATION_READ_COMMITTED
-        }, async (err, db) => {
+        // Por que o try/catch aqui (e não só dentro do callback): se
+        // Firebird.attach() lançar uma excecao SINCRONA (antes de invocar o
+        // callback — ex: config malformada rejeitada pelo driver), o callback
+        // abaixo nunca executa e o lock nunca seria liberado, travando todo
+        // carregamento futuro até reiniciar o servidor manualmente. Esta
+        // camada garante que _loadLock/_carregando SEMPRE são liberados e a
+        // Promise SEMPRE resolve (nunca rejeita) — quem chama carregarItens()
+        // não precisa de .catch() pra garantir esse destravamento.
+        try {
+            Firebird.attach({
+                host:      _cfgVivo.fbHost,
+                port:      _cfgVivo.fbPort,
+                database:  _cfgVivo.fbPath,
+                user:      _cfgVivo.fbUser,
+                password:  _cfgVivo.fbPassword,
+                role:      null,
+                pageSize:  4096,
+                charset:   "UTF8",
+                isolation: Firebird.ISOLATION_READ_COMMITTED
+            }, async (err, db) => {
 
             if (err) {
                 _erroConexao = "Falha na conexão: " + String(err.message || err);
                 _carregando = _loadLock = false;
-                logTs("ERRO: " + _erroConexao);
+                logErro("ERRO: " + _erroConexao);
                 resolve(false);
+                // Agenda scan de rede em background: tenta descobrir um host
+                // Firebird diferente do atual sem travar o fluxo de resolução.
+                setImmediate(function() { autoDetectarHost().catch(function() {}); });
                 return;
             }
 
@@ -581,11 +844,20 @@ async function carregarItens() {
                     logTs("Filtro ATIVO (blacklist N/I/X/F) aplicado na coluna: " + colAtivo);
                 }
 
+                // NOTA DE SEGURANÇA (achado #5 da revisão 2026-07-11): os nomes de
+                // coluna/tabela abaixo (colCod, colDesc, colEst, colAtivo, nomTabela)
+                // são interpolados direto na string SQL — o que pareceria SQL
+                // Injection à primeira vista. Não é: eles vêm de introspecção do
+                // schema do banco feita no boot (função pick(), acima), nunca de
+                // request HTTP/entrada do usuário — e identificadores de coluna/
+                // tabela não são parametrizáveis via "?" no Firebird de qualquer
+                // forma (só valores são). Os VALORES desta query (quando existem
+                // parâmetros de usuário) são corretamente parametrizados via
+                // "params" em tx.query() — ver função query() (Firebird, mais acima).
                 // Busca TODOS os itens do catálogo (estoque >= 0, inclusive zerado).
                 // 3 fases no JS garantem prioridade: est>=5 → est 1-4 → est=0.
-                const limiteBruto = 200000;
                 const sql = [
-                    "SELECT FIRST " + limiteBruto,
+                    "SELECT FIRST " + SQL_LIMIT_BRUTO,
                     "  TRIM(CAST(p." + colCod  + " AS VARCHAR(30)))  AS CODIGO,",
                     "  TRIM(CAST(p." + colDesc + " AS VARCHAR(120))) AS DESCRICAO,",
                     "  "  + selBar  + " AS CODBARRAS,",
@@ -601,12 +873,113 @@ async function carregarItens() {
 
                 logTs("Executando consulta de estoque disponivel...");
                 const r = await query(db, sql, [], 120000);
+
+                // Consulta DEDICADA aos códigos da lista personalizada, SEM o filtro
+                // "estoque >= 0" da query principal — só assim dá pra diferenciar
+                // "chegou a zero" de "está negativado" (o ERP pode permitir estoque
+                // negativo em alguns fluxos, ex.: venda antes da entrada no sistema)
+                // de "não existe mais no banco" (produto excluído/renomeado). A query
+                // principal, como já filtra >=0, NUNCA vê uma linha com estoque
+                // negativo — pra ela, "negativo" e "excluído" são indistinguíveis
+                // (nenhum dos dois aparece em r.rows). Roda na mesma conexão, antes
+                // do detach; falha aqui NUNCA derruba o carregamento principal —
+                // best-effort, o alerta cai pro fallback "não encontrado" se essa
+                // consulta falhar.
+                //
+                // FIX (2026-07-22): quando a coluna de código é NUMÉRICA no banco
+                // (INTEGER/BIGINT), CAST(...AS VARCHAR) perde zeros à esquerda — um
+                // código cadastrado como "04567" na lista personalizada vira "4567"
+                // ao vir do banco, e a comparação de string exata nunca batia,
+                // fazendo um item que EXISTE e tem estoque aparecer como "excluído
+                // do banco". Agora a consulta busca as DUAS formas (com e sem
+                // zeros à esquerda) e o resultado é reconciliado de volta pro
+                // código exatamente como foi digitado na lista personalizada — ver
+                // _normalizarCodigoNumerico() e o bloco de reconciliação abaixo.
+                let rLp = { e: null, rows: [] };
+                if (!r.e && _listaPersonalizada.length) {
+                    const _lpCodsOriginais = Array.from(new Set(_listaPersonalizada.map(lp => lp.codigo).filter(Boolean))).slice(0, 500);
+                    const _lpCodsBusca = new Set();
+                    _lpCodsOriginais.forEach(cod => {
+                        _lpCodsBusca.add(cod);
+                        const semZeros = _normalizarCodigoNumerico(cod);
+                        if (semZeros !== null && semZeros !== cod) _lpCodsBusca.add(semZeros);
+                        const padded5 = _codigoPadrao5Digitos(cod);
+                        if (padded5 !== null && padded5 !== cod) _lpCodsBusca.add(padded5);
+                    });
+                    const _lpCodsArr = Array.from(_lpCodsBusca).slice(0, 1000);
+                    if (_lpCodsArr.length) {
+                        const sqlLp = [
+                            "SELECT FIRST " + _lpCodsArr.length,
+                            "  TRIM(CAST(p." + colCod  + " AS VARCHAR(30)))  AS CODIGO,",
+                            "  TRIM(CAST(p." + colDesc + " AS VARCHAR(120))) AS DESCRICAO,",
+                            "  CAST(p." + colEst + " AS DOUBLE PRECISION)   AS ESTOQUE,",
+                            "  "  + selPrc  + " AS PRECO",
+                            "FROM " + nomTabela + " p",
+                            "WHERE TRIM(CAST(p." + colCod + " AS VARCHAR(30))) IN (" + _lpCodsArr.map(() => "?").join(",") + ")"
+                        ].join("\n");
+                        rLp = await query(db, sqlLp, _lpCodsArr, 15000);
+                        if (rLp.e) logErro("ERRO consulta lista personalizada (n\u00e3o-fatal, segue com fallback): " + String(rLp.e.message || rLp.e));
+                    }
+                }
+
                 db.detach();
+
+                // _lpEstoquesReais: {codigo: {estoque, descricao, preco}} — SEMPRE
+                // indexado pelo código EXATAMENTE como está na lista personalizada (é
+                // essa a chave que o cliente usa pra consultar). Reconcilia o
+                // resultado da consulta acima (que pode ter vindo sem zeros à
+                // esquerda, ver FIX 2026-07-22) casando primeiro por igualdade exata
+                // e, se não achar, por forma numérica normalizada. O campo "preco"
+                // (adicionado em 2026-07-22) permite ao Modo Automático montar o pool
+                // de busca da lista personalizada DIRETO daqui, sem depender de
+                // _itens (que é filtrado por proibidos/maxItens/estoqueMinimo) — a
+                // lista personalizada é escolha manual do usuário e não pode ficar
+                // invisível pro próprio Modo Automático por causa de filtros
+                // pensados pra sugestões automáticas.
+                _lpEstoquesReais = {};
+                if (!rLp.e) {
+                    const _porCodigoExato  = new Map();
+                    const _porNormalizado  = new Map(); // chave: sem zeros à esquerda
+                    const _porPadrao5      = new Map(); // chave: preenchido com 5 dígitos
+                    for (const row of rLp.rows) {
+                        const codDB = String(row.CODIGO || "").trim();
+                        if (!codDB || _porCodigoExato.has(codDB)) continue; // primeira ocorrência vence
+                        const est  = Number(row.ESTOQUE != null ? row.ESTOQUE : NaN);
+                        const prc  = Number(row.PRECO   != null ? row.PRECO   : NaN);
+                        const desc = String(row.DESCRICAO || "").trim();
+                        const registro = {
+                            estoque:   Number.isFinite(est) ? Math.round(est * 1000) / 1000 : null,
+                            preco:     Number.isFinite(prc) ? Math.round(prc * 100)  / 100  : null,
+                            descricao: desc || null
+                        };
+                        _porCodigoExato.set(codDB, registro);
+                        const norm = _normalizarCodigoNumerico(codDB);
+                        if (norm !== null && !_porNormalizado.has(norm)) _porNormalizado.set(norm, registro);
+                        const pad5 = _codigoPadrao5Digitos(codDB);
+                        if (pad5 !== null && !_porPadrao5.has(pad5)) _porPadrao5.set(pad5, registro);
+                    }
+                    for (const lp of _listaPersonalizada) {
+                        const cod = lp.codigo;
+                        let registro = _porCodigoExato.get(cod);
+                        if (!registro) {
+                            const pad5 = _codigoPadrao5Digitos(cod);
+                            if (pad5 !== null) registro = _porPadrao5.get(pad5);
+                        }
+                        if (!registro) {
+                            const norm = _normalizarCodigoNumerico(cod);
+                            if (norm !== null) registro = _porNormalizado.get(norm);
+                        }
+                        // Se não achou de nenhuma forma: o código realmente não
+                        // existe no banco — fica de fora de _lpEstoquesReais, e o
+                        // cliente trata isso como "código não existe mais" (correto).
+                        if (registro) _lpEstoquesReais[cod] = registro;
+                    }
+                }
 
                 if (r.e) {
                     _erroConexao = "Erro na consulta: " + String(r.e.message || r.e);
                     _carregando = _loadLock = false;
-                    logTs("ERRO query: " + _erroConexao);
+                    logErro("ERRO query: " + _erroConexao);
                     resolve(false);
                     return;
                 }
@@ -614,25 +987,28 @@ async function carregarItens() {
                 logTs(r.rows.length + " linhas brutas. Filtrando proibidos (3 fases)...");
 
                 // Prioridade: est >= estoqueMinimo (itensAcima).
-                // Se insuficiente para MAX_ITENS, complementa com est < estoqueMinimo (itensAbaixo).
+                // Complementa com est < estoqueMinimo (itensAbaixo) quando necessário
+                // para completar a lista enviada ao cliente.
+                //
+                // IMPORTANTE: o loop varre TODAS as linhas retornadas pela query (sem
+                // parar em maxItens) para construir o catálogo COMPLETO (_catalogoCompleto),
+                // usado depois pela busca estendida do Modo Automático (ver
+                // /api/buscar-mais-itens). A lista normal enviada ao cliente continua
+                // limitada a maxItens, via slice() mais abaixo — isso não muda.
                 const _estMin     = _cfgVivo.estoqueMinimo;
                 const itensAcima  = [];   // est >= _estMin
-                const itensAbaixo = [];   // est <  _estMin (complemento para atingir MAX_ITENS)
+                const itensAbaixo = [];   // est <  _estMin
                 const codigosVistos = new Set();
 
                 for (const row of r.rows) {
-                    // Para quando temos MAX_ITENS acima do mínimo, ou MAX_ITENS no total
-                    if (itensAcima.length >= MAX_ITENS) break;
-                    if (itensAcima.length + itensAbaixo.length >= MAX_ITENS) break;
-
                     const desc = String(row.DESCRICAO || "").trim();
+                    const cod  = String(row.CODIGO || "").trim();
+                    const est  = Number(row.ESTOQUE != null ? row.ESTOQUE : 0);
+
                     if (!desc) continue;
                     if (ehProibido(desc)) continue;
 
-                    const est = Number(row.ESTOQUE != null ? row.ESTOQUE : 0);
                     if (!Number.isFinite(est) || est < 0) continue;
-
-                    const cod = String(row.CODIGO || "").trim();
                     if (!cod) continue;
                     if (codigosVistos.has(cod)) continue;
                     codigosVistos.add(cod);
@@ -650,15 +1026,18 @@ async function carregarItens() {
                     if (est >= _estMin) {
                         itensAcima.push(item);
                     } else {
-                        // Só coleta abaixo do mínimo se ainda precisamos completar a lista
-                        const faltam = MAX_ITENS - itensAcima.length;
-                        if (faltam > 0) itensAbaixo.push(item);
+                        itensAbaixo.push(item);
                     }
                 }
 
-                // Combina: acima do mínimo primeiro, depois os de complemento
-                const _nAcima  = itensAcima.length;
-                const itens    = itensAcima.concat(itensAbaixo).slice(0, MAX_ITENS);
+                // Combina: acima do mínimo primeiro, depois os de complemento.
+                // Como a query já ordena por ESTOQUE DESC, todo item de itensAcima
+                // naturalmente vem antes de qualquer item de itensAbaixo — a
+                // concatenação preserva essa ordem sem precisar reordenar.
+                const _nAcima  = Math.min(itensAcima.length, _cfgVivo.maxItens);
+                _catalogoCompleto = itensAcima.concat(itensAbaixo);
+                const itens        = _catalogoCompleto.slice(0, _cfgVivo.maxItens);
+                _catalogoCursor    = itens.length; // busca estendida continua a partir daqui
                 const _nAbaixo = itens.length - _nAcima;
                 _itensAbaixoMin = _nAbaixo;
                 const _nF1     = itens.length;
@@ -667,27 +1046,43 @@ async function carregarItens() {
                 _codigosSet    = new Set(itens.map(i => i.codigo)); // lookup O(1) em marcar-usado
                 _ultimaAtualiz = new Date();
                 reordenarFila();
+                // _lpEstoquesReais já foi calculado acima (consulta dedicada rLp,
+                // antes do db.detach()) — não depende do filtro de proibidos nem do
+                // filtro "estoque >= 0" da query principal, então detecta zerado,
+                // negativado e excluído do ERP corretamente. Ver comentário acima.
                 _carregando = _loadLock = false;
 
                 logTs(
                     "OK: " + _itensBrutos.length + " itens carregados " +
                     "(estq\u2265" + _estMin + ": " + _nAcima +
                     (_nAbaixo > 0 ? ", abaixo do m\u00ednimo: " + _nAbaixo : "") +
-                    "). Usados na fila: " + _usadosCount + "."
+                    "). Usados na fila: " + _usadosCount + ". " +
+                    "Cat\u00e1logo completo: " + _catalogoCompleto.length + " itens (" +
+                    Math.max(0, _catalogoCompleto.length - _catalogoCursor) + " dispon\u00edveis para extens\u00e3o)."
                 );
                 if (!colUltV) {
                     logTs("AVISO: ULTIMAVENDA não encontrada — itens NÃO foram filtrados por ano de venda.");
                 }
                 resolve(true);
+                // Notifica todos os clientes SSE que o catálogo foi atualizado
+                emitirEventoSse("dados", { carregando: false, total: _itensBrutos.length });
 
             } catch (e) {
                 _erroConexao = "Erro inesperado: " + String(e.message || e);
                 try { db.detach(); } catch (_) {}
                 _carregando = _loadLock = false;
-                logTs("ERRO inesperado: " + _erroConexao);
+                logErro("ERRO inesperado: " + _erroConexao);
                 resolve(false);
             }
-        });
+            });
+        } catch (e) {
+            // Firebird.attach() lançou antes de chamar o callback (config
+            // inválida rejeitada pelo driver, etc.) — libera o lock mesmo assim.
+            _erroConexao = "Erro ao iniciar conexão: " + String(e.message || e);
+            _carregando = _loadLock = false;
+            logErro("ERRO: " + _erroConexao);
+            resolve(false);
+        }
     });
 }
 
@@ -702,8 +1097,8 @@ async function carregarItens() {
 //     para não precisar de escaping adicional dentro do template literal do Node.
 // ─────────────────────────────────────────────────────────────────────────────
 function gerarHTML() {
-    // O HTML é estático (APP_NAME, ANO_ATUAL, MAX_ITENS são constantes de startup).
-    // Gera apenas uma vez e retorna o cache nas chamadas subsequentes.
+    // O HTML é gerado sob demanda e cacheado. O cache é invalidado automaticamente
+    // quando configurações como appName, estoqueMinimo ou maxItens mudam em runtime.
     if (_htmlCache) return _htmlCache;
 
     // Objeto de configuração injetado no cliente como JSON.
@@ -712,9 +1107,10 @@ function gerarHTML() {
     const serverCfg = JSON.stringify({
         appName:            APP_NAME,
         anoAtual:           ANO_ATUAL,
-        maxItens:           MAX_ITENS,
+        maxItens:           _cfgVivo.maxItens,
         estoqueMinimo:      _cfgVivo.estoqueMinimo,
-        proibidosEmbutidos: PROIBIDOS_EMBUTIDOS
+        proibidosEmbutidos: PROIBIDOS_EMBUTIDOS,
+        proibidosExtra:     _cfgVivo.proibidosExtra || []
     }).replace(/<\//g, "<\\/");
 
     _htmlCache = `<!DOCTYPE html>
@@ -769,7 +1165,19 @@ input{background:var(--bg2);border:1px solid var(--brd);color:var(--txt);
       padding:6px 10px;border-radius:6px;font-size:13px;outline:none;transition:border-color .18s}
 input:focus{border-color:var(--acc)}
 input[type=number]{width:150px}
-input[type=text]{width:230px}
+input[type=text]{width:150px}
+textarea.busca-multi-ta{background:var(--bg2);border:1px solid var(--brd);color:var(--txt);
+      padding:6px 10px;border-radius:6px;font-size:12px;outline:none;transition:border-color .18s;
+      width:150px;height:62px;resize:vertical;font-family:inherit;line-height:1.4}
+textarea.busca-multi-ta:focus{border-color:var(--acc)}
+.lnk-toggle{background:none;border:none;color:var(--acc);cursor:pointer;padding:3px;
+      margin-left:6px;font-family:inherit;vertical-align:middle;display:inline-flex;
+      align-items:center;justify-content:center;border-radius:4px;flex-shrink:0;
+      transition:color .15s,background-color .15s}
+.lnk-toggle:hover{color:var(--acc2);background:var(--bg2)}
+.lnk-toggle-ativo{color:var(--acc2);background:var(--bg2)}
+.cl-busca{display:flex;align-items:center;max-width:150px;gap:0}
+.cl-busca-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 
 /* ─ BOTÕES ───────────────────────────────────────────────────────────────── */
 .btn{display:inline-flex;align-items:center;gap:5px;padding:6px 13px;border-radius:6px;
@@ -784,15 +1192,33 @@ input[type=text]{width:230px}
 .btn-d:hover:not(:disabled){background:rgba(239,83,80,.2)}
 .btn-usar{background:rgba(78,168,222,.1);color:var(--acc);border-color:rgba(78,168,222,.22)}
 .btn-usar:hover:not(:disabled){background:rgba(78,168,222,.2)}
-.btn-sm{padding:5px 10px;font-size:11px}
+.btn-w{background:rgba(217,119,6,.12);color:#d97706;border-color:rgba(217,119,6,.3)}
+.btn-w:hover:not(:disabled){background:rgba(217,119,6,.22)}
+.btn-sm{padding:6px 10px;font-size:11px}
 
 /* ─ FAIXA DE PREÇO ──────────────────────────────────────────────────────── */
+/* IMPORTANTE (fix 2026-07-09): antes o .prc-box inteiro tinha
+   white-space:nowrap+overflow:hidden+text-overflow:ellipsis, o que truncava
+   o BLOCO TODO como uma unidade só — na prática cortava também o prc-range
+   (o valor em R$, que precisa estar sempre 100% legível). Agora só o
+   prc-hint (texto complementar, ex: "(até +R$40 de tolerância)") pode
+   truncar; prc-range nunca é cortado (flex-shrink:0). O texto completo do
+   hint, mesmo truncado visualmente, fica disponível no atributo title
+   (tooltip ao passar o mouse) — ver atualizarPrcBox(). */
 .prc-box{background:rgba(76,175,80,.08);border:1px solid rgba(76,175,80,.2);
          border-radius:6px;padding:5px 12px;font-size:11px;color:var(--txt2);
-         display:none;align-items:center;gap:6px}
+         display:none;align-items:center;gap:6px;min-width:0;
+         max-width:320px}
 .prc-box.vis{display:flex}
-.prc-range{color:var(--grn);font-weight:700}
-.prc-hint{font-size:10px;color:var(--txt2);font-style:italic}
+#prcBoxWrap{flex-shrink:1;min-width:0;max-width:320px}
+
+/* ─ BOTÃO LIMPAR FILTROS — só aparece quando há filtro ativo ──────────────── */
+#btnLimparFiltros{display:none}
+#btnLimparFiltros.vis{display:inline-flex}
+.prc-range{color:var(--grn);font-weight:700;flex-shrink:0;white-space:nowrap}
+.prc-hint{font-size:10px;color:var(--txt2);font-style:italic;
+          flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+          cursor:default}
 
 /* ─ STATS ────────────────────────────────────────────────────────────────── */
 .stats{background:var(--sur);border-bottom:1px solid var(--brd);padding:5px 20px;
@@ -855,24 +1281,32 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
           margin-right:5px;flex-shrink:0;overflow:visible}
 
 /* ─ TOAST ────────────────────────────────────────────────────────────────── */
-.toast{position:fixed;bottom:22px;right:22px;background:var(--sur2);border:1px solid var(--brd);
+.toast{position:fixed;top:22px;left:22px;background:var(--sur2);border:1px solid var(--brd);
        color:var(--txt);padding:9px 16px;border-radius:8px;font-size:13px;
-       box-shadow:var(--shadow);z-index:9999;opacity:0;transform:translateY(8px);
+       box-shadow:var(--shadow);z-index:9999;opacity:0;transform:translateY(-8px);
        transition:all .22s;pointer-events:none;max-width:320px}
 .toast.on{opacity:1;transform:translateY(0)}
 
 /* ─ MODAL CONFIRM ────────────────────────────────────────────────────────── */
-.modal-ov{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9000;
+/* z-index alto o suficiente para ficar SEMPRE acima de qualquer outro overlay
+   da página (.auto-ov:9100, .cfg-ov:1200, .toast:9999, .btn-top:9000).
+   Antes era 9000 — menor que .auto-ov (9100), por isso o modal de confirmação
+   (ex.: "Itens não encontrados") aparecia ATRÁS do modal do Modo Automático. */
+.modal-ov{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:10000;
   display:flex;align-items:center;justify-content:center;
   opacity:0;transition:opacity .18s;pointer-events:none}
 .modal-ov.on{opacity:1;pointer-events:auto}
 .modal-bx{background:var(--sur);border:1px solid var(--brd);border-radius:10px;
   padding:22px 26px;max-width:380px;width:92%;box-shadow:var(--shadow);
-  transform:translateY(-10px);transition:transform .18s}
-.modal-ov.on .modal-bx{transform:translateY(0)}
-.modal-ttl{font-size:14px;font-weight:700;color:var(--txt);margin-bottom:8px}
-.modal-msg{font-size:13px;color:var(--txt2);line-height:1.6;margin-bottom:18px;white-space:pre-line}
-.modal-ftr{display:flex;justify-content:flex-end;gap:8px}
+  transform:translateY(-10px);transition:transform .18s;
+  max-height:85vh;display:flex;flex-direction:column;overflow-y:auto}
+.modal-ov.on .modal-bx{transform:translateY(0);}
+.modal-ttl{font-size:14px;font-weight:700;color:var(--txt);margin-bottom:8px;flex-shrink:0}
+.modal-msg{font-size:13px;color:var(--txt2);line-height:1.6;margin-bottom:18px;white-space:pre-line;flex-shrink:0}
+.modal-msg-lista{font-size:12.5px;color:var(--txt2);line-height:1.6;margin-bottom:18px;white-space:pre-line;
+  flex-shrink:0;max-height:220px;overflow-y:auto;
+  background:var(--bg3);border:1px solid var(--brd);border-radius:6px;padding:8px 10px}
+.modal-ftr{display:flex;justify-content:flex-end;gap:8px;flex-shrink:0}
 
 /* ─ SCROLLBAR FINA ─────────────────────────────────────────────────────── */
 ::-webkit-scrollbar{width:5px;height:5px}
@@ -954,6 +1388,12 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 .auto-ta-out{width:100%;min-height:180px;background:rgba(76,175,80,.05);border:1px solid rgba(76,175,80,.25);
   color:var(--txt);padding:10px 12px;border-radius:8px;font-family:Consolas,monospace;font-size:12px;
   outline:none;resize:vertical;line-height:1.55;cursor:text}
+/* ─ LISTA PERSONALIZADA (modo automático) ─────────────────────────────────── */
+.auto-ta-lp{width:100%;min-height:70px;background:rgba(78,168,222,.05);border:1px solid rgba(78,168,222,.25);
+  color:var(--txt);padding:9px 11px;border-radius:8px;font-family:Consolas,monospace;font-size:12px;
+  outline:none;resize:vertical;transition:border-color .18s;line-height:1.55;margin-top:8px}
+.auto-ta-lp:focus{border-color:var(--acc)}
+.auto-lp-hint{font-size:10.5px;color:var(--txt3);margin-top:5px;line-height:1.5}
 .auto-ftr{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
 .auto-status{font-size:11px;color:var(--txt2);font-style:italic;flex:1}
 .auto-status.ok{color:var(--grn)}
@@ -962,7 +1402,7 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 .btn-auto:hover:not(:disabled){background:rgba(78,168,222,.22)}
 
 /* ─ TOGGLE SWITCH ──────────────────────────────────────────────────────── */
-.tgl-wrap{display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;padding:6px 10px;background:var(--bg2);border:1px solid var(--brd);border-radius:6px;transition:border-color .18s}
+.tgl-wrap{display:inline-flex;align-items:center;gap:7px;cursor:pointer;user-select:none;padding:6px 10px;background:var(--bg2);border:1px solid var(--brd);border-radius:6px;transition:border-color .18s;vertical-align:middle}
 .tgl-wrap:hover{border-color:var(--acc)}
 .tgl-wrap input{display:none}
 .tgl{width:32px;height:17px;background:var(--brd);border-radius:9px;position:relative;transition:background .2s;flex-shrink:0}
@@ -990,6 +1430,42 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 .grp-total .diff-pos{font-size:10px;color:var(--ora);margin-left:6px}
 .grp-total .diff-neg{font-size:10px;color:var(--grn);margin-left:6px}
 .grp-vazio{padding:16px 20px;color:var(--txt2);font-size:12px;font-style:italic}
+
+/* ─ MODAL: ALERTA CONSOLIDADO DA LISTA PERSONALIZADA ──────────────────────── */
+.lpa-lista{display:flex;flex-direction:column;gap:8px;max-height:50vh;overflow-y:auto;margin:2px 0}
+.lpa-row{background:var(--bg3);border:1px solid var(--brd);border-radius:8px;
+         padding:10px 12px;display:flex;align-items:center;justify-content:space-between;
+         gap:10px;flex-wrap:wrap;transition:border-color .15s}
+.lpa-row:hover{border-color:var(--ora)}
+.lpa-info{flex:1;min-width:180px}
+.lpa-nome{font-size:12.5px;font-weight:700;color:var(--txt);
+          overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+.lpa-item{font-size:11.5px;color:var(--txt);margin-top:2px;line-height:1.4;
+          overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+.lpa-motivo{font-size:11px;color:var(--txt2);margin-top:3px;line-height:1.4}
+.lpa-btns{display:flex;gap:6px;flex-shrink:0}
+.lpa-rodape{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;
+            border-top:1px solid var(--brd);padding-top:12px;margin-top:2px}
+
+/* ─ BOTÃO VOLTAR AO TOPO ─────────────────────────────────────────────────── */
+.btn-top{
+  position:fixed;left:50%;bottom:22px;width:38px;height:38px;border-radius:50%;
+  background:var(--sur2);border:1px solid var(--brd);color:var(--txt2);
+  display:flex;align-items:center;justify-content:center;cursor:pointer;
+  box-shadow:var(--shadow);opacity:0;transform:translate(-50%,10px) scale(.9);
+  pointer-events:none;transition:opacity .2s,transform .2s,background .15s,color .15s,border-color .15s;
+  z-index:9000}
+.btn-top.on{opacity:1;transform:translate(-50%,0) scale(1);pointer-events:auto}
+.btn-top:hover{background:var(--acc2);color:#fff;border-color:var(--acc2)}
+.btn-top:active{transform:scale(.92)}
+
+/* ─ SORT NOS TH ─────────────────────────────────────────────────────────── */
+.th-sort{cursor:pointer;user-select:none;transition:color .15s,background .15s}
+.th-sort:hover{color:var(--acc);background:rgba(78,168,222,.07)}
+.th-sort-ativo{color:var(--acc)!important}
+.sort-ico{display:inline-block;font-size:9px;margin-left:3px;opacity:.75;vertical-align:middle}
+.sort-ico-inativo{display:inline-block;font-size:9px;margin-left:3px;opacity:.22;vertical-align:middle}
+
 /* ─ RESPONSIVO ───────────────────────────────────────────────────────────── */
 @media(max-width:720px){
   .th-bar,.td-bar,.th-uv,.td-uv{display:none}
@@ -1005,9 +1481,9 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
   <div>
     <div class="hdr-title">${escH(APP_NAME)} &mdash; Estoque Disponivel</div>
     <div class="hdr-sub">
-      At&eacute; ${MAX_ITENS} itens &nbsp;&bull;&nbsp;
+      At&eacute; <span id="hdrMaxItens">${_cfgVivo.maxItens}</span> itens &nbsp;&bull;&nbsp;
       Estoque m&iacute;nimo <span id="hdrEstMin">${_cfgVivo.estoqueMinimo}</span> unid. &nbsp;&bull;&nbsp;
-      Maior estoque primeiro
+      Ordenando por <span id="hdrSortLabel">Estoque \u25bc</span>
     </div>
   </div>
   <div class="hdr-r">
@@ -1021,23 +1497,24 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 <!-- CONTROLES -->
 <div class="ctrl">
   <div class="cg">
-    <label class="cl" for="txtBusca">Buscar (descri&ccedil;&atilde;o, c&oacute;digo, EAN, &gt;N, &lt;N)</label>
-    <input type="text" id="txtBusca" placeholder="Nome, c&oacute;d, EAN, &gt;200, &lt;50..." oninput="filtrarDebounced()">
+    <label class="cl cl-busca" for="txtBusca" title="Buscar (descri&ccedil;&atilde;o, c&oacute;digo, EAN, &gt;N, &lt;N)"><span class="cl-busca-txt">Buscar (descri&ccedil;&atilde;o, c&oacute;digo, EAN, &gt;N, &lt;N)</span><button type="button" class="lnk-toggle" id="btnBuscaMulti" onclick="toggleBuscaMulti()" title="Mudar para busca personalizada (v&aacute;rios c&oacute;digos, produtos e/ou c&oacute;digos de barra de uma vez, um por linha)" aria-label="Busca personalizada"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="4.5" x2="13" y2="4.5"/><line x1="3" y1="8" x2="13" y2="8"/><line x1="3" y1="11.5" x2="9" y2="11.5"/></svg></button></label>
+    <input type="text" id="txtBusca" placeholder="Nome, c&oacute;d, EAN, &gt;200, &lt;50..." title="Buscar por descri&ccedil;&atilde;o, c&oacute;digo, EAN, &gt;N (estoque m&iacute;nimo) ou &lt;N (estoque m&aacute;ximo)" oninput="filtrarDebounced()">
+    <textarea id="txtBuscaMulti" class="busca-multi-ta" style="display:none" title="Um c&oacute;digo, produto ou c&oacute;digo de barras por linha (ou separados por v&iacute;rgula)" placeholder="Um c&oacute;digo, produto ou c&oacute;digo de barras por linha (ou separados por v&iacute;rgula). Mistura os tipos livremente. Ex:&#10;08395&#10;7891234567890&#10;ARROZ" oninput="filtrarDebounced()"></textarea>
   </div>
 
   <div class="cg">
     <label class="cl" for="numPrc">Busca por valor (R$)</label>
-    <div style="display:flex;gap:8px;align-items:center">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:nowrap">
       <input type="number" id="numPrc" placeholder="Ex: 250,00" step="0.01" min="0" oninput="onPrecoInput()">
-      <label class="tgl-wrap" title="Agrupar itens que somem ao valor informado">
+      <label class="tgl-wrap" style="flex-shrink:0" title="Agrupar itens distintos (sem limite de quantidade) que somem ao valor informado, respeitando estoque m&iacute;nimo e toler&acirc;ncia +R$40">
         <input type="checkbox" id="chkGrupar" onchange="filtrar()">
         <span class="tgl"></span>
         <span class="tgl-lbl">Agrupar</span>
       </label>
-      <label class="tgl-wrap" title="Mostrar itens com preco acima do valor (ate +R$40)">
+      <label class="tgl-wrap" style="flex-shrink:0" title="Busca combina&ccedil;&otilde;es com repeti&ccedil;&atilde;o do mesmo item (ex: 3&times;08395) — marca como usado s&oacute; ap&oacute;s confirma&ccedil;&atilde;o">
         <input type="checkbox" id="chkAcima" onchange="filtrar()">
         <span class="tgl"></span>
-        <span class="tgl-lbl">+R$40</span>
+        <span class="tgl-lbl">Combinar</span>
       </label>
     </div>
   </div>
@@ -1052,21 +1529,16 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 
   <div class="cg">
     <label class="cl">&nbsp;</label>
-    <button class="btn btn-s btn-sm" onclick="limparFiltros()"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="vertical-align:middle;margin-right:5px"><path d="M3 3l10 10M13 3 3 13"/></svg>Limpar filtros</button>
+    <button class="btn btn-s btn-sm" id="btnLimparFiltros" onclick="limparFiltros()"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="vertical-align:middle;margin-right:5px"><path d="M3 3l10 10M13 3 3 13"/></svg>Limpar filtros</button>
   </div>
 
   <div class="cg">
     <label class="cl" for="selLimite">Itens exibidos</label>
     <select id="selLimite" onchange="aplicarLimite()" style="background:var(--bg2);border:1px solid var(--brd);color:var(--txt);padding:6px 10px;border-radius:6px;font-size:13px;outline:none;cursor:pointer">
-      <option value="100">100</option>
-      <option value="250">250</option>
-      <option value="500">500</option>
-      <option value="1000">1000</option>
-      <option value="2000" selected>2000</option>
     </select>
   </div>
 
-  <div class="cg" style="margin-left:auto">
+  <div class="cg" style="margin-left:auto;flex-shrink:0">
     <label class="cl">&nbsp;</label>
     <button class="btn btn-d btn-sm" onclick="resetarUsados()" id="btnReset"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:middle;margin-right:5px"><path d="M2.5 4.5h11M6 4.5v-1a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 .5.5v1M5.5 4.5l.7 8h3.6l.7-8"/><path d="M7 7.5v3M9 7.5v3"/></svg>Resetar usados</button>
   </div>
@@ -1075,17 +1547,23 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 <!-- STATS BAR -->
 <div class="stats" id="stats">Carregando dados...</div>
 
-<!-- TABELA -->
-<div class="tw" id="tw">
-  <div class="msg">
-    <p><svg class="spin-svg" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="5.5" stroke="rgba(78,168,222,.18)" stroke-width="2.5"/><path d="M8 2.5A5.5 5.5 0 0 1 13.5 8" stroke="var(--acc)" stroke-width="2.5" stroke-linecap="round"/></svg>Conectando ao banco de dados...</p>
-  </div>
+<!-- COMBINAR COM QUANTIDADE (visível quando "Combinar" está ativo e há valor) — fica ANTES da tabela -->
+<div id="combinarWrap" style="display:none">
+  <div class="grp-hdr">Combina&ccedil;&atilde;o com repeti&ccedil;&atilde;o para <span id="combinarValorLabel">-</span><span id="combinarStatus" style="font-size:11px;color:var(--txt3);margin-left:12px"></span></div>
+  <div class="grp-grid" id="combinarGrid"></div>
 </div>
 
 <!-- GRUPOS (visível quando agrupar está ativo e há valor informado) -->
 <div id="gruposWrap" style="display:none">
   <div class="grp-hdr">Combina&ccedil;&otilde;es que somam a <span id="grpValorLabel">-</span></div>
   <div class="grp-grid" id="gruposGrid"></div>
+</div>
+
+<!-- TABELA -->
+<div class="tw" id="tw">
+  <div class="msg">
+    <p><svg class="spin-svg" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="5.5" stroke="rgba(78,168,222,.18)" stroke-width="2.5"/><path d="M8 2.5A5.5 5.5 0 0 1 13.5 8" stroke="var(--acc)" stroke-width="2.5" stroke-linecap="round"/></svg>Conectando ao banco de dados...</p>
+  </div>
 </div>
 
 <!-- CONFIGURAÇÕES MODAL -->
@@ -1120,7 +1598,7 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
         <div class="cfg-grid-1">
           <div class="cfg-field">
             <label class="cfg-lbl" for="cfgFdbPath">Caminho do arquivo .FDB no servidor</label>
-            <input class="cfg-inp" id="cfgFdbPath" type="text" placeholder="C:\Program Files (x86)\SmallSoft\Small Commerce\SMALL.FDB" spellcheck="false" autocomplete="off">
+            <input class="cfg-inp" id="cfgFdbPath" type="text" placeholder="C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB" spellcheck="false" autocomplete="off">
           </div>
         </div>
         <div class="cfg-grid">
@@ -1153,6 +1631,10 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
           <div class="cfg-field">
             <label class="cfg-lbl" for="cfgEstMin">Estoque m&iacute;nimo &mdash; itens com quantidade abaixo s&atilde;o exclu&iacute;dos da listagem (padr&atilde;o: 5)</label>
             <input class="cfg-inp" id="cfgEstMin" type="number" placeholder="5" min="0" max="9999" step="1" style="font-family:inherit">
+          </div>
+          <div class="cfg-field">
+            <label class="cfg-lbl" for="cfgMaxItens">M&aacute;x. itens carregados do banco (100&ndash;5000, padr&atilde;o: 2000) &mdash; aplicado imediatamente</label>
+            <input class="cfg-inp" id="cfgMaxItens" type="number" placeholder="2000" min="100" max="5000" step="100" style="font-family:inherit">
           </div>
           <div class="cfg-field">
             <label class="cfg-lbl" for="cfgAppName">Nome da aplica&ccedil;&atilde;o</label>
@@ -1211,15 +1693,35 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
       <button class="auto-close" onclick="fecharModoAuto()" title="Fechar" aria-label="Fechar"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
     </div>
     <div class="auto-desc">
-      Cole a lista de entregas no formato abaixo e clique em <strong>Iniciar</strong>.
-      O sistema ir&aacute; buscar os c&oacute;digos automaticamente e marcar como usados.<br>
+      Cole a lista no formato abaixo e clique em <strong>Iniciar</strong>.
+      O sistema ir&aacute; buscar os c&oacute;digos automaticamente.<br>
       <span style="color:var(--acc);font-family:Consolas,monospace;font-size:11px">
-        Entregas:<br>139,00&nbsp;&nbsp;CREDITO<br>Gerencia:<br>177,00&nbsp;&nbsp;CREDITO
+        Entregas:<br>139,00&nbsp;&nbsp;CREDITO<br>Gerencia:<br>177,00&nbsp;&nbsp;CREDITO<br>Rafael:<br>197,00&nbsp;&nbsp;PIX&nbsp;&nbsp;[NAO ENCONTRADO]
+      </span>
+      <span style="display:block;margin-top:4px;font-size:11px">
+        O "[NAO ENCONTRADO]" &eacute; opcional &mdash; &uacute;til se voc&ecirc; est&aacute; colando de volta uma sa&iacute;da anterior;
+        ele &eacute; sempre substitu&iacute;do pelos c&oacute;digos encontrados neste processamento.
       </span>
     </div>
     <div>
       <div class="cl" style="margin-bottom:4px">Lista de entrada</div>
       <textarea class="auto-ta" id="autoInput" placeholder="Cole aqui a lista..."></textarea>
+    </div>
+    <div style="display:flex;align-items:center;flex-wrap:nowrap;gap:8px;/*overflow-x:auto*/">
+      <label class="tgl-wrap" id="lpToggleWrap" title="Restringe a busca apenas aos c&oacute;digos configurados, permitindo repeti-los" style="width:fit-content;flex-shrink:0">
+        <input type="checkbox" id="chkListaPersonalizada" onchange="toggleListaPersonalizada()">
+        <span class="tgl"></span>
+        <span class="tgl-lbl" id="lpToggleLbl">Usar lista personalizada</span>
+      </label>
+      <button class="btn btn-s btn-sm" type="button" onclick="abrirListaPersonalizadaModal()" style="vertical-align:middle;flex-shrink:0">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:middle;margin-right:5px"><path d="M3 4.5h10M3 8h10M3 11.5h6"/></svg>Configurar lista
+      </button>
+      <span id="lpResumo" style="font-size:11px;color:var(--txt3);flex-shrink:0;white-space:nowrap"></span>
+      <label class="tgl-wrap" id="reaproveitarToggleWrap" title="Reaproveita o mesmo c&oacute;digo em v&aacute;rias combina&ccedil;&otilde;es/linhas, respeitando o estoque m&iacute;nimo configurado. S&oacute; marca como usado quando o c&oacute;digo esgotar essa sobra (s&oacute; vale no modo padr&atilde;o, sem lista personalizada)." style="width:fit-content;flex-shrink:0">
+        <input type="checkbox" id="chkReaproveitarPadrao" onchange="_salvarPrefReaproveitar()">
+        <span class="tgl"></span>
+        <span class="tgl-lbl">Reaproveitar c&oacute;digo</span>
+      </label>
     </div>
     <div id="autoResultWrap" style="display:none">
       <div class="cl" style="margin-bottom:4px">Resultado</div>
@@ -1236,8 +1738,68 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
   </div>
 </div>
 
+<!-- MODAL: LISTA PERSONALIZADA -->
+<div class="auto-ov" id="lpOv">
+  <div class="auto-bx" id="lpBx">
+    <div class="auto-ttl">
+      <span><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:middle;margin-right:6px"><path d="M3 4.5h10M3 8h10M3 11.5h6"/></svg>Lista Personalizada</span>
+      <button class="auto-close" onclick="fecharListaPersonalizadaModal()" title="Fechar" aria-label="Fechar"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+    </div>
+    <div class="auto-desc">
+      Um c&oacute;digo por linha. Formato: <strong>c&oacute;digo, estoque de parada (opcional)</strong>.
+      Quando o estoque do produto atingir esse n&uacute;mero, o modo autom&aacute;tico para de us&aacute;-lo.
+      Sem o segundo valor, o c&oacute;digo &eacute; usado livremente.<br>
+      <span style="color:var(--acc);font-family:Consolas,monospace;font-size:11px">
+        Exemplo:<br>00278, 30<br>08395
+      </span>
+    </div>
+    <div>
+      <div class="cl" style="margin-bottom:4px">C&oacute;digos</div>
+      <textarea class="auto-ta-lp" id="lpTextarea" style="min-height:220px" placeholder="00278, 30&#10;08395"></textarea>
+      <div class="auto-lp-hint">Os c&oacute;digos podem se repetir entre e dentro das combina&ccedil;&otilde;es para fechar o valor. Na sa&iacute;da, repeti&ccedil;&otilde;es aparecem como <strong>3*c&oacute;digo</strong>.</div>
+    </div>
+    <div class="auto-ftr">
+      <span class="auto-status" id="lpStatus"></span>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-d btn-sm" onclick="fecharListaPersonalizadaModal()">Cancelar</button>
+        <button class="btn btn-p btn-sm" id="lpSalvarBtn" onclick="salvarListaPersonalizada()">Salvar lista</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: ALERTA CONSOLIDADO — CÓDIGOS DA LISTA PERSONALIZADA ESGOTADOS -->
+<!-- Substitui o antigo fluxo de confirmação um-a-um: todos os códigos que
+     precisam de decisão aparecem de uma vez, cada um com nome do produto,
+     o motivo do alerta e botões individuais de "Excluir"/"Deixar para
+     depois", além de botões no rodapé para resolver todos de uma só vez. -->
+<div class="auto-ov" id="lpAlertaOv">
+  <div class="auto-bx" id="lpAlertaBx" style="max-width:560px">
+    <div class="auto-ttl">
+      <span><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:middle;margin-right:6px"><path d="M8 5v4M8 11.2h.01"/><path d="M7.16 2.68 1.4 12.5A1.4 1.4 0 0 0 2.6 14.6h10.8a1.4 1.4 0 0 0 1.2-2.1L8.84 2.68a1.4 1.4 0 0 0-2.42-.01"/></svg>C&oacute;digos da lista personalizada esgotados</span>
+      <button class="auto-close" onclick="_lpaResolverTodos('depois')" title="Fechar (deixa todos para depois — pergunto de novo nesta sess&atilde;o at&eacute; voc&ecirc; decidir, ou na pr&oacute;xima vez que abrir o sistema)" aria-label="Fechar"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+    </div>
+    <div class="auto-desc" id="lpAlertaCount">Os c&oacute;digos abaixo est&atilde;o na sua lista personalizada, mas cada um deles zerou, ficou negativado, foi exclu&iacute;do do banco ou atingiu o valor de parada configurado (o motivo espec&iacute;fico est&aacute; em cada linha). Escolha, para cada um, se deseja exclu&iacute;-lo da lista ou deixar para decidir depois (volta a perguntar sobre ele a cada nova sess&atilde;o, at&eacute; voc&ecirc; decidir) — ou resolva todos de uma vez no rodap&eacute;.</div>
+    <div class="lpa-lista" id="lpAlertaLista"></div>
+    <div class="lpa-rodape">
+      <button class="btn btn-s btn-sm" onclick="_lpaResolverTodos('depois')">Deixar todos para depois</button>
+      <button class="btn btn-d btn-sm" onclick="_lpaResolverTodos('excluir')">Excluir todos</button>
+    </div>
+  </div>
+</div>
+
+<!-- VOLTAR AO TOPO -->
+<button class="btn-top" id="btnTopo" onclick="voltarAoTopo()" title="Voltar ao topo" aria-label="Voltar ao topo">
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 12.5V3.5"/><path d="M3.5 8 8 3.5 12.5 8"/></svg>
+</button>
+
 <!-- TOAST -->
 <div class="toast" id="toast"></div>
+
+<!-- ESTOQUE ENGINE — mesmo módulo importado pelos testes unitários -->
+<script>
+${_ENGINE_SRC}
+</script>
 
 <script>
 "use strict";
@@ -1246,6 +1808,11 @@ var _S = ${serverCfg};
 
 // ── Estado do cliente ────────────────────────────────────────────────────────
 var _itens   = [];   // Todos os itens recebidos do servidor
+var _lpEstoquesReais = {}; // {codigo: {estoque, descricao}} — dados REAIS dos códigos
+                            // da lista personalizada, vindo do servidor sem o corte de
+                            // maxItens/estoqueMinimo/proibidos (ver /api/itens → lpEstoquesReais).
+                            // Usado por _verificarAlertasListaPersonalizada() em vez de
+                            // checar presença em _itens (que é truncado/priorizado).
 var _vis     = [];   // Itens visíveis após filtros
 var _ldg     = false;
 var _erroCli = null;
@@ -1257,8 +1824,43 @@ var _renderRAF      = null;        // Controle de rAF para renderTabela
 var _dadosFingerprint = '';        // Fingerprint para evitar re-render sem mudança de dados
 var _gruposTimer    = null;        // Async de encontrarGrupos
 var _nUsadosVis     = 0;           // Contagem de usados nos itens visíveis (evita filter() extra)
+var _ultimoTermosEncontrados = null; // Set de termos (busca personalizada) que bateram na última filtrar()
+// Objetos de geração: o engine incrementa .valor ao iniciar, caller usa o mesmo
+// objeto para cancelar uma busca em andamento incrementando externamente.
+var _gruposGenObj   = { valor: 0 };
+var _combinarGenObj = { valor: 0 };
+
+// ── Sort por coluna: persistido no localStorage ───────────────────────────────
+// Valores válidos para _sortKey: 'estoque' | 'preco'
+// Valores válidos para _sortDir: 'asc' | 'desc'
+var _sortKey = (function() {
+    try { var v = localStorage.getItem('est-sort-key'); return (v === 'preco') ? 'preco' : 'estoque'; } catch(_) { return 'estoque'; }
+})();
+var _sortDir = (function() {
+    try { var v = localStorage.getItem('est-sort-dir'); return (v === 'asc') ? 'asc' : 'desc'; } catch(_) { return 'desc'; }
+})();
+
+// ── Faixa "acima" (+R$40) — fixa ──────────────────────────────────────────────
+// Antes era ampliável (+40, +80, +120...) via confirmação manual num toast.
+// Agora a faixa é sempre +R$40; quando não há resultado, a busca continua
+// automaticamente no restante do banco de dados (ver _buscarRestanteSeNecessario)
+// em vez de pedir para ampliar a faixa de preço.
+// Constantes FAIXA_COMBINAR, FAIXA_EXCEDENTE_LP, FLOAT_EPS, PRECO_SENTINEL_ZERADO
+// e MAX_COMBINAR_RESULTADOS são expostas como globals pelo estoque-engine.js (UMD).
+// Declaradas apenas no engine — fonte única de verdade.
+
+// Intervalo de polling enquanto banco está carregando (ms) — exclusivo do UI
+var POLL_INTERVALO_MS = 1800;
+
+// ── Busca exaustiva no banco (substitui o antigo "ampliar +R$40") ────────────
+// Geração por tipo de busca ('item' | 'grupo'): incrementar invalida qualquer
+// busca anterior em andamento, evitando que um resultado tardio de uma busca
+// já obsoleta (ex: usuário trocou o valor digitado) seja aplicado por engano.
+var _buscaRestanteGen   = { item: 0, grupo: 0, multi: 0 };
+var _buscaRestanteTimer = { item: null, grupo: null, multi: null };
+
 // Referências DOM cacheadas em DOMContentLoaded (evita getElementById a cada keystroke)
-var _elBusca = null, _elPrc = null, _elGrupar = null, _elAcima = null;
+var _elBusca = null, _elPrc = null, _elGrupar = null, _elAcima = null, _elBuscaMulti = null;
 
 // ── Ícones SVG (definidos uma vez, reutilizados no HTML gerado dinamicamente) ─
 var _icons = {
@@ -1268,20 +1870,47 @@ var _icons = {
 };
 
 // ── Modal confirm customizado (substitui confirm() nativo) ────────────────────
-function _modalConfirm(msg, onOk, onCancel) {
+// opts.itensScroll (opcional): array de strings — quando presente, renderiza
+// num bloco DEDICADO com scroll próprio (só ele rola), entre "msg" (fixo,
+// sempre visível) e opts.msgApos (fixo, sempre visível, opcional). Sem
+// itensScroll, comportamento igual a antes (um único bloco de texto).
+function _modalConfirm(msg, onOk, onCancel, opts) {
+    opts = opts || {};
+    // Defensivo: se um modal anterior ainda estiver no DOM (ex: em transição de
+    // saída de 220ms, ou um encadeamento rápido de confirmações), remove-o
+    // imediatamente antes de criar o novo — evita dois overlays sobrepostos.
+    document.querySelectorAll('.modal-ov').forEach(function(old) {
+        if (old.parentNode) old.parentNode.removeChild(old);
+    });
     var ov  = document.createElement('div');  ov.className  = 'modal-ov';
     var bx  = document.createElement('div');  bx.className  = 'modal-bx';
     var ttl = document.createElement('div');  ttl.className = 'modal-ttl';
-    ttl.textContent = 'Confirma\u00e7\u00e3o';
+    // tituloHtml permite SVG inline no título; textContent é o fallback seguro
+    if (opts.tituloHtml) {
+        ttl.innerHTML = opts.tituloHtml;
+    } else {
+        ttl.textContent = opts.titulo || 'Confirma\u00e7\u00e3o';
+    }
     var txt = document.createElement('div');  txt.className = 'modal-msg';
     txt.textContent = msg;
     var ftr = document.createElement('div');  ftr.className = 'modal-ftr';
     var bNo = document.createElement('button'); bNo.className = 'btn btn-s btn-sm';
     bNo.textContent = 'Cancelar';
-    var bOk = document.createElement('button'); bOk.className = 'btn btn-d btn-sm';
-    bOk.textContent = 'Confirmar';
+    var bOk = document.createElement('button'); bOk.className = opts.okClass || 'btn btn-d btn-sm';
+    bOk.textContent = opts.okLabel || 'Confirmar';
     ftr.appendChild(bNo); ftr.appendChild(bOk);
-    bx.appendChild(ttl); bx.appendChild(txt); bx.appendChild(ftr);
+    bx.appendChild(ttl); bx.appendChild(txt);
+    if (opts.itensScroll && opts.itensScroll.length) {
+        var lista = document.createElement('div'); lista.className = 'modal-msg-lista';
+        lista.textContent = opts.itensScroll.join('\\n');
+        bx.appendChild(lista);
+        if (opts.msgApos) {
+            var depois = document.createElement('div'); depois.className = 'modal-msg';
+            depois.textContent = opts.msgApos;
+            bx.appendChild(depois);
+        }
+    }
+    bx.appendChild(ftr);
     ov.appendChild(bx);
     document.body.appendChild(ov);
     requestAnimationFrame(function() { ov.classList.add('on'); });
@@ -1289,8 +1918,14 @@ function _modalConfirm(msg, onOk, onCancel) {
         ov.classList.remove('on');
         setTimeout(function() { if (ov.parentNode) ov.parentNode.removeChild(ov); }, 220);
     }
-    bNo.addEventListener('click', function() { fechar(); if (onCancel) onCancel(); });
-    bOk.addEventListener('click', function() { fechar(); if (onOk) onOk(); });
+    bNo.addEventListener('click', function() { fechar(); if (onCancel) onCancel(); }, { once: true });
+    bOk.addEventListener('click', function() { fechar(); if (onOk) onOk(); }, { once: true });
+    // NOTA (achado #2 da revisão 2026-07-11, revertido): {once:true} foi
+    // cogitado aqui por consistência com bNo/bOk, mas é incorreto — cliques
+    // DENTRO do modal borbulham até "ov", então o listener seria removido no
+    // primeiro clique (mesmo sem fechar nada), quebrando "fechar ao clicar
+    // fora" nos cliques seguintes. Sem once mesmo: não é vazamento real,
+    // porque "ov" é descartado do DOM (não reciclado) a cada chamada.
     ov.addEventListener('click',  function(e) { if (e.target === ov) { fechar(); if (onCancel) onCancel(); } });
 }
 
@@ -1338,7 +1973,7 @@ function marcarGrupoUsado(grupoItens, onDone) {
 
 var _autoCodsParaMarcar = []; // códigos prontos para marcar após o usuário copiar o resultado
 
-// ── Toast ─────────────────────────────────────────────────────────────────────
+// ── Toast simples ─────────────────────────────────────────────────────────────
 function toast(msg, ms) {
     var el = document.getElementById("toast");
     if (!el) return;
@@ -1378,10 +2013,22 @@ function carregarItens() {
             _ldg = true;
             renderTabela();
             clearTimeout(_pollT);
-            _pollT = setTimeout(carregarItens, 1800);
+            _pollT = setTimeout(carregarItens, POLL_INTERVALO_MS);
             return;
         }
         _erroCli = dados.erro || null;
+
+        // _aplicarDadosItensFrescos() é compartilhado com o fluxo de
+        // sincronização forçada do Modo Automático (ver iniciarModoAuto) —
+        // mesma lógica de mapeamento, uma única fonte de verdade.
+        _aplicarDadosItensFrescos(dados);
+
+        // Estoque real (sem o corte de maxItens/estoqueMinimo) dos códigos da
+        // lista personalizada — roda ANTES do fingerprint/early-return abaixo
+        // porque o estoque de um código específico pode mudar (ex.: de 3 pra
+        // 2 unidades) sem alterar dados.total nem usadosCount, o que faria o
+        // fingerprint bater igual e pular esse processamento indevidamente.
+        _verificarAlertasListaPersonalizada();
 
         // Fingerprint: se total, usados e limite não mudaram, dados não mudaram — evita re-render
         var usadosCount = 0;
@@ -1392,17 +2039,10 @@ function carregarItens() {
         }
         var fp = (dados.total || 0) + '|' + usadosCount + '|' + _limiteItens;
         if (fp === _dadosFingerprint && _itens.length > 0) {
-            return; // dados idênticos — nada a re-renderizar
+            return; // dados idênticos — nada a re-renderizar (a checagem da lista
+                     // personalizada acima já rodou com os dados mais recentes)
         }
         _dadosFingerprint = fp;
-
-        // Pre-computa campos uppercase uma única vez (evita toUpperCase() a cada filtrar())
-        _itens = (Array.isArray(dados.itens) ? dados.itens : []).slice(0, _limiteItens).map(function(it) {
-            it._descUp = it.descricao              ? it.descricao.toUpperCase()        : '';
-            it._codUp  = it.codigo                 ? String(it.codigo).toUpperCase()   : '';
-            it._barUp  = it.codbarras              ? String(it.codbarras).toUpperCase(): '';
-            return it;
-        });
 
         atualizarBadge(dados);
         filtrar();
@@ -1433,6 +2073,143 @@ function carregarItens() {
     });
 }
 
+// ── Busca estendida (Modo Automático) ──────────────────────────────────────
+// Pede ao servidor a próxima "sessão" de itens do catálogo completo (itens que
+// não couberam no carregamento normal, limitado por maxItens) e funde os
+// resultados em _itens — sem duplicar código já presente e sem afetar o
+// _limiteItens normal da tabela principal (os itens extras só importam pro
+// processamento do Modo Automático em andamento).
+function _buscarMaisItensBanco(callback) {
+    apiFetch('/api/buscar-mais-itens').then(function(dados) {
+        if (!dados || !dados.ok) { callback(false, 0, false); return; }
+        var novos = Array.isArray(dados.itens) ? dados.itens : [];
+        if (novos.length) {
+            var _codsJaPresentes = {};
+            for (var i = 0; i < _itens.length; i++) { _codsJaPresentes[_itens[i].codigo] = true; }
+            novos.forEach(function(it) {
+                if (_codsJaPresentes[it.codigo]) return; // já carregado — não duplica
+                it._descUp = it.descricao ? it.descricao.toUpperCase()         : '';
+                it._codUp  = it.codigo    ? String(it.codigo).toUpperCase()    : '';
+                it._barUp  = it.codbarras ? String(it.codbarras).toUpperCase() : '';
+                _itens.push(it);
+            });
+        }
+        callback(true, novos.length, !!dados.temMais);
+    }).catch(function() { callback(false, 0, false); });
+}
+
+// ── Busca exaustiva no restante do banco (filtro manual: item único e Agrupar) ─
+// Substitui o antigo fluxo "ampliar para +R$40, +R$80...": em vez de pedir
+// confirmação a cada +40, busca automaticamente — sessão por sessão, nunca
+// repetindo — todo o restante do catálogo no banco de dados, até achar algo
+// ou esgotar o catálogo por completo. Só avisa o usuário se, depois de
+// esgotar TODO o banco, ainda não encontrou nada.
+//
+// tipo: 'item' (busca por valor único, faixa +R$40) ou 'grupo' (Modo Agrupar)
+//
+// Debounce de 700ms: evita disparar a busca a cada tecla digitada no campo de
+// preço. A geração por tipo (_buscaRestanteGen) garante que, se o usuário
+// mudar o valor ou desativar o modo antes do debounce (ou durante uma busca
+// já em andamento), o resultado tardio da busca antiga é ignorado.
+function _buscarRestanteSeNecessario(tipo, contexto) {
+    clearTimeout(_buscaRestanteTimer[tipo]);
+    var minhaGen = ++_buscaRestanteGen[tipo];
+    _buscaRestanteTimer[tipo] = setTimeout(function() {
+        if (minhaGen !== _buscaRestanteGen[tipo]) return; // substituída por uma busca mais nova
+
+        if (tipo === 'multi') {
+            // Revalida: a textarea ainda tem o mesmo conteúdo de quando a busca foi pedida?
+            if (!buscaMultiAtiva() || !_elBuscaMulti || _elBuscaMulti.value !== contexto) return;
+        } else {
+            var prcAtual = _elPrc ? parseFloat(_elPrc.value) : NaN;
+            // Revalida: o valor buscado e o modo ainda são os mesmos de quando a busca foi pedida?
+            if (isNaN(prcAtual) || prcAtual <= 0 || Math.abs(prcAtual - contexto) > FLOAT_EPS) return;
+            if (tipo === 'item'  && (!combinarAtivo()  || _vis.length > 0))  return;
+            if (tipo === 'grupo' && !gruparAtivo()) return;
+        }
+
+        toast('Buscando no restante do banco de dados...', 60000);
+        _buscarRestantePasso(tipo, contexto, minhaGen);
+    }, 700);
+}
+
+function _esconderToastBuscando() {
+    var el = document.getElementById('toast');
+    if (el) el.classList.remove('on');
+}
+
+function _buscarRestantePasso(tipo, contexto, minhaGen) {
+    // Revalida a cada passo (não só no disparo inicial): se o usuário desligou
+    // o modo relevante (+R$40, Agrupar ou busca personalizada) enquanto a
+    // busca corria, para aqui — não há mais critério válido para continuar.
+    var modoDesligado = tipo === 'multi'
+        ? !buscaMultiAtiva()
+        : ((tipo === 'item' && !combinarAtivo()) || (tipo === 'grupo' && !gruparAtivo()));
+    if (modoDesligado) {
+        _esconderToastBuscando();
+        return;
+    }
+    _buscarMaisItensBanco(function(ok, qtd, temMais) {
+        if (minhaGen !== _buscaRestanteGen[tipo]) {
+            _esconderToastBuscando(); // busca obsoleta (filtros limpos, etc.) — ignora resultado
+            return;
+        }
+        if (!ok || qtd === 0) { _finalizarBuscaRestante(tipo, contexto, false); return; }
+        var aoTentar = function(achou) {
+            if (minhaGen !== _buscaRestanteGen[tipo]) { _esconderToastBuscando(); return; }
+            if (achou) { _finalizarBuscaRestante(tipo, contexto, true); return; }
+            if (!temMais) { _finalizarBuscaRestante(tipo, contexto, false); return; }
+            _buscarRestantePasso(tipo, contexto, minhaGen); // ainda há mais no banco — continua
+        };
+        if (tipo === 'item') {
+            filtrar();
+            aoTentar(_vis.length > 0);
+        } else if (tipo === 'grupo') {
+            encontrarGruposAsync(_itens, contexto, function(grupos) {
+                renderGrupos(grupos, contexto);
+                aoTentar(!!(grupos && grupos.length > 0));
+            }, _gruposGenObj, null, {
+                estoqueMinimo:      _S.estoqueMinimo || 0,
+                proibidosEmbutidos: _S.proibidosEmbutidos,
+                proibidosExtra:     _S.proibidosExtra
+            });
+        } else {
+            // multi: só "achou" quando TODOS os termos tiverem pelo menos 1 item —
+            // um lote de códigos não está completo enquanto faltar algum.
+            filtrar();
+            aoTentar(_termosSemMatch(_termosBuscaMulti(), _itens).length === 0);
+        }
+    });
+}
+
+function _finalizarBuscaRestante(tipo, contexto, achou) {
+    if (achou) { _esconderToastBuscando(); return; } // achou — UI já atualizada, só limpa o toast
+
+    if (tipo === 'multi') {
+        var faltantes = _termosSemMatch(_termosBuscaMulti(), _itens);
+        if (!faltantes.length) { _esconderToastBuscando(); return; } // todos cobertos nesse meio-tempo
+        var lista = faltantes.slice(0, 8).join(', ') +
+            (faltantes.length > 8 ? ' e mais ' + (faltantes.length - 8) : '');
+        toast(
+            'Procurado em todo o banco de dados (' + _itens.length + ' itens) \u2014 ' +
+            faltantes.length + ' termo' + (faltantes.length === 1 ? '' : 's') +
+            ' n\u00e3o encontrado' + (faltantes.length === 1 ? '' : 's') + ': ' + lista,
+            9000
+        );
+        return;
+    }
+
+    var valorFmt = contexto.toFixed(2).replace('.', ',');
+    toast(
+        'Procurado em todo o banco de dados (' + _itens.length + ' itens) \u2014 ' +
+        (tipo === 'item'
+            ? 'nenhum item encontrado na faixa de R$' + valorFmt + '.'
+            : 'nenhuma combina\u00e7\u00e3o encontrada para R$' + valorFmt + '.'),
+        7000
+    );
+}
+
+
 // ── Badge de status ───────────────────────────────────────────────────────────
 function atualizarBadge(dados) {
     var el = document.getElementById("badge");
@@ -1449,21 +2226,77 @@ function atualizarBadge(dados) {
 
 // ── Lógica de faixa de preço ──────────────────────────────────────────────────
 // Sem "Acima": match EXATO no valor (tolerância de 1 centavo para float)
-// Com "Acima" (+R$40): intervalo [valor, valor+40]
+// Com "Acima" (+R$40): intervalo [valor, valor+40] — quando vazio, busca
+// automaticamente o restante do banco (ver _buscarRestanteSeNecessario)
+// calcFaixa: usado apenas quando combinarAtivo()==false para filtrar a tabela
+// por preço exato. No modo Combinar a tabela NÃO filtra por preço — mostra todos
+// os itens; o resultado vai para o painel "Combinar", não para a tabela.
 function calcFaixa(valor) {
-    var acima = acimaAtivo();
-    if (acima) {
-        return { min: valor, max: valor + 40 };
-    }
-    // Exato: tolerância mínima de floating-point (0,01)
-    return { min: valor - 0.005, max: valor + 0.005 };
+    return { min: valor - FLOAT_EPS, max: valor + FLOAT_EPS };
 }
 
-function gruparAtivo() { return !!(_elGrupar && _elGrupar.checked); }
-function acimaAtivo()  { return !!(_elAcima  && _elAcima.checked);  }
+function gruparAtivo()   { return !!(_elGrupar && _elGrupar.checked); }
+function combinarAtivo() { return !!(_elAcima  && _elAcima.checked);  }
 
-function onPrecoInput() { filtrar(); }
+// ── Busca personalizada (múltiplos termos: códigos, produtos, códigos de barra) ─
+// Alterna entre o campo de busca simples (1 termo) e a textarea de múltiplos
+// termos (1 por linha, ou separados por vírgula). Os dois nunca ficam ativos
+// ao mesmo tempo — só um existe visível por vez, e filtrar() lê qual está ativo.
+function buscaMultiAtiva() {
+    return !!(_elBuscaMulti && _elBuscaMulti.style.display !== 'none');
+}
+function toggleBuscaMulti() {
+    var btn = document.getElementById('btnBuscaMulti');
+    if (!_elBusca || !_elBuscaMulti || !btn) return;
+    var vaiAtivar = !buscaMultiAtiva();
+    if (vaiAtivar) {
+        // Migra o termo único já digitado (se houver) pra primeira linha da textarea
+        if (_elBusca.value.trim() && !_elBuscaMulti.value.trim()) {
+            _elBuscaMulti.value = _elBusca.value.trim();
+        }
+        _elBusca.style.display      = 'none';
+        _elBuscaMulti.style.display = '';
+        btn.title = 'Voltar para busca simples';
+        btn.setAttribute('aria-label', 'Busca simples');
+        btn.classList.add('lnk-toggle-ativo');
+        _elBuscaMulti.focus();
+    } else {
+        _elBuscaMulti.style.display = 'none';
+        _elBusca.style.display      = '';
+        btn.title = 'Mudar para busca personalizada (v\u00e1rios c\u00f3digos, produtos e/ou c\u00f3digos de barra de uma vez, um por linha)';
+        btn.setAttribute('aria-label', 'Busca personalizada');
+        btn.classList.remove('lnk-toggle-ativo');
+        _elBusca.focus();
+    }
+    // Cancela qualquer busca exaustiva pendente do modo que está saindo de cena
+    clearTimeout(_buscaRestanteTimer.multi);
+    _buscaRestanteGen.multi++;
+    filtrar();
+}
 
+// Extrai os termos da textarea: um por linha OU separados por vírgula,
+// misturados livremente. Vazias são ignoradas; tudo em caixa alta (mesma
+// convenção de _descUp/_codUp/_barUp, usados na comparação).
+function _termosBuscaMulti() {
+    var raw = _elBuscaMulti ? _elBuscaMulti.value : '';
+    return raw.split(/[\\n,]+/)
+        .map(function(t) { return t.trim().toUpperCase(); })
+        .filter(function(t) { return t.length > 0; });
+}
+
+
+
+
+function onPrecoInput() {
+    filtrar();
+}
+
+// Define texto do hint em rng/hint. O prc-hint pode truncar visualmente com
+// reticências (CSS: overflow:hidden + text-overflow:ellipsis) quando o
+// container não tem espaço — o atributo title garante que o texto COMPLETO
+// sempre apareça no tooltip ao passar o mouse, mesmo truncado na tela.
+// prc-range (valor em R$) NUNCA trunca (flex-shrink:0 no CSS) — não precisa
+// de title porque já está sempre 100% visível.
 function atualizarPrcBox(val) {
     var box  = document.getElementById('prcBox');
     var rng  = document.getElementById('prcRange');
@@ -1471,26 +2304,45 @@ function atualizarPrcBox(val) {
     if (!box) return;
     if (!val || val <= 0) { box.classList.remove('vis'); return; }
     box.classList.add('vis');
-    var acima = acimaAtivo();
-    if (acima) {
-        if (rng)  rng.textContent  = 'R$ ' + val.toFixed(2).replace('.',',') + ' a R$ ' + (val+40).toFixed(2).replace('.',',');
-        if (hint) hint.textContent = '(acima: ate +R$40,00)';
+    var hintTexto;
+    if (combinarAtivo()) {
+        if (rng) rng.textContent = 'Combinar: R$ ' + val.toFixed(2).replace('.', ',');
+        hintTexto = '(at\u00e9 +R$' + FAIXA_COMBINAR.toFixed(0) + ' de toler\u00e2ncia)';
     } else {
-        if (rng)  rng.textContent  = 'R$ ' + val.toFixed(2).replace('.',',');
-        if (hint) hint.textContent = '(valor exato)';
+        if (rng) rng.textContent = 'R$ ' + val.toFixed(2).replace('.', ',');
+        hintTexto = gruparAtivo() ? '(combina\u00e7\u00f5es de qualquer tamanho, at\u00e9 +R$' + FAIXA_COMBINAR.toFixed(0) + ')' : '(valor exato)';
     }
+    if (hint) { hint.textContent = hintTexto; hint.title = hintTexto; }
+}
+
+// Mostra o botão "Limpar filtros" só quando há algo que limparFiltros()
+// realmente vai resetar: busca preenchida, preço preenchido, ou busca
+// personalizada (múltiplos termos) preenchida.
+function _atualizarBtnLimparFiltros(busca, temPrc, temMulti) {
+    var btn = document.getElementById('btnLimparFiltros');
+    if (!btn) return;
+    var temFiltro = !!busca || !!temPrc || !!temMulti;
+    btn.classList.toggle('vis', temFiltro);
 }
 
 // ── Filtrar ───────────────────────────────────────────────────────────────────
 function filtrar() {
-    var busca = _elBusca ? _elBusca.value.trim() : "";
+    var multiAtiva  = buscaMultiAtiva();
+    var termosMulti = multiAtiva ? _termosBuscaMulti() : [];
+    // Em modo multi, ignora o campo de busca simples mesmo que ainda tenha
+    // texto antigo (ele só está escondido, não foi limpo) — evita que um
+    // valor obsoleto do campo de 1 termo influencie o resultado.
+    var busca = (!multiAtiva && _elBusca) ? _elBusca.value.trim() : "";
     var prcN  = _elPrc   ? parseFloat(_elPrc.value) : NaN;
     var temPrc = !isNaN(prcN) && prcN > 0;
     var fx = temPrc ? calcFaixa(prcN) : null;
 
     atualizarPrcBox(temPrc ? prcN : 0);
+    _atualizarBtnLimparFiltros(busca, temPrc, termosMulti.length > 0);
 
     // ── Filtro de estoque: >N (estoque >= N) ou <N (estoque <= N) ──────────────
+    // (só faz sentido na busca simples — em modo multi cada linha é um termo
+    // literal de código/produto/barras, não uma expressão de comparação)
     var estoqueMin = null;
     var estoqueMax = null;
     var buscaTexto = busca;
@@ -1505,6 +2357,12 @@ function filtrar() {
     }
     var buscaUpper = buscaTexto.toUpperCase();
 
+    // Coleta quais termos bateram em pelo menos 1 item DURANTE o filtro
+    // principal (não num segundo passe sobre _itens) — evita duplicar o custo
+    // O(itens × termos) que existiria se filtrássemos e depois chamássemos
+    // _termosSemMatch separadamente.
+    var termosEncontrados = multiAtiva ? new Set() : null;
+
     // Conta usados em uma única passagem (evita filter() adicional em renderTabela)
     var _tmpUsados = 0;
     _vis = _itens.filter(function(it) {
@@ -1512,8 +2370,20 @@ function filtrar() {
         if (estoqueMin !== null && Number(it.estoque) < estoqueMin) return false;
         if (estoqueMax !== null && Number(it.estoque) > estoqueMax) return false;
 
-        // Filtro de texto: descrição, código do produto e código de barras (contains)
-        if (buscaUpper) {
+        // Filtro de texto: busca personalizada (união de termos) OU busca simples
+        if (multiAtiva) {
+            if (termosMulti.length) {
+                var bateu = false;
+                for (var ti = 0; ti < termosMulti.length; ti++) {
+                    var t = termosMulti[ti];
+                    if (it._descUp.indexOf(t) !== -1 || it._codUp.indexOf(t) !== -1 || it._barUp.indexOf(t) !== -1) {
+                        termosEncontrados.add(t);
+                        bateu = true;
+                    }
+                }
+                if (!bateu) return false;
+            }
+        } else if (buscaUpper) {
             var matchDesc = it._descUp.indexOf(buscaUpper) !== -1;
             var matchCod  = it._codUp.indexOf(buscaUpper)  !== -1;
             var matchBar  = it._barUp.indexOf(buscaUpper)  !== -1;
@@ -1521,8 +2391,10 @@ function filtrar() {
         }
 
         var p = Number(it.preco || 0);
-        if (p === 0.01) return false; // ocultar itens com valor R$0,01
-        if (temPrc) {
+        if (p === PRECO_SENTINEL_ZERADO) return false;
+        // No modo Combinar, a tabela não filtra por preço — o preço é usado
+        // pelo painel Combinar. No modo exato (sem Combinar), filtra normalmente.
+        if (temPrc && !combinarAtivo()) {
             if (p <= 0) return false;
             if (p < fx.min || p > fx.max) return false;
         }
@@ -1530,43 +2402,132 @@ function filtrar() {
         return true;
     });
     _nUsadosVis = _tmpUsados; // salva para renderTabela sem re-iterar _vis
+    _ultimoTermosEncontrados = termosEncontrados; // reuso por quem decide estender a busca (evita re-varredura)
 
-    // Quando +40 ativo: ordenar pela menor diferença possível (0 → 40)
-    if (temPrc && acimaAtivo()) {
-        _vis.sort(function(a, b) {
-            var da = Math.abs(Number(a.preco || 0) - prcN);
-            var db = Math.abs(Number(b.preco || 0) - prcN);
-            return da - db;
-        });
-    }
+    // ── Ordenação ─────────────────────────────────────────────────────────────
+    // No modo Combinar, a tabela mostra todos os itens (sem filtrar por preço
+    // — o preço vai pro painel Combinar). Ordenação padrão por coluna.
+    _vis.sort(function(a, b) {
+        if (a.usado !== b.usado) return (a.usado ? 1 : 0) - (b.usado ? 1 : 0);
+        var va = Number(_sortKey === 'preco' ? (a.preco || 0) : (a.estoque || 0));
+        var vb = Number(_sortKey === 'preco' ? (b.preco || 0) : (b.estoque || 0));
+        return _sortDir === 'desc' ? vb - va : va - vb;
+    });
 
     // Agenda renderTabela via requestAnimationFrame — nunca bloqueia o frame atual
     if (_renderRAF) cancelAnimationFrame(_renderRAF);
     _renderRAF = requestAnimationFrame(function() {
         _renderRAF = null;
         renderTabela();
+
+        // ── Busca personalizada: algum termo ainda sem nenhum item correspondente? ──
+        if (multiAtiva && termosMulti.length && _diffTermosFaltantes(termosMulti, _ultimoTermosEncontrados).length > 0) {
+            _buscarRestanteSeNecessario('multi', _elBuscaMulti.value);
+        }
+        // ── Toast informativo: busca de texto sem resultado com agrupar ativo ──
+        else if (buscaUpper && _vis.length === 0 && gruparAtivo()) {
+            toast('Nenhum item encontrado para "' + buscaTexto + '" no modo Agrupar.', 3500);
+        }
     });
 
-    // Grupos: cálculo pesado (O(n³)) adiado para depois do render principal
+    // ── Agrupar (itens distintos, pares e triplas) ─────────────────────────────
+    // Respeita sempre: estoque mínimo configurado, tolerância +R$40 e itens
+    // proibidos. Algoritmo restaurado da versão comprovadamente estável —
+    // ver estoque-engine.js v1.3.0 para detalhes.
     clearTimeout(_gruposTimer);
     var gWrap = document.getElementById("gruposWrap");
     if (gruparAtivo() && temPrc) {
         _gruposTimer = setTimeout(function() {
-            var grupos = encontrarGrupos(_itens, prcN);
-            renderGrupos(grupos, prcN);
+            encontrarGruposAsync(_itens, prcN, function(grupos) {
+                renderGrupos(grupos, prcN);
+                if ((!grupos || grupos.length === 0) && gruparAtivo()) {
+                    _buscarRestanteSeNecessario('grupo', prcN);
+                }
+            }, _gruposGenObj, null, {
+                estoqueMinimo:      _S.estoqueMinimo || 0,
+                proibidosEmbutidos: _S.proibidosEmbutidos,
+                proibidosExtra:     _S.proibidosExtra
+            });
         }, 0);
-    } else {
-        if (gWrap) gWrap.style.display = "none";
+    } else if (gWrap) {
+        gWrap.style.display = "none";
+    }
+
+    // ── Combinar (qtd×item com repetição, marcação via botão + confirmação) ───
+    clearTimeout(_combinarTimer);
+    var cWrap = document.getElementById("combinarWrap");
+    if (combinarAtivo() && temPrc) {
+        if (cWrap) cWrap.style.display = 'block';
+        _combinarTimer = setTimeout(function() {
+            var statusEl = document.getElementById('combinarStatus');
+            encontrarCombinacoesComRepeticaoAsync(_itens, prcN, function(combos) {
+                renderCombinar(combos, prcN);
+            }, {
+                estoqueMinimo: _S.estoqueMinimo || 0,
+                gen: _combinarGenObj,
+                onStatus: function(msg) { if (statusEl) statusEl.textContent = msg; }
+            });
+        }, 0);
+    } else if (cWrap) {
+        cWrap.style.display = "none";
+        _combinarGenObj.valor++; // cancela qualquer cálculo em andamento ao desligar
     }
 }
 
 // ── Marcar item como usado (via data-attribute para evitar escaping de onclick) ─
-function marcarUsadoBtn(el) {
-    var cod = el ? el.getAttribute("data-cod") : null;
-    if (!cod) return;
-    el.disabled  = true;
-    el.textContent = "...";
-    // Copia o código para o clipboard e exibe feedback visual imediato
+// ── Verificação de estoque mínimo antes de "Usar" ────────────────────────────
+// Verifica se algum dos itens está abaixo do estoqueMinimo configurado.
+// • Se não houver problema → chama onOk() imediatamente.
+// • Se houver → exibe modal de aviso (⚠) com lista dos itens e estoque de cada um.
+//   Continuar: chama onOk()  |  Cancelar: restaura btnEl ao estado original.
+// Parâmetros:
+//   itens   : array de objetos item (precisa de .estoque, .descricao, .codigo)
+//   onOk    : callback a chamar quando o usuário confirmar ou não houver problema
+//   btnEl   : (opcional) botão que disparou a ação — desativado enquanto modal está aberto
+function _usarComVerificacao(itens, onOk, btnEl) {
+    var min = _S.estoqueMinimo != null ? Number(_S.estoqueMinimo) : 0;
+    if (!min || min <= 0 || !itens || !itens.length) { onOk(); return; }
+
+    var abaixo = [];
+    for (var _vi = 0; _vi < itens.length; _vi++) {
+        if (Number(itens[_vi].estoque || 0) < min) abaixo.push(itens[_vi]);
+    }
+    if (!abaixo.length) { onOk(); return; }
+
+    // Monta mensagem listando cada item abaixo do mínimo
+    var linhas = abaixo.map(function(it) {
+        return '\u2022 ' + (it.descricao || it.codigo) +
+               ' \u2014 ' + Number(it.estoque || 0) + ' unid. em estoque';
+    });
+    var msg = (abaixo.length === 1
+            ? 'Este item est\u00e1 com estoque abaixo do m\u00ednimo:'
+            : 'Os seguintes itens est\u00e3o com estoque abaixo do m\u00ednimo:')
+        + '\\n' + linhas.join('\\n')
+        + '\\n\\nM\\u00ednimo configurado: ' + min + ' unid.'
+        + '\\n\\nDeseja continuar mesmo assim?';
+
+    // Desativa o botão imediatamente (evita clique duplo durante o modal)
+    var origText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '...'; }
+
+    _modalConfirm(msg,
+        function() { onOk(); },
+        function() {
+            // Cancelar: restaura o botão ao estado original
+            if (btnEl) { btnEl.disabled = false; btnEl.textContent = origText; }
+        },
+        {
+            tituloHtml: _icons.warn + ' Estoque abaixo do m\u00ednimo',
+            okLabel: 'Continuar',
+            okClass: 'btn btn-w btn-sm'
+        }
+    );
+}
+
+// Executa a marcação de um único item como usado (chamado após passar pela verificação)
+function _executarMarcarUsado(el, cod) {
+    el.disabled    = true;
+    el.textContent = '...';
     _copiarTexto(cod, function() {
         toast('\u2713 C\u00f3digo ' + cod + ' copiado!', 1800);
     });
@@ -1576,22 +2537,32 @@ function marcarUsadoBtn(el) {
         body:    JSON.stringify({ codigo: cod })
     }).then(function(r) {
         if (!r || !r.ok) {
-            el.disabled  = false;
+            el.disabled    = false;
             el.textContent = "Usar";
             toast("Falha ao registrar.", 2000);
             return;
         }
         toast("\u2713 " + cod + " \u2014 movido para a fila de usados.", 2400);
-        // Atualização LOCAL: marca o item e reordena sem round-trip completo ao servidor.
-        // Espelha exatamente o que o servidor faz em reordenarFila():
-        //   não-usados primeiro → usados no final.
         for (var _i = 0; _i < _itens.length; _i++) {
             if (_itens[_i].codigo === cod) { _itens[_i].usado = true; break; }
         }
         _itens.sort(function(a, b) { return (a.usado ? 1 : 0) - (b.usado ? 1 : 0); });
-        _dadosFingerprint = ''; // invalida fingerprint para eventual re-sync posterior
-        filtrar();              // re-filtra e re-renderiza sem buscar dados do servidor
+        _dadosFingerprint = '';
+        filtrar();
     });
+}
+
+function marcarUsadoBtn(el) {
+    var cod = el ? el.getAttribute("data-cod") : null;
+    if (!cod) return;
+    // Localiza o item para checar o estoque antes de prosseguir
+    var item = null;
+    for (var _fi = 0; _fi < _itens.length; _fi++) {
+        if (_itens[_fi].codigo === cod) { item = _itens[_fi]; break; }
+    }
+    _usarComVerificacao(item ? [item] : [], function() {
+        _executarMarcarUsado(el, cod);
+    }, el);
 }
 
 // ── Resetar usados ────────────────────────────────────────────────────────────
@@ -1631,13 +2602,54 @@ function atualizarBanco() {
 
 // ── Limpar filtros ────────────────────────────────────────────────────────────
 function limparFiltros() {
-    var b = document.getElementById("txtBusca");
-    var p = document.getElementById("numPrc");
-    var x = document.getElementById("prcBox");
-    if (b) b.value = "";
+    var b  = document.getElementById("txtBusca");
+    var bm = document.getElementById("txtBuscaMulti");
+    var p  = document.getElementById("numPrc");
+    var x  = document.getElementById("prcBox");
+    if (b)  b.value  = "";
+    if (bm) bm.value = "";
     if (p) p.value = "";
     if (x) x.classList.remove("vis");
+    // Cancela qualquer busca exaustiva pendente/em andamento (item, grupo ou multi)
+    clearTimeout(_buscaRestanteTimer.item);
+    clearTimeout(_buscaRestanteTimer.grupo);
+    clearTimeout(_buscaRestanteTimer.multi);
+    _buscaRestanteGen.item++;
+    _buscaRestanteGen.grupo++;
+    _buscaRestanteGen.multi++;
     filtrar();
+}
+
+// ── Toggle de ordenação por coluna ────────────────────────────────────────────
+// Chamado pelo onclick dos TH de Estoque e Preço.
+// • Mesma coluna → inverte direção (asc ↔ desc)
+// • Outra coluna → muda coluna, direção padrão: estoque=desc, preço=asc
+function toggleSort(key) {
+    if (!key) return;
+    if (_sortKey === key) {
+        _sortDir = (_sortDir === 'desc') ? 'asc' : 'desc';
+    } else {
+        _sortKey = key;
+        _sortDir = (key === 'preco') ? 'asc' : 'desc';
+    }
+    try {
+        localStorage.setItem('est-sort-key', _sortKey);
+        localStorage.setItem('est-sort-dir', _sortDir);
+    } catch(_) {}
+    // Atualiza label no header
+    _atualizarHdrSortLabel();
+    // Força re-render (fingerprint zerado para não pular a renderização)
+    _dadosFingerprint = '';
+    filtrar();
+}
+
+// Atualiza o texto "Ordenando por X ▼/▲" no hdr-sub
+function _atualizarHdrSortLabel() {
+    var el = document.getElementById('hdrSortLabel');
+    if (!el) return;
+    var nome = (_sortKey === 'preco') ? 'Pre\u00e7o' : 'Estoque';
+    var ico  = (_sortDir === 'desc') ? ' \u25bc' : ' \u25b2';
+    el.textContent = nome + ico;
 }
 
 // ── Debounce para o campo de busca (evita filtrar() a cada tecla) ─────────────
@@ -1646,7 +2658,45 @@ function filtrarDebounced() {
     _filtrarTimer = setTimeout(filtrar, 160);
 }
 
-// ── Limite de itens exibidos ──────────────────────────────────────────────────
+// Gera e injeta 5 opções distribuídas em [max/5 … max] no select "selLimite".
+// Algoritmo:
+//   step = max / 5  →  arredonda para múltiplo de potência de 10 (mín. 10)
+//   opções 1-4 = step×1 … step×4 (arredondadas, sem duplicatas e < max)
+//   opção 5    = max (sempre exato)
+// Seleciona automaticamente a maior opção ≤ _limiteItens atual.
+function _atualizarSelLimite(max) {
+    var sel = document.getElementById('selLimite');
+    if (!sel || !max || max < 1) return;
+
+    var rawStep = max / 5;
+    // Magnitude de arredondamento: potência de 10 um nível abaixo do step (mín. 10)
+    var logStep = Math.floor(Math.log10(Math.max(rawStep, 1)) - 0.5);
+    var mag     = Math.pow(10, logStep < 1 ? 1 : logStep); // mínimo 10
+
+    var opts = [];
+    for (var i = 1; i <= 4; i++) {
+        var v = Math.round(Math.round(rawStep * i) / mag) * mag;
+        v = Math.min(Math.max(v, 1), max - 1); // garante sempre < max (evita duplicata com último)
+        if (!opts.length || opts[opts.length - 1] !== v) opts.push(v);
+    }
+    opts.push(max); // quinta opção: máximo exato sempre presente
+
+    // Reconstrói as <option>
+    while (sel.firstChild) sel.removeChild(sel.firstChild);
+    var curLimite   = (typeof _limiteItens !== 'undefined' && _limiteItens > 0) ? _limiteItens : max;
+    var selecionado = opts[opts.length - 1]; // fallback: última (maior)
+    for (var j = 0; j < opts.length; j++) {
+        var opt         = document.createElement('option');
+        opt.value       = String(opts[j]);
+        opt.textContent = String(opts[j]);
+        sel.appendChild(opt);
+        // Seleciona a maior opção que não supere o limite atual
+        if (opts[j] <= curLimite) selecionado = opts[j];
+    }
+    sel.value    = String(selecionado);
+    _limiteItens = selecionado;
+}
+
 function aplicarLimite() {
     var sel = document.getElementById('selLimite');
     var val = sel ? parseInt(sel.value, 10) : _S.maxItens;
@@ -1664,81 +2714,139 @@ function fmtBRLt(v) {
     return 'R$ ' + Math.abs(n).toFixed(2).replace('.',',');
 }
 
-// ── Copiar com fallback ───────────────────────────────────────────────────────
-function fallbackCopy(txt) {
-    var ta = document.createElement('textarea');
-    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.focus(); ta.select();
-    try { document.execCommand('copy'); toast('Codigos copiados!', 2000); }
-    catch(e) { toast('Nao foi possivel copiar.', 2000); }
-    document.body.removeChild(ta);
-}
 
-// ── encontrarGrupos: combinações de 2 ou 3 itens cujos preços somam ao valor ──
-// Retorna até 20 grupos, priorizando os mais próximos do valor-alvo.
-function encontrarGrupos(itens, valor) {
-    if (!itens || !itens.length || !valor || valor <= 0) return [];
+// ── Modo Combinar (qtd×item) ──────────────────────────────────────────────────
+var _combinarTimer = null;
 
-    var acima   = acimaAtivo();
-    var alvoMin = valor;
-    var alvoMax = acima ? valor + 40 : valor;
-    var EPS     = 0.005; // tolerância de float (~1 centavo)
 
-    // Só candidatos com preço > 0 e <= alvoMax
-    var cands = [];
-    for (var _ci = 0; _ci < itens.length; _ci++) {
-        var _cp = Number(itens[_ci].preco);
-        if (_cp > 0 && _cp <= alvoMax + EPS) cands.push(itens[_ci]);
-    }
-    // Limita candidatos para não explodir O(n³)
-    if (cands.length > 250) cands = cands.slice(0, 250);
+function renderCombinar(combos, valor, usosSimulados) {
+    var wrap  = document.getElementById('combinarWrap');
+    var grid  = document.getElementById('combinarGrid');
+    var label = document.getElementById('combinarValorLabel');
+    if (!wrap || !grid) return;
+    if (label) label.textContent = 'R$ ' + valor.toFixed(2).replace('.', ',');
+    wrap.style.display = 'block';
+    while (grid.firstChild) grid.removeChild(grid.firstChild);
 
-    // Pré-extrai preços numéricos uma única vez (evita Number() repetido nos loops internos)
-    var _precos = new Array(cands.length);
-    for (var _pi = 0; _pi < cands.length; _pi++) {
-        _precos[_pi] = Number(cands[_pi].preco);
+    if (!combos || !combos.length) {
+        var vazio = document.createElement('div');
+        vazio.className = 'grp-vazio';
+        vazio.textContent = 'Nenhuma combina\u00e7\u00e3o encontrada.';
+        grid.appendChild(vazio);
+        return;
     }
 
-    var grupos = [];
-    var LIMITE = 30;
+    combos.forEach(function(combo, idx) {
+        var diff = +((combo.soma || 0) - valor).toFixed(2);
+        var card = document.createElement('div');
+        card.className = 'grp-card';
 
-    // ── Pares ──
-    for (var a = 0; a < cands.length && grupos.length < LIMITE; a++) {
-        var pa = _precos[a];
-        for (var b = a + 1; b < cands.length && grupos.length < LIMITE; b++) {
-            var soma2 = pa + _precos[b];
-            if (soma2 >= alvoMin - EPS && soma2 <= alvoMax + EPS) {
-                grupos.push({ itens: [cands[a], cands[b]], soma: +soma2.toFixed(2) });
-            }
+        // Agrupa itens repetidos em linhas de "Nx descricao"
+        var contagemPorCod = {};
+        var ordem = [];
+        combo.itens.forEach(function(it) {
+            if (!contagemPorCod[it.codigo]) { contagemPorCod[it.codigo] = { it: it, qtd: 0 }; ordem.push(it.codigo); }
+            contagemPorCod[it.codigo].qtd++;
+        });
+
+        ordem.forEach(function(cod) {
+            var c = contagemPorCod[cod];
+            var row = document.createElement('div');
+            row.className = 'grp-card-item';
+
+            var qtdEl = document.createElement('span');
+            qtdEl.style.cssText = 'color:var(--acc);font-weight:700;min-width:24px;flex-shrink:0';
+            qtdEl.textContent = c.qtd + '\u00d7';
+
+            var codEl = document.createElement('span');
+            codEl.className = 'grp-cod';
+            codEl.textContent = cod;
+
+            var nm = document.createElement('span');
+            nm.className = 'nm';
+            nm.title = c.it.descricao;
+            nm.textContent = c.it.descricao;
+
+            var barEl = document.createElement('span');
+            barEl.className = 'grp-bar';
+            barEl.textContent = c.it.codbarras || '-';
+
+            var pvEl = document.createElement('span');
+            pvEl.className = 'pv';
+            pvEl.textContent = fmtBRLt(c.it.preco);
+
+            row.appendChild(qtdEl);
+            row.appendChild(codEl);
+            row.appendChild(nm);
+            row.appendChild(barEl);
+            row.appendChild(pvEl);
+            card.appendChild(row);
+        });
+
+        var foot = document.createElement('div');
+        foot.className = 'grp-total';
+
+        var lblEl = document.createElement('span');
+        lblEl.className = 'lbl';
+        lblEl.textContent = combo.itens.length + (combo.itens.length === 1 ? ' item' : ' itens');
+
+        var rhs = document.createElement('span');
+        rhs.style.cssText = 'display:flex;align-items:center;gap:8px';
+
+        var valEl = document.createElement('span');
+        valEl.className = 'val';
+        valEl.textContent = fmtBRLt(combo.soma);
+        rhs.appendChild(valEl);
+
+        if (diff !== 0) {
+            var diffEl = document.createElement('span');
+            diffEl.className = diff > 0 ? 'diff-pos' : 'diff-neg';
+            diffEl.textContent = (diff > 0 ? '+' : '-') + fmtBRLt(Math.abs(diff));
+            rhs.appendChild(diffEl);
         }
-    }
 
-    // ── Triplas (apenas se ainda precisamos de mais grupos) ──
-    if (grupos.length < 20) {
-        for (var a2 = 0; a2 < cands.length && grupos.length < LIMITE; a2++) {
-            var pa2 = _precos[a2];
-            if (pa2 >= alvoMax + EPS) continue;
-            for (var b2 = a2 + 1; b2 < cands.length && grupos.length < LIMITE; b2++) {
-                var pb2 = _precos[b2];
-                var ab2 = pa2 + pb2;
-                if (ab2 >= alvoMax + EPS) continue;
-                for (var c2 = b2 + 1; c2 < cands.length && grupos.length < LIMITE; c2++) {
-                    var soma3 = ab2 + _precos[c2];
-                    if (soma3 >= alvoMin - EPS && soma3 <= alvoMax + EPS) {
-                        grupos.push({ itens: [cands[a2], cands[b2], cands[c2]], soma: +soma3.toFixed(2) });
-                    }
-                }
-            }
-        }
-    }
+        // Botão "Usar" — requer confirmação antes de marcar como usado
+        var usarBtn = document.createElement('button');
+        usarBtn.className = 'btn btn-usar btn-sm';
+        usarBtn.textContent = 'Usar (' + (idx + 1) + ')';
+        usarBtn.title = 'Confirmar e marcar itens como usados';
 
-    // Ordena do mais próximo ao valor-alvo usando transformação de Schwartzian:
-    // pré-computa Math.abs uma única vez por elemento antes de ordenar.
-    return grupos
-        .map(function(g) { return { g: g, d: Math.abs(g.soma - valor) }; })
-        .sort(function(x, y) { return x.d - y.d; })
-        .slice(0, 20)
-        .map(function(x) { return x.g; });
+        (function(itensCombo, usarBtnRef) {
+            usarBtnRef.addEventListener('click', function() {
+                // Lista o que vai ser marcado (com quantidade)
+                var linhasCod = ordem.map(function(cod) {
+                    var c = contagemPorCod[cod];
+                    return c.qtd + '\u00d7 ' + cod + ' (' + c.it.descricao + ')';
+                });
+                _modalConfirm(
+                    'Confirmar uso dos seguintes itens?\\n\\n' + linhasCod.join('\\n') +
+                    '\\n\\nTotal: ' + fmtBRLt(combo.soma),
+                    function() {
+                        _usarComVerificacao(itensCombo, function() {
+                            marcarGrupoUsado(itensCombo, function(n) {
+                                var codsTexto = ordem.map(function(cod) {
+                                    return contagemPorCod[cod].qtd + '\u00d7' + cod;
+                                }).join(' ');
+                                _copiarTexto(codsTexto, function() {});
+                                toast('\u2713 ' + n + ' item' + (n === 1 ? '' : 's') +
+                                    ' marcado' + (n === 1 ? '' : 's') + ' como usado' + (n === 1 ? '' : 's') + '!', 3000);
+                                // Re-executa a busca de combinações com o pool atualizado
+                                filtrar();
+                            });
+                        }, usarBtnRef);
+                    },
+                    null,
+                    { titulo: 'Usar combina\u00e7\u00e3o', okLabel: 'Confirmar uso', okClass: 'btn btn-usar btn-sm' }
+                );
+            });
+        })(combo.itens, usarBtn);
+
+        rhs.appendChild(usarBtn);
+        foot.appendChild(lblEl);
+        foot.appendChild(rhs);
+        card.appendChild(foot);
+        grid.appendChild(card);
+    });
 }
 
 // ── Renderizar grupos — via DOM (sem innerHTML complexo) ──────────────────────
@@ -1754,7 +2862,7 @@ function renderGrupos(grupos, valor) {
     if (!grupos || !grupos.length) {
         var vazio = document.createElement('div');
         vazio.className = 'grp-vazio';
-        vazio.textContent = 'Nenhuma combinacao encontrada. Tente ativar +R$40.';
+        vazio.textContent = 'Nenhuma combina\u00e7\u00e3o encontrada.';
         grid.appendChild(vazio);
         return;
     }
@@ -1828,27 +2936,31 @@ function renderGrupos(grupos, valor) {
 
         (function(itens) {
             usarBtn.addEventListener('click', function() {
-                var txt = itens.map(function(it) { return it.codigo || '-'; }).join(' ');
-                _copiarTexto(txt, function() {
-                    marcarGrupoUsado(itens, function(n) {
-                        toast('\u2713 C\u00f3digos copiados! ' + n + ' item' + (n===1?'':'s') +
-                              ' marcado' + (n===1?'':'s') + ' como usado' + (n===1?'':'s') + '.', 3200);
+                _usarComVerificacao(itens, function() {
+                    var txt = itens.map(function(it) { return it.codigo || '-'; }).join(' ');
+                    _copiarTexto(txt, function() {
+                        marcarGrupoUsado(itens, function(n) {
+                            toast('\u2713 C\u00f3digos copiados! ' + n + ' item' + (n===1?'':'s') +
+                                  ' marcado' + (n===1?'':'s') + ' como usado' + (n===1?'':'s') + '.', 3200);
+                        });
                     });
-                });
+                }, usarBtn);
             });
             tudoBtn.addEventListener('click', function() {
-                var linhas = itens.map(function(it) {
-                    return 'COD:' + (it.codigo||'-') +
-                           ' | EAN:' + (it.codbarras||'-') +
-                           ' | ' + it.descricao +
-                           ' | ' + fmtBRLt(it.preco);
-                });
-                _copiarTexto(linhas.join('\\n'), function() {
-                    marcarGrupoUsado(itens, function(n) {
-                        toast('\u2713 Informa\u00e7\u00f5es copiadas! ' + n + ' item' + (n===1?'':'s') +
-                              ' marcado' + (n===1?'':'s') + ' como usado' + (n===1?'':'s') + '.', 3200);
+                _usarComVerificacao(itens, function() {
+                    var linhas = itens.map(function(it) {
+                        return 'COD:' + (it.codigo||'-') +
+                               ' | EAN:' + (it.codbarras||'-') +
+                               ' | ' + it.descricao +
+                               ' | ' + fmtBRLt(it.preco);
                     });
-                });
+                    _copiarTexto(linhas.join('\\n'), function() {
+                        marcarGrupoUsado(itens, function(n) {
+                            toast('\u2713 Informa\u00e7\u00f5es copiadas! ' + n + ' item' + (n===1?'':'s') +
+                                  ' marcado' + (n===1?'':'s') + ' como usado' + (n===1?'':'s') + '.', 3200);
+                        });
+                    });
+                }, tudoBtn);
             });
         })(gr.itens);
         rhs.appendChild(usarBtn);
@@ -1881,6 +2993,33 @@ function fmtData(iso) {
     return m ? m[3] + "/" + m[2] + "/" + m[1] : String(iso);
 }
 
+// NOTA: idêntica a _normalizarCodigoNumerico() (servidor, topo do arquivo) —
+// mesmo motivo de esc()/escH() acima: dois runtimes (Node vs browser) sem
+// bundler entre eles. Resolve o mesmo problema aqui do lado do cliente: o
+// Modo Automático com lista personalizada precisa casar o código digitado
+// (ex.: "04567") contra o código que vem de _itens (ex.: "4567", se a
+// coluna do banco for numérica e tiver perdido o zero à esquerda no CAST).
+function _normalizarCodigoNumericoCliente(codigo) {
+    var s = String(codigo == null ? '' : codigo).trim();
+    if (!/^\\d+$/.test(s)) return null;
+    var semZeros = s.replace(/^0+/, '');
+    return semZeros === '' ? '0' : semZeros;
+}
+
+// NOTA: idêntica a _codigoPadrao5Digitos() (servidor) — mesmo motivo de
+// esc()/escH() acima. Regra de negócio confirmada: todo código deste
+// catálogo tem exatamente 5 dígitos (ex.: 7403 -> 07403, 8883 -> 08883).
+function _codigoPadrao5DigitosCliente(codigo) {
+    var s = String(codigo == null ? '' : codigo).trim();
+    if (!/^\\d+$/.test(s)) return null;
+    if (s.length >= 5) return s;
+    var zeros = '';
+    for (var _z = 0; _z < 5 - s.length; _z++) zeros += '0';
+    return zeros + s;
+}
+
+// NOTA (achado #1 da revisão 2026-07-11): idêntica a escH() (topo do arquivo,
+// server-side). Ver comentário lá para o porquê de existirem duas cópias.
 function esc(s) {
     return String(s == null ? "" : s)
         .replace(/&/g,  "&amp;")
@@ -1941,8 +3080,9 @@ function renderTabela() {
             s += ' &nbsp;&bull;&nbsp; <span style="color:var(--uso-txt)">' + nUso + ' usados</span>';
         }
         if (temPrc) {
-            if (acimaAtivo()) {
-                s += ' &nbsp;&bull;&nbsp; <span style="color:var(--grn)">R$' + prcN.toFixed(2).replace(".",",") + ' a R$' + (prcN+40).toFixed(2).replace(".",",") + '</span>';
+            if (combinarAtivo()) {
+                s += ' &nbsp;&bull;&nbsp; <span style="color:var(--grn)">Combinar R$' + prcN.toFixed(2).replace(".",",") +
+                     ' (\u00b1R$' + FAIXA_COMBINAR + ')</span>';
             } else {
                 s += ' &nbsp;&bull;&nbsp; <span style="color:var(--grn)">=\u00a0R$' + prcN.toFixed(2).replace(".",",") + ' (exato)</span>';
             }
@@ -1961,6 +3101,18 @@ function renderTabela() {
     }
 
     // Montar tabela via array de strings (mais performático para 500 linhas)
+    // ── Helper para gerar TH de colunas sortáveis ─────────────────────────────
+    function _thSortHtml(key, label, cls) {
+        var ativo = (_sortKey === key);
+        var ico   = ativo
+            ? '<span class="sort-ico">' + (_sortDir === 'desc' ? '\u25bc' : '\u25b2') + '</span>'
+            : '<span class="sort-ico-inativo">\u21d5</span>';
+        return '<th class="' + cls + ' th-sort' + (ativo ? ' th-sort-ativo' : '') +
+               '" onclick="toggleSort(\\'' + key + '\\')" title="Ordenar por ' + label +
+               ' (' + (ativo ? (_sortDir === 'desc' ? 'crescente' : 'decrescente') : 'clique para ordenar') + ')">' +
+               label + ico + '</th>';
+    }
+
     var buf = [
         "<table>",
         "<thead><tr>",
@@ -1968,8 +3120,8 @@ function renderTabela() {
         '<th class="th-cod">C\u00f3digo</th>',
         '<th class="th-desc">Descri\u00e7\u00e3o</th>',
         '<th class="th-bar">C\u00f3d. Barras</th>',
-        '<th class="th-est">Estoque</th>',
-        '<th class="th-prc">Pre\u00e7o</th>',
+        _thSortHtml('estoque', 'Estoque', 'th-est'),
+        _thSortHtml('preco',   'Pre\u00e7o',  'th-prc'),
         '<th class="th-uv">\u00dalt. Venda</th>',
         '<th class="th-ac">A\u00e7\u00e3o</th>',
         "</tr></thead><tbody>"
@@ -2034,8 +3186,465 @@ function abrirModoAuto() {
     document.getElementById('autoStatus').textContent = 'Aguardando lista...';
     document.getElementById('autoStatus').className   = 'auto-status';
     document.getElementById('autoIniciarBtn').disabled = false;
+    // Reseta apenas o checkbox — a lista personalizada salva (_lpDados) persiste
+    // entre aberturas do modal e entre recarregamentos da página, pois agora é
+    // sincronizada com o servidor (lista-personalizada.json)
+    var chkLp = document.getElementById('chkListaPersonalizada');
+    if (chkLp) chkLp.checked = false;
+    var lblLp = document.getElementById('lpToggleLbl');
+    if (lblLp) lblLp.textContent = 'Usar lista personalizada';
+    _atualizarResumoLp();
     _autoCodsParaMarcar = [];
     ov.classList.add('on');
+}
+
+// ── Lista personalizada: dados salvos ──────────────────────────────────────────
+// Persistida no servidor (lista-personalizada.json), no mesmo esquema de
+// usados-estoque.json: carregada do servidor em DOMContentLoaded (ver
+// _carregarListaPersonalizadaServidor) e gravada via POST a cada "Salvar lista".
+// Por isso sobrevive a F5 e a reinícios do servidor — não vive só na sessão.
+var _lpDados = []; // [{codigo, estoqueParada}, ...] — estoqueParada pode ser null (sem limite)
+
+// ── Alerta consolidado: códigos da lista personalizada esgotados ─────────────
+// Dispara toda vez que _itens é atualizado (carregarItens). Para cada código
+// configurado na lista que sumiu do catálogo (estoque zerado — o servidor só
+// retorna itens com estoque > 0) ou atingiu o estoque de parada individual
+// configurado para ele, o código entra na fila "_lpAlertasPendentes" e o
+// modal consolidado (#lpAlertaOv) mostra TODOS os pendentes de uma vez —
+// nome do produto, motivo, e botões "Excluir"/"Deixar para depois" por
+// linha, além de "Excluir todos"/"Deixar todos para depois" no rodapé.
+// Se o usuário deixar um código para depois (individual ou em massa), o
+// alerta é adiado apenas para esta sessão (sessionStorage) — ao recarregar a
+// página ou abrir o sistema numa nova sessão, o alerta volta a aparecer.
+var _lpAlertasPendentes  = []; // [{codigo, motivo, descricao}, ...] — aguardando decisão do usuário
+var _lpAlertaModalAberto = false;
+
+// sessionStorage é esvaziado automaticamente quando a aba/janela fecha —
+// diferente de localStorage, não sobrevive entre sessões, então "deixar
+// para depois" só vale até a página ser recarregada/reaberta.
+function _lpAlertaAdiado(codigo) {
+    try { return sessionStorage.getItem('est-lp-snooze-' + codigo) === '1'; } catch (_) { return false; }
+}
+function _lpAlertaAdiar(codigo) {
+    try { sessionStorage.setItem('est-lp-snooze-' + codigo, '1'); } catch (_) {}
+}
+function _lpAlertaLimparSnooze(codigo) {
+    try { sessionStorage.removeItem('est-lp-snooze-' + codigo); } catch (_) {}
+}
+
+function _verificarAlertasListaPersonalizada() {
+    if (!_lpDados.length) return;
+    // mapaDesc é fallback SECUNDÁRIO pra exibir o nome do produto — a fonte
+    // primária é o próprio _lpEstoquesReais[codigo].descricao (capturada no
+    // servidor direto da linha do banco, antes do filtro de proibidos — ver
+    // /api/itens). mapaDesc só entra em jogo se por algum motivo a resposta
+    // do servidor não trouxer descrição pra aquele código específico.
+    var mapaDesc = Object.create(null);
+    for (var i = 0; i < _itens.length; i++) mapaDesc[_itens[i].codigo] = _itens[i];
+
+    var novos = [];
+    for (var j = 0; j < _lpDados.length; j++) {
+        var lpItem   = _lpDados[j];
+        var lpReal   = Object.prototype.hasOwnProperty.call(_lpEstoquesReais, lpItem.codigo)
+                        ? _lpEstoquesReais[lpItem.codigo] : null;
+        // temReal exige um número de estoque válido — lpReal existe mas
+        // .estoque pode vir null se a consulta dedicada (rLp, servidor) achou
+        // a linha porém não conseguiu converter ESTOQUE num número finito
+        // (dado corrompido no banco) — tratado como "não deu pra confirmar",
+        // mesmo caminho de "não encontrado" (nunca finge que está tudo bem).
+        var temReal     = !!(lpReal && typeof lpReal.estoque === 'number' && !isNaN(lpReal.estoque));
+        var estoqueReal = temReal ? lpReal.estoque : null;
+
+        // Motivo REAL e específico — a consulta dedicada no servidor (rLp,
+        // sem o filtro "estoque >= 0" da query principal) permite diferenciar
+        // de verdade estes 4 casos, em vez de um "chegou a zero" genérico
+        // pra qualquer situação:
+        var motivo = null;
+        if (!temReal) {
+            motivo = 'o c\u00f3digo n\u00e3o existe mais no banco (foi exclu\u00eddo ou renomeado no ERP)';
+        } else if (estoqueReal < 0) {
+            motivo = 'o estoque est\u00e1 NEGATIVADO (valor atual no banco: ' + estoqueReal + ' unid. \u2014 verifique o cadastro no ERP)';
+        } else if (estoqueReal === 0) {
+            motivo = 'o estoque chegou a zero';
+        } else if (lpItem.estoqueParada != null && estoqueReal <= Number(lpItem.estoqueParada)) {
+            motivo = 'o estoque atingiu o valor de parada configurado (atual: ' + estoqueReal + ' unid. \u2014 parada em ' + lpItem.estoqueParada + ' unid.)';
+        }
+        if (!motivo) continue;
+
+        if (_lpAlertaAdiado(lpItem.codigo)) continue; // já adiado nesta sessão
+
+        var jaNaFila = false;
+        for (var k = 0; k < _lpAlertasPendentes.length; k++) {
+            if (_lpAlertasPendentes[k].codigo === lpItem.codigo) { jaNaFila = true; break; }
+        }
+        if (jaNaFila) continue;
+        // descricao: 1) _lpEstoquesReais (fonte primária, sobrevive a filtro de
+        // proibidos); 2) mapaDesc (fallback); 3) null → UI mostra "não
+        // encontrada" em vez de deixar em branco ou quebrar.
+        var atual     = mapaDesc[lpItem.codigo];
+        var descricao = (lpReal && lpReal.descricao) ? lpReal.descricao : (atual ? atual.descricao : null);
+        novos.push({ codigo: lpItem.codigo, motivo: motivo, descricao: descricao });
+    }
+    if (novos.length) {
+        _lpAlertasPendentes = _lpAlertasPendentes.concat(novos);
+        _abrirOuAtualizarAlertaLpModal();
+    }
+}
+
+// ── Modal consolidado (abrir/atualizar/fechar) ────────────────────────────────
+function _abrirOuAtualizarAlertaLpModal() {
+    if (!_lpAlertasPendentes.length) { _fecharAlertaLpModal(); return; }
+    _renderAlertaLpModal();
+    if (!_lpAlertaModalAberto) {
+        var ov = document.getElementById('lpAlertaOv');
+        if (ov) { ov.classList.add('on'); _lpAlertaModalAberto = true; }
+    }
+}
+
+function _fecharAlertaLpModal() {
+    var ov = document.getElementById('lpAlertaOv');
+    if (ov) ov.classList.remove('on');
+    _lpAlertaModalAberto = false;
+}
+
+// Monta a lista de linhas do modal a partir de _lpAlertasPendentes. Usa
+// textContent (nunca innerHTML) para nome/motivo — evita XSS caso a
+// descrição do produto contenha caracteres especiais vindos do banco.
+function _renderAlertaLpModal() {
+    var lista = document.getElementById('lpAlertaLista');
+    var count = document.getElementById('lpAlertaCount');
+    if (!lista) return;
+    while (lista.firstChild) lista.removeChild(lista.firstChild);
+
+    if (count) {
+        var n = _lpAlertasPendentes.length;
+        count.textContent = n + (n === 1 ? ' c\u00f3digo precisa' : ' c\u00f3digos precisam') +
+            ' da sua decis\u00e3o: exclu\u00edr da lista ou deixar para decidir depois.';
+    }
+
+    _lpAlertasPendentes.forEach(function(alerta) {
+        var row = document.createElement('div');
+        row.className = 'lpa-row';
+
+        var info = document.createElement('div');
+        info.className = 'lpa-info';
+
+        var linhaCod = document.createElement('div');
+        linhaCod.className = 'lpa-nome';
+        linhaCod.textContent = 'C\u00f3digo ' + alerta.codigo;
+
+        var linhaItem = document.createElement('div');
+        linhaItem.className = 'lpa-item';
+        var textoItem = 'Item: ' + (alerta.descricao || '(descri\u00e7\u00e3o n\u00e3o encontrada no banco)');
+        linhaItem.textContent = textoItem;
+        linhaItem.title = textoItem; // tooltip com nome completo se truncar por ellipsis
+
+        var motivo = document.createElement('div');
+        motivo.className = 'lpa-motivo';
+        motivo.textContent = 'Motivo: ' + alerta.motivo + '.';
+
+        info.appendChild(linhaCod);
+        info.appendChild(linhaItem);
+        info.appendChild(motivo);
+
+        var btns = document.createElement('div');
+        btns.className = 'lpa-btns';
+
+        var bDepois = document.createElement('button');
+        bDepois.className = 'btn btn-s btn-sm';
+        bDepois.textContent = 'Deixar para depois';
+        bDepois.title = 'Manter na lista \u2014 pergunto de novo na pr\u00f3xima sess\u00e3o (ou se o item continuar pendente nesta mesma sess\u00e3o)';
+
+        var bExcluir = document.createElement('button');
+        bExcluir.className = 'btn btn-d btn-sm';
+        bExcluir.textContent = 'Excluir';
+        bExcluir.title = 'Remover este c\u00f3digo da lista personalizada';
+
+        // { once: true } evita duplo-clique disparar a ação duas vezes
+        // (a linha é removida do DOM logo após o clique, mas o listener
+        // ainda poderia disparar de novo num clique muito rápido).
+        (function(codigo) {
+            bDepois.addEventListener('click', function() { _lpaResolverItem(codigo, 'depois'); }, { once: true });
+            bExcluir.addEventListener('click', function() { _lpaResolverItem(codigo, 'excluir'); }, { once: true });
+        })(alerta.codigo);
+
+        btns.appendChild(bDepois);
+        btns.appendChild(bExcluir);
+
+        row.appendChild(info);
+        row.appendChild(btns);
+        lista.appendChild(row);
+    });
+}
+
+// Resolve UM único código (botões da linha): remove da fila local, aplica a
+// decisão (excluir da lista OU adiar 1 dia) e re-renderiza. Fecha o modal
+// automaticamente quando não sobrar nenhum pendente.
+function _lpaResolverItem(codigo, acao) {
+    var idx = -1;
+    for (var i = 0; i < _lpAlertasPendentes.length; i++) {
+        if (_lpAlertasPendentes[i].codigo === codigo) { idx = i; break; }
+    }
+    if (idx === -1) return; // defensivo: já resolvido (ex.: clique duplo/rápido)
+    _lpAlertasPendentes.splice(idx, 1);
+
+    if (acao === 'excluir') {
+        _lpAlertaLimparSnooze(codigo);
+        _removerCodigosListaPersonalizada([codigo]);
+    } else {
+        _lpAlertaAdiar(codigo);
+    }
+
+    if (_lpAlertasPendentes.length) {
+        _renderAlertaLpModal();
+    } else {
+        _fecharAlertaLpModal();
+    }
+}
+
+// Resolve TODOS os pendentes de uma só vez (botões do rodapé e o X de fechar
+// — fechar o modal sem escolher por item é tratado como "deixar para
+// depois" para tudo que ainda estava pendente, nunca perde a lista nem
+// deixa estado inconsistente entre _lpAlertasPendentes e o localStorage).
+function _lpaResolverTodos(acao) {
+    if (!_lpAlertasPendentes.length) { _fecharAlertaLpModal(); return; }
+    var codigos = _lpAlertasPendentes.map(function(a) { return a.codigo; });
+    _lpAlertasPendentes = [];
+
+    if (acao === 'excluir') {
+        codigos.forEach(_lpAlertaLimparSnooze);
+        _removerCodigosListaPersonalizada(codigos);
+    } else {
+        codigos.forEach(_lpAlertaAdiar);
+        toast('Vou lembrar voc\u00ea de novo na pr\u00f3xima sess\u00e3o sobre ' + codigos.length +
+              (codigos.length === 1 ? ' c\u00f3digo.' : ' c\u00f3digos.'), 3500);
+    }
+
+    _fecharAlertaLpModal();
+}
+
+// Remove um ou mais códigos de _lpDados numa ÚNICA gravação no servidor
+// (mesma rota usada por salvarListaPersonalizada) — usado tanto pela
+// exclusão individual (array de 1) quanto por "Excluir todos" (array com
+// N códigos), evitando N requisições POST sequenciais e a condição de
+// corrida de reler/escrever _lpDados entre elas.
+function _removerCodigosListaPersonalizada(codigos) {
+    if (!codigos || !codigos.length) return;
+    var remover = Object.create(null);
+    codigos.forEach(function(c) { remover[c] = true; });
+    var novaLista = _lpDados.filter(function(it) { return !remover[it.codigo]; });
+    apiFetch('/api/lista-personalizada', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ itens: novaLista })
+    }).then(function(r) {
+        if (r && r.ok) {
+            _lpDados = novaLista;
+            _atualizarResumoLp();
+            toast('\u2713 ' + codigos.length + (codigos.length === 1 ? ' c\u00f3digo removido' : ' c\u00f3digos removidos') +
+                  ' da lista personalizada.', 3500);
+        } else {
+            toast('N\u00e3o foi poss\u00edvel remover ' + codigos.length + ' c\u00f3digo(s) da lista (erro ao salvar no servidor). ' +
+                  'Abra a lista personalizada para conferir o estado atual.', 4500);
+        }
+    }).catch(function() {
+        toast('Erro de conex\u00e3o ao tentar remover c\u00f3digo(s) da lista. Abra a lista personalizada para conferir o estado atual.', 4500);
+    });
+}
+
+// ── Toggle único (ativar/desativar) ────────────────────────────────────────────
+// Quando marcado: restringe a busca apenas aos códigos configurados, permitindo
+// repeti-los. Se ainda não houver lista salva, abre o modal de configuração.
+function toggleListaPersonalizada() {
+    var chk = document.getElementById('chkListaPersonalizada');
+    var lbl = document.getElementById('lpToggleLbl');
+    if (!chk || !lbl) return;
+    var ativo = chk.checked;
+    lbl.textContent = ativo ? 'Lista personalizada ativa' : 'Usar lista personalizada';
+    if (ativo && _lpDados.length === 0) {
+        abrirListaPersonalizadaModal();
+    }
+    // Ao ATIVAR a lista personalizada, verifica na hora se algum código já
+    // configurado esgotou (estoque zero) ou atingiu o estoque de parada
+    // individual — não espera o próximo ciclo de poll. Usa os dados de
+    // catálogo já carregados (_itens); se ainda não chegaram, a verificação
+    // do próximo carregarItens() cobre o caso.
+    if (ativo && _lpDados.length > 0 && _itens.length > 0) {
+        _verificarAlertasListaPersonalizada();
+    }
+    // "Reaproveitar código" só faz sentido no modo padrão — a lista
+    // personalizada já tem reaproveitamento nativo (com estoque de parada
+    // por código), então o toggle fica desabilitado e visualmente apagado
+    // enquanto ela estiver ativa.
+    var chkReap = document.getElementById('chkReaproveitarPadrao');
+    var wrapReap = document.getElementById('reaproveitarToggleWrap');
+    if (chkReap) chkReap.disabled = ativo;
+    if (wrapReap) wrapReap.style.opacity = ativo ? '0.45' : '';
+}
+
+// ── Preferência "Reaproveitar código" (modo padrão) — persistida no localStorage,
+// igual ao padrão já usado para ordenação de coluna (est-sort-key/est-sort-dir).
+// É só uma preferência de UI, não dado de negócio, por isso não vai pro servidor.
+function _salvarPrefReaproveitar() {
+    var chk = document.getElementById('chkReaproveitarPadrao');
+    if (!chk) return;
+    try { localStorage.setItem('est-reaproveitar-padrao', chk.checked ? '1' : '0'); } catch (_) {}
+}
+function _restaurarPrefReaproveitar() {
+    var chk = document.getElementById('chkReaproveitarPadrao');
+    if (!chk) return;
+    try { chk.checked = localStorage.getItem('est-reaproveitar-padrao') === '1'; } catch (_) {}
+}
+
+// ── Modal de Lista Personalizada: abrir / fechar / salvar ─────────────────────
+function abrirListaPersonalizadaModal() {
+    var ov = document.getElementById('lpOv');
+    var ta = document.getElementById('lpTextarea');
+    var st = document.getElementById('lpStatus');
+    if (!ov || !ta) return;
+    // Repopula o textarea a partir dos dados já salvos (permite reabrir e editar)
+    ta.value = _lpDados.map(function(it) {
+        return it.estoqueParada != null ? (it.codigo + ', ' + it.estoqueParada) : it.codigo;
+    }).join(String.fromCharCode(10));
+    if (st) { st.textContent = ''; st.className = 'auto-status'; }
+    ov.classList.add('on');
+}
+
+function fecharListaPersonalizadaModal() {
+    var ov = document.getElementById('lpOv');
+    if (ov) ov.classList.remove('on');
+    // Se o usuário cancelou (X, "Cancelar" ou clique fora) sem nunca ter salvo
+    // uma lista, desmarca o checkbox — não faz sentido ficar "ativo" sem
+    // nenhum código configurado.
+    if (!_lpDados.length) {
+        var chk = document.getElementById('chkListaPersonalizada');
+        if (chk && chk.checked) {
+            chk.checked = false;
+            var lbl = document.getElementById('lpToggleLbl');
+            if (lbl) lbl.textContent = 'Usar lista personalizada';
+            _atualizarResumoLp();
+            // FIX (2026-07-22): toggleListaPersonalizada() desabilita "Reaproveitar
+            // código" quando a lista personalizada é ativada (ela tem seu próprio
+            // reaproveitamento nativo) — mas esse desmarque aqui é feito direto no
+            // DOM, sem passar por toggleListaPersonalizada(), então o "Reaproveitar
+            // código" ficava travado desabilitado mesmo depois da lista
+            // personalizada voltar a ficar inativa (o usuário cancelando o modal
+            // sem salvar nunca re-habilitava o checkbox). Re-sincroniza aqui.
+            var chkReap  = document.getElementById('chkReaproveitarPadrao');
+            var wrapReap = document.getElementById('reaproveitarToggleWrap');
+            if (chkReap)  chkReap.disabled = false;
+            if (wrapReap) wrapReap.style.opacity = '';
+        }
+    }
+}
+
+function salvarListaPersonalizada() {
+    var ta  = document.getElementById('lpTextarea');
+    var st  = document.getElementById('lpStatus');
+    var btn = document.getElementById('lpSalvarBtn');
+    if (!ta) return;
+    var parsed = _parseListaPersonalizadaDetalhada(ta.value);
+    if (!parsed.length) {
+        if (st) { st.textContent = 'Adicione ao menos um c\u00f3digo antes de salvar.'; st.className = 'auto-status er'; }
+        return;
+    }
+
+    if (btn) btn.disabled = true;
+    if (st)  { st.textContent = 'Salvando...'; st.className = 'auto-status'; }
+
+    // Persiste no servidor (lista-personalizada.json) antes de confirmar — evita
+    // a UI achar que salvou quando, na real, a gravação em disco falhou.
+    apiFetch('/api/lista-personalizada', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ itens: parsed })
+    }).then(function(r) {
+        if (btn) btn.disabled = false;
+        if (!r || !r.ok) {
+            var msg = r ? (r.erro || 'Erro ao salvar no servidor.') : 'Sem resposta do servidor.';
+            if (st) { st.textContent = msg; st.className = 'auto-status er'; }
+            return;
+        }
+        _lpDados = parsed;
+        _atualizarResumoLp();
+        fecharListaPersonalizadaModal();
+        toast('\u2713 Lista personalizada salva: ' + parsed.length + ' c\u00f3digo' + (parsed.length === 1 ? '' : 's'), 2500);
+    });
+}
+
+// ── Lista personalizada: carrega do servidor ───────────────────────────────────
+// Chamada em DOMContentLoaded para popular _lpDados com o que já está gravado
+// em lista-personalizada.json — mesmo papel que /api/itens cumpre para o
+// estado "usado" de cada item. Falha de rede aqui não deve travar a página:
+// se não der, _lpDados simplesmente fica vazio até o usuário configurar.
+function _carregarListaPersonalizadaServidor() {
+    return apiFetch('/api/lista-personalizada').then(function(dados) {
+        if (dados && dados.ok && Array.isArray(dados.itens)) {
+            _lpDados = dados.itens;
+            _atualizarResumoLp();
+        }
+        return _lpDados;
+    });
+}
+
+// Atualiza o texto de resumo ao lado do botão "Configurar lista"
+function _atualizarResumoLp() {
+    var resumo = document.getElementById('lpResumo');
+    if (!resumo) return;
+    resumo.textContent = _lpDados.length > 0
+        ? _lpDados.length + ' c\u00f3digo' + (_lpDados.length === 1 ? '' : 's') + ' configurado' + (_lpDados.length === 1 ? '' : 's')
+        : '';
+}
+
+// ── Parser da lista personalizada detalhada ────────────────────────────────────
+// Formato por linha: "codigo" ou "codigo, estoque_de_parada"
+// Quando o estoque do produto atingir (ou ficar abaixo de) estoque_de_parada,
+// o modo automático para de usá-lo. Sem o segundo valor, uso ilimitado.
+// Implementado via charCodeAt (sem regex) para evitar a armadilha de escape
+// \\n vs \\\\n dentro do template literal Node.js.
+function _parseListaPersonalizadaDetalhada(raw) {
+    var itens = [];
+    if (!raw) return itens;
+
+    function _trim(s) {
+        var a = 0, b = s.length;
+        while (a < b && s.charCodeAt(a) <= 32) a++;
+        while (b > a && s.charCodeAt(b - 1) <= 32) b--;
+        return s.slice(a, b);
+    }
+
+    var NL = String.fromCharCode(10);
+    var CR = String.fromCharCode(13);
+    var normalizado = raw.split(CR + NL).join(NL).split(CR).join(NL);
+    var linhas = normalizado.split(NL);
+
+    for (var i = 0; i < linhas.length; i++) {
+        var linha = _trim(linhas[i]);
+        if (!linha) continue;
+
+        var idxVirgula = linha.indexOf(',');
+        var codigoRaw, estoqueRaw;
+        if (idxVirgula >= 0) {
+            codigoRaw  = linha.slice(0, idxVirgula);
+            estoqueRaw = linha.slice(idxVirgula + 1);
+        } else {
+            codigoRaw  = linha;
+            estoqueRaw = '';
+        }
+
+        var codigo     = _trim(codigoRaw);
+        var estoqueTxt = _trim(estoqueRaw);
+        if (!codigo) continue;
+
+        var estoqueParada = null;
+        if (estoqueTxt) {
+            var n = parseFloat(estoqueTxt.split(',').join('.'));
+            if (!isNaN(n) && n >= 0) estoqueParada = n;
+        }
+
+        itens.push({ codigo: codigo, estoqueParada: estoqueParada });
+    }
+    return itens;
 }
 
 function fecharModoAuto() {
@@ -2048,8 +3657,14 @@ function copiarResultadoAuto() {
     if (!out || !out.value) return;
     _copiarTexto(out.value, function() {
         toast('\u2713 Resultado copiado!', 2200);
-        // Agora que o usuário copiou, marca todos os itens como usados
-        var cods = _autoCodsParaMarcar.slice();
+        // Agora que o usuário copiou, marca todos os itens como usados.
+        // Deduplica por segurança — mesmo que a origem (_jaMarcado, no
+        // processamento do Modo Automático) já evite repetir o mesmo código.
+        var cods = [];
+        var _vistosCod = {};
+        _autoCodsParaMarcar.forEach(function(c) {
+            if (!_vistosCod[c]) { _vistosCod[c] = true; cods.push(c); }
+        });
         _autoCodsParaMarcar = [];
         if (!cods.length) return;
         var pendentes = cods.length;
@@ -2074,83 +3689,94 @@ function copiarResultadoAuto() {
 document.addEventListener('click', function(e) {
     var ov = document.getElementById('autoOv');
     if (ov && e.target === ov) fecharModoAuto();
+    var lpOv = document.getElementById('lpOv');
+    if (lpOv && e.target === lpOv) fecharListaPersonalizadaModal();
+    // Clique fora do modal de alerta consolidado = "deixar todos para depois"
+    // (nunca perde a lista nem deixa _lpAlertasPendentes dessincronizado do
+    // localStorage — resolve explicitamente em vez de só esconder o modal).
+    var lpAlertaOv = document.getElementById('lpAlertaOv');
+    if (lpAlertaOv && e.target === lpAlertaOv) _lpaResolverTodos('depois');
 });
 
-// Encontra a melhor combinação de itens (não usados nesta sessão) para um valor alvo.
-// Retorna { itens: [...], soma, diff } ou null se nada encontrado.
-// Estratégia: single item mais próximo, depois pares, depois triplas — sempre menor diff >= 0.
-// PERF: candidatos ordenados por proximidade ao alvo e limitados a 80 para evitar O(n³) lento.
-function _autoEncontrarMelhor(disponiveis, valor) {
-    var EPS     = 0.005;
-    var alvoMax = valor + 40;
-    var melhor  = null;
 
-    // Candidatos: preço > 0 e <= alvoMax
-    var cands = [];
-    for (var i = 0; i < disponiveis.length; i++) {
-        var p = Number(disponiveis[i].preco || 0);
-        if (p > 0 && p <= alvoMax + EPS) cands.push(disponiveis[i]);
-    }
 
-    // Pré-extrai preços numéricos UMA VEZ (evita Number() repetido nos loops internos)
-    for (var _pi = 0; _pi < cands.length; _pi++) {
-        cands[_pi]._p = Number(cands[_pi].preco || 0);
-    }
 
-    // Ordena do mais próximo ao mais distante — usa _p já extraído
-    cands.sort(function(a, b) { return Math.abs(a._p - valor) - Math.abs(b._p - valor); });
-    // Cap em 80: com os mais próximos primeiro, a qualidade do match não piora sensivelmente
-    // mas o pior caso do loop triplo cai de ~2,6M para ~85k iterações por linha
-    if (cands.length > 80) cands = cands.slice(0, 80);
 
-    function atualizar(itensGrupo, soma) {
-        var diff = +(soma - valor).toFixed(2);
-        if (diff < -EPS) return; // abaixo do valor: não serve
-        if (!melhor || diff < melhor.diff) {
-            melhor = { itens: itensGrupo.slice(), soma: soma, diff: diff };
-        }
-    }
 
-    // Single items
-    for (var a = 0; a < cands.length; a++) {
-        atualizar([cands[a]], cands[a]._p);
-        if (melhor && melhor.diff < EPS) return melhor; // match perfeito: para já
-    }
 
-    // Pares
-    outer2:
-    for (var a2 = 0; a2 < cands.length; a2++) {
-        var pa = cands[a2]._p;
-        for (var b = a2 + 1; b < cands.length; b++) {
-            var soma2 = pa + cands[b]._p;
-            if (soma2 > alvoMax + EPS) continue;
-            atualizar([cands[a2], cands[b]], soma2);
-            if (melhor && melhor.diff < EPS) break outer2; // match perfeito
-        }
-    }
-    if (melhor && melhor.diff < EPS) return melhor;
 
-    // Triplas (apenas se ainda não tem match perfeito)
-    outer3:
-    for (var a3 = 0; a3 < cands.length; a3++) {
-        var pa3 = cands[a3]._p;
-        for (var b3 = a3 + 1; b3 < cands.length; b3++) {
-            var pb3 = cands[b3]._p;
-            var ab3 = pa3 + pb3;
-            if (ab3 > alvoMax + EPS) continue;
-            for (var c3 = b3 + 1; c3 < cands.length; c3++) {
-                var soma3 = ab3 + cands[c3]._p;
-                if (soma3 > alvoMax + EPS) continue;
-                atualizar([cands[a3], cands[b3], cands[c3]], soma3);
-                if (melhor && melhor.diff < EPS) break outer3; // match perfeito
-            }
-        }
-    }
 
-    return melhor;
+// ── Sincronização forçada com o banco antes do Modo Automático ─────────────────
+// FIX (2026-07-17): iniciarModoAuto() usava _itens como estava em memória no
+// momento do clique — um snapshot alimentado por poll passivo (a cada
+// POLL_INTERVALO_MS) ou por evento SSE, ou seja, podia estar desatualizado em
+// relação ao estoque real no Firebird se outra venda tivesse acontecido entre
+// o último poll e o clique em "Iniciar". Como o Modo Automático decide QUANTAS
+// unidades de cada item ainda podem ser sugeridas (nunca abaixo de zero — ver
+// _qtdMaximaDisponivel em estoque-engine.js), a base precisa ser o estoque
+// real no instante em que o processamento começa, não um cache. Esta função
+// força um SELECT fresco (/api/atualizar) e só libera o processamento depois
+// que os dados voltarem — nunca deixa o algoritmo decidir sobre números
+// potencialmente velhos.
+var SYNC_ESTOQUE_TIMEOUT_MS   = 6000; // teto de espera — rede lenta/Firebird ocupado nunca trava a UI pra sempre
+var SYNC_ESTOQUE_POLL_MS      = 400;
+var SYNC_ESTOQUE_MAX_TENTATIVAS = Math.ceil(SYNC_ESTOQUE_TIMEOUT_MS / SYNC_ESTOQUE_POLL_MS);
+
+function _aplicarDadosItensFrescos(dados) {
+    _lpEstoquesReais = dados.lpEstoquesReais || _lpEstoquesReais;
+    _itens = (Array.isArray(dados.itens) ? dados.itens : []).slice(0, _limiteItens).map(function(it) {
+        it._descUp = it.descricao ? it.descricao.toUpperCase()         : '';
+        it._codUp  = it.codigo    ? String(it.codigo).toUpperCase()    : '';
+        it._barUp  = it.codbarras ? String(it.codbarras).toUpperCase() : '';
+        return it;
+    });
 }
 
-function iniciarModoAuto() {
+function _aguardarCargaFrescaConcluir(onPronto, tentativa) {
+    apiFetch('/api/itens').then(function(dados) {
+        if (!dados) { onPronto(); return; } // falha de rede — segue com o que já tinha em _itens
+        if (dados.carregando && tentativa < SYNC_ESTOQUE_MAX_TENTATIVAS) {
+            setTimeout(function() { _aguardarCargaFrescaConcluir(onPronto, tentativa + 1); }, SYNC_ESTOQUE_POLL_MS);
+            return;
+        }
+        // Dados frescos direto do Firebird (ou o teto de espera foi atingido —
+        // segue com o resultado mais recente que conseguiu obter; nunca trava
+        // a UI indefinidamente esperando uma rede ou banco muito lento).
+        _aplicarDadosItensFrescos(dados);
+        onPronto();
+    }).catch(function() { onPronto(); });
+}
+
+function _sincronizarEstoqueTempoReal(onPronto) {
+    apiFetch('/api/atualizar', { method: 'POST' }).then(function(r) {
+        if (!r || !r.ok) { onPronto(); return; } // já em carregamento por outro motivo — segue com o que já tinha
+        _aguardarCargaFrescaConcluir(onPronto, 0);
+    }).catch(function() { onPronto(); });
+}
+
+function iniciarModoAuto(faixaExtraOverride, tentativaExtensaoOverride) {
+    var inputEl  = document.getElementById('autoInput');
+    var statusEl = document.getElementById('autoStatus');
+    var btn      = document.getElementById('autoIniciarBtn');
+    if (!inputEl) return;
+    if (!inputEl.value.trim()) {
+        if (statusEl) { statusEl.textContent = 'Cole a lista antes de iniciar.'; statusEl.className = 'auto-status er'; }
+        return;
+    }
+    if (btn) btn.disabled = true;
+    if (statusEl) {
+        statusEl.textContent = 'Sincronizando estoque em tempo real com o banco...';
+        statusEl.className   = 'auto-status';
+    }
+    _sincronizarEstoqueTempoReal(function() {
+        _iniciarModoAutoAposSync(faixaExtraOverride, tentativaExtensaoOverride);
+    });
+}
+
+// Contém toda a lógica original do Modo Automático — só roda depois que
+// iniciarModoAuto() (acima) confirma que _itens reflete o estoque real mais
+// recente possível do Firebird.
+function _iniciarModoAutoAposSync(faixaExtraOverride, tentativaExtensaoOverride) {
     var inputEl  = document.getElementById('autoInput');
     var outputEl = document.getElementById('autoOutput');
     var statusEl = document.getElementById('autoStatus');
@@ -2158,6 +3784,18 @@ function iniciarModoAuto() {
     var copyBtn  = document.getElementById('autoCopyBtn');
     var btn      = document.getElementById('autoIniciarBtn');
     if (!inputEl || !outputEl) return;
+
+    // faixaExtraOverride: quando o usuário decide ampliar a busca (ex: +80, +120...)
+    var _faixaAutoAtual = (typeof faixaExtraOverride === 'number' && faixaExtraOverride >= 0)
+        ? faixaExtraOverride
+        : 0;
+
+    // tentativaExtensaoOverride: quantas "sessões" de busca estendida no banco já
+    // foram usadas neste processamento (máx. 5 — ver _perguntarExtensaoBusca abaixo)
+    var _tentativaExtensaoAtual = (typeof tentativaExtensaoOverride === 'number' && tentativaExtensaoOverride >= 0)
+        ? tentativaExtensaoOverride
+        : 0;
+    var MAX_TENTATIVAS_EXTENSAO = 5;
 
     var raw = inputEl.value.trim();
     if (!raw) {
@@ -2172,18 +3810,107 @@ function iniciarModoAuto() {
     }
 
     btn.disabled = true;
-    statusEl.textContent = 'Processando...';
+    var _limLabel = _faixaAutoAtual > 0 ? ' (faixa +R$' + (40 + _faixaAutoAtual) + ')' : '';
+    statusEl.textContent = 'Processando' + _limLabel + '...';
     statusEl.className   = 'auto-status';
+
+    // ── Lista personalizada: restringe o pool de busca e habilita repetição ────
+    var chkLp = document.getElementById('chkListaPersonalizada');
+    var lpAtiva = !!(chkLp && chkLp.checked);
+    var poolPersonalizado    = [];
+    var _estoqueParadaPorCod = {}; // codigo -> limite de estoque para parar de usar (ou undefined = sem limite)
+
+    // ── Reaproveitar código (modo padrão) ──────────────────────────────────────
+    // Só vale quando a lista personalizada NÃO está ativa (ela já tem seu
+    // próprio reaproveitamento nativo, com piso por código configurável).
+    var chkReap = document.getElementById('chkReaproveitarPadrao');
+    var reaproveitarAtivo = !lpAtiva && !!(chkReap && chkReap.checked);
+
+    if (lpAtiva) {
+        if (!_lpDados.length) {
+            statusEl.textContent = 'Lista personalizada ativa, mas nenhum c\u00f3digo foi configurado. Clique em "Configurar lista".';
+            statusEl.className   = 'auto-status er';
+            btn.disabled = false;
+            return;
+        }
+        // Fonte PRIMÁRIA: _lpEstoquesReais (preenchido pelo servidor via consulta
+        // dedicada — ver /api/itens → lpEstoquesReais, FIX 2026-07-22). Ao
+        // contrário de _itens, essa fonte NÃO é filtrada por proibidos, NÃO é
+        // truncada por maxItens/estoqueMinimo, e já resolve o mismatch de zero
+        // à esquerda quando a coluna de código é numérica no banco — a lista
+        // personalizada é escolha manual do usuário e não pode ficar invisível
+        // pro próprio Modo Automático por causa de filtros pensados pra
+        // sugestões automáticas. _itens só entra como fallback secundário, pro
+        // caso raro da consulta dedicada ter falhado nesse ciclo de carga
+        // (ver comentário "best-effort" no servidor).
+        var _mapaCods     = {};
+        var _mapaCodsNorm = {};
+        var _mapaCodsPad5 = {};
+        for (var _mi = 0; _mi < _itens.length; _mi++) {
+            var _itCod = String(_itens[_mi].codigo);
+            _mapaCods[_itCod] = _itens[_mi];
+            var _itNorm = _normalizarCodigoNumericoCliente(_itCod);
+            if (_itNorm !== null && !(_itNorm in _mapaCodsNorm)) _mapaCodsNorm[_itNorm] = _itens[_mi];
+            var _itPad5 = _codigoPadrao5DigitosCliente(_itCod);
+            if (_itPad5 !== null && !(_itPad5 in _mapaCodsPad5)) _mapaCodsPad5[_itPad5] = _itens[_mi];
+        }
+        var _naoAchados = [];
+        for (var _li = 0; _li < _lpDados.length; _li++) {
+            var _lpItem = _lpDados[_li];
+            var _itemLp = null;
+
+            var _lpReal = Object.prototype.hasOwnProperty.call(_lpEstoquesReais, _lpItem.codigo)
+                ? _lpEstoquesReais[_lpItem.codigo] : null;
+            if (_lpReal && typeof _lpReal.preco === 'number' && !isNaN(_lpReal.preco) && _lpReal.preco > 0 &&
+                typeof _lpReal.estoque === 'number' && !isNaN(_lpReal.estoque)) {
+                _itemLp = {
+                    codigo:    _lpItem.codigo,
+                    descricao: _lpReal.descricao || _lpItem.codigo,
+                    estoque:   _lpReal.estoque,
+                    preco:     _lpReal.preco
+                };
+            }
+
+            // Fallback: _lpEstoquesReais não veio (consulta dedicada falhou nesse
+            // ciclo) ou não tinha preço válido — tenta _itens como antes (código
+            // sempre 5 dígitos: tenta a forma preenchida antes da sem-zeros).
+            if (!_itemLp) {
+                _itemLp = _mapaCods[_lpItem.codigo];
+                if (!_itemLp) {
+                    var _lpPad5 = _codigoPadrao5DigitosCliente(_lpItem.codigo);
+                    if (_lpPad5 !== null) _itemLp = _mapaCodsPad5[_lpPad5];
+                }
+                if (!_itemLp) {
+                    var _lpNorm = _normalizarCodigoNumericoCliente(_lpItem.codigo);
+                    if (_lpNorm !== null) _itemLp = _mapaCodsNorm[_lpNorm];
+                }
+            }
+
+            if (_itemLp && Number(_itemLp.preco || 0) > 0) {
+                poolPersonalizado.push(_itemLp);
+                if (_lpItem.estoqueParada != null) {
+                    _estoqueParadaPorCod[_lpItem.codigo] = _lpItem.estoqueParada;
+                }
+            } else if (_naoAchados.indexOf(_lpItem.codigo) === -1) {
+                _naoAchados.push(_lpItem.codigo);
+            }
+        }
+        if (!poolPersonalizado.length) {
+            statusEl.textContent = 'Nenhum c\u00f3digo da lista personalizada foi encontrado no banco (ou sem pre\u00e7o v\u00e1lido).';
+            statusEl.className   = 'auto-status er';
+            btn.disabled = false;
+            return;
+        }
+        if (_naoAchados.length > 0) {
+            toast(_naoAchados.length + ' c\u00f3digo(s) n\u00e3o encontrado(s): ' +
+                  _naoAchados.slice(0, 5).join(', ') + (_naoAchados.length > 5 ? '...' : ''), 5000);
+        }
+    }
 
     // Usa charCodes para evitar qualquer barra invertida no template literal do Node.js
     var NL  = String.fromCharCode(10);
     var CR  = String.fromCharCode(13);
     var TAB = String.fromCharCode(9);
-
-    // Normaliza linha para saída: tabs → espaço simples (saída uniforme)
-    function normalizarLinha(s) {
-        return s.split(TAB).join(' ');
-    }
 
     // Normaliza todas as quebras de linha
     var normalizado = raw.split(CR + NL).join(NL).split(CR).join(NL);
@@ -2192,9 +3919,22 @@ function iniciarModoAuto() {
     var _pendentes = {};
     _autoCodsParaMarcar.forEach(function(c) { _pendentes[c] = true; });
 
-    var disponiveis = _itens.filter(function(it) {
-        return !it.usado && !_pendentes[it.codigo] && Number(it.preco || 0) > 0.01;
-    });
+    var disponiveis;
+    if (lpAtiva) {
+        // Lista personalizada: pool restrito aos códigos informados, sem
+        // filtro de estoque mínimo nem de "usado" — é uma escolha manual do usuário.
+        disponiveis = poolPersonalizado;
+    } else {
+        disponiveis = _itens.filter(function(it) {
+            // Candidato válido: não usado, não pendente, tem preço, atinge o
+            // estoque mínimo configurado e não está na lista de proibidos
+            return !it.usado
+                && !_pendentes[it.codigo]
+                && Number(it.preco   || 0) > PRECO_SENTINEL_ZERADO
+                && Number(it.estoque || 0) >= _S.estoqueMinimo
+                && !_ehProibidoCliente(it.descricao, _S.proibidosEmbutidos, _S.proibidosExtra);
+        });
+    }
 
     var usadosSession  = {};
     var saida          = [];
@@ -2204,6 +3944,43 @@ function iniciarModoAuto() {
     var idxLinha       = 0;
     var totalLinhas    = linhas.length;
 
+    // ── Linhas sem combinação exata, candidatas a "exceder o valor" ────────────
+    // (só relevante na lista personalizada — ver _processarProximoExcedente)
+    var _linhasPendentesExcedente = [];
+    // FAIXA_EXCEDENTE_LP é a constante de módulo definida fora desta função
+
+    // ── Consumo simulado de estoque (lista personalizada) ──────────────────────
+    // Contador acumulado de quantas vezes cada código já foi usado durante TODO
+    // o processamento (não reseta por linha — simula o consumo real do estoque
+    // ao longo de toda a lista de entregas).
+    var _usosLPPorCod = {};
+
+    // Retorna o pool atual, removendo códigos cujo estoque simulado já atingiu
+    // o piso permitido:
+    //   • COM "estoque de parada" informado → para nesse valor.
+    //   • SEM "estoque de parada" informado → para em 0 ("uso livre até
+    //     atingir zero" — nunca deixa nenhum código ficar negativo).
+    function _poolLpDisponivelAgora() {
+        return disponiveis.filter(function(it) {
+            return _qtdMaximaDisponivel(it, _usosLPPorCod, _estoqueParadaPorCod) > 0;
+        });
+    }
+
+    // ── Consumo simulado de estoque (modo padrão com "Reaproveitar código") ────
+    // Mesmo princípio do _usosLPPorCod acima, mas para o modo padrão: o piso é
+    // sempre o estoqueMinimo configurado (sem limite por código). Um código só
+    // é de fato marcado como "usado" no servidor quando esse consumo simulado
+    // atingir o piso — ver _jaMarcado abaixo.
+    var _usosPadraoPorCod = {};
+    var _jaMarcado        = {}; // evita pedir /api/marcar-usado mais de uma vez pro mesmo código
+
+    function _poolPadraoDisponivelAgora() {
+        return disponiveis.filter(function(it) {
+            return !usadosSession[it.codigo]
+                && _qtdMaximaDisponivel(it, _usosPadraoPorCod, null, _S.estoqueMinimo) > 0;
+        });
+    }
+
     // Processa uma linha por vez via setTimeout para não travar o browser
     function _processarProxima() {
         // Processa 1 linha por frame — garante que o browser nunca fica bloqueado
@@ -2211,9 +3988,25 @@ function iniciarModoAuto() {
         while (idxLinha < totalLinhas && lote < 1) {
             lote++;
             var linha = linhas[idxLinha++];
-            // Remove trailing whitespace sem usar \s no template
+            // Remove trailing whitespace sem usar \\s no template
             while (linha.length > 0 && linha.charCodeAt(linha.length - 1) <= 32) {
                 linha = linha.slice(0, -1);
+            }
+
+            // Aceita "[NAO ENCONTRADO]" já presente no final da linha colada — o
+            // usuário pode reaproveitar uma saída anterior como entrada nova (ex.:
+            // colar de volta uma lista que tinha ficado com alguns itens sem
+            // solução). É só um placeholder visual: sempre sai substituído pelo
+            // resultado deste processamento (achado ou não), nunca mantido ou
+            // duplicado. Comparação manual (sem regex \\s), mesmo motivo do
+            // trecho de remoção de espaço em branco logo acima.
+            var _marcador = '[NAO ENCONTRADO]';
+            if (linha.length >= _marcador.length &&
+                linha.slice(-_marcador.length).toUpperCase() === _marcador) {
+                linha = linha.slice(0, -_marcador.length);
+                while (linha.length > 0 && linha.charCodeAt(linha.length - 1) <= 32) {
+                    linha = linha.slice(0, -1);
+                }
             }
 
             if (!linha.trim()) { saida.push(''); continue; }
@@ -2241,20 +4034,87 @@ function iniciarModoAuto() {
             var valor    = parseFloat(valorStr);
             if (isNaN(valor) || valor <= 0) { saida.push(linha); continue; }
 
-            var livres    = disponiveis.filter(function(it) { return !usadosSession[it.codigo]; });
-            var resultado = _autoEncontrarMelhor(livres, valor);
+            var resultado;
+            if (lpAtiva) {
+                // Lista personalizada: recalcula o pool a cada linha, removendo
+                // códigos cujo estoque simulado já atingiu o piso permitido
+                // (limite de parada informado, ou 0 quando não informado).
+                var poolAgora = _poolLpDisponivelAgora();
+                resultado = _autoEncontrarMelhorComRepeticao(
+                    poolAgora, valor, _faixaAutoAtual, _usosLPPorCod, _estoqueParadaPorCod
+                );
+                // Camada defensiva extra: protege contra anomalia de dados (ex:
+                // estoque alterado durante o processamento assíncrono da lista) —
+                // nunca deixa passar um resultado que ultrapasse o piso de
+                // estoque de parada (ou zero absoluto) de algum código.
+                resultado = _validarResultadoLista(resultado, _usosLPPorCod, _estoqueParadaPorCod);
+            } else if (reaproveitarAtivo) {
+                // Modo padrão com "Reaproveitar código": mesmo algoritmo com
+                // repetição da lista personalizada, mas com piso fixo =
+                // estoqueMinimo configurado (sem limite por código) e
+                // recalculando o pool a cada linha.
+                var poolPadraoAgora = _poolPadraoDisponivelAgora();
+                resultado = _autoEncontrarMelhorComRepeticao(
+                    poolPadraoAgora, valor, _faixaAutoAtual, _usosPadraoPorCod, null, _S.estoqueMinimo
+                );
+                resultado = _validarResultadoPadrao(resultado, _S.estoqueMinimo, _usosPadraoPorCod, _S.estoqueMinimo, _S.proibidosEmbutidos, _S.proibidosExtra);
+            } else {
+                var livres = disponiveis.filter(function(it) { return !usadosSession[it.codigo]; });
+                resultado  = _autoEncontrarMelhor(livres, valor, _faixaAutoAtual);
+                // Camada defensiva extra (modo padrão, sem lista personalizada):
+                // o algoritmo já não repete código na mesma combinação, mas essa
+                // revalidação protege contra qualquer anomalia (ex: estoque
+                // alterado durante o processamento assíncrono/chunked da lista,
+                // ou código duplicado no catálogo) — nunca deixa passar um
+                // resultado que fira o estoque mínimo configurado.
+                resultado = _validarResultadoPadrao(resultado, _S.estoqueMinimo, null, null, _S.proibidosEmbutidos, _S.proibidosExtra);
+            }
 
             if (resultado && resultado.itens && resultado.itens.length > 0) {
-                resultado.itens.forEach(function(it) {
-                    usadosSession[it.codigo] = true;
-                    codsMarcados.push(it.codigo);
-                });
-                var codigos = resultado.itens.map(function(it) { return it.codigo; }).join(' ');
+                if (lpAtiva) {
+                    // Lista personalizada: NÃO marca como usado no servidor — os
+                    // códigos seguem disponíveis. Apenas acumula o consumo simulado
+                    // de estoque, para respeitar o limite de parada configurado.
+                    resultado.itens.forEach(function(it) {
+                        _usosLPPorCod[it.codigo] = (_usosLPPorCod[it.codigo] || 0) + 1;
+                    });
+                } else if (reaproveitarAtivo) {
+                    // Modo padrão com reaproveitamento: acumula o consumo simulado e
+                    // SÓ marca como usado de fato (fila pro servidor) quando o
+                    // código atingir o piso (estoqueMinimo) — ou seja, quando não
+                    // houver mais sobra pra reaproveitar em linhas seguintes.
+                    // Enquanto houver sobra acima do mínimo, o código continua
+                    // disponível para reaparecer em outras linhas/combinações.
+                    resultado.itens.forEach(function(it) {
+                        _usosPadraoPorCod[it.codigo] = (_usosPadraoPorCod[it.codigo] || 0) + 1;
+                        var esgotou = _qtdMaximaDisponivel(it, _usosPadraoPorCod, null, _S.estoqueMinimo) <= 0;
+                        if (esgotou) {
+                            usadosSession[it.codigo] = true; // some do pool mesmo dentro desta sessão
+                            if (!_jaMarcado[it.codigo]) {
+                                _jaMarcado[it.codigo] = true;
+                                codsMarcados.push(it.codigo); // 1 marcação só, mesmo que reaproveitado várias vezes
+                            }
+                        }
+                    });
+                } else {
+                    // Modo padrão original: cada item só pode entrar em uma
+                    // combinação — marca nesta sessão e na fila de "usados" do servidor.
+                    resultado.itens.forEach(function(it) {
+                        usadosSession[it.codigo] = true;
+                        codsMarcados.push(it.codigo);
+                    });
+                }
+                // Agrupa repetições do mesmo código no formato "3*codigo" em vez
+                // de listá-lo várias vezes seguidas
+                var codigos = _formatarCodigosCompactado(resultado.itens);
                 saida.push(linha + TAB + codigos);
                 encontrados++;
             } else {
                 saida.push(linha + TAB + '[NAO ENCONTRADO]');
                 naoEncontrados++;
+                if (lpAtiva) {
+                    _linhasPendentesExcedente.push({ idx: saida.length - 1, linha: linha, valor: valor });
+                }
             }
         }
 
@@ -2265,21 +4125,333 @@ function iniciarModoAuto() {
             return;
         }
 
+        // ── Reordena para EXIBIÇÃO: dentro de cada seção (delimitada por linhas
+        // "Nome:"), as linhas [NAO ENCONTRADO] vêm primeiro, seguidas pelas
+        // demais — o usuário vê de cara o que ainda precisa resolver, sem
+        // precisar rolar a lista toda. IMPORTANTE: opera sobre uma CÓPIA,
+        // nunca muta o array "saida" original — ele é referenciado por índice
+        // em _linhasPendentesExcedente (revisão de excedente da lista
+        // personalizada, mais abaixo); reordenar o array de verdade quebraria
+        // essas referências e faria a revisão sobrescrever a linha errada.
+        function _pareceCabecalhoSecao(linhaTxt) {
+            var t = linhaTxt;
+            while (t.length > 0 && t.charCodeAt(0) <= 32) t = t.slice(1);
+            while (t.length > 0 && t.charCodeAt(t.length - 1) <= 32) t = t.slice(0, -1);
+            if (!t.length) return false;
+            var primeiroCode = t.charCodeAt(0);
+            var ehDigito = primeiroCode >= 48 && primeiroCode <= 57;
+            return !ehDigito && t.charAt(t.length - 1) === ':';
+        }
+        function _saidaReordenadaParaExibicao() {
+            var resultado    = [];
+            var secaoAtual   = null; // { naoEncontrados: [...], outros: [...] }
+            function fecharSecao() {
+                if (!secaoAtual) return;
+                resultado = resultado.concat(secaoAtual.naoEncontrados, secaoAtual.outros);
+                secaoAtual = null;
+            }
+            for (var _si = 0; _si < saida.length; _si++) {
+                var l = saida[_si];
+                if (_pareceCabecalhoSecao(l)) {
+                    fecharSecao();
+                    resultado.push(l); // cabeçalho sempre no topo da própria seção
+                    secaoAtual = { naoEncontrados: [], outros: [] };
+                    continue;
+                }
+                if (!secaoAtual) secaoAtual = { naoEncontrados: [], outros: [] }; // linhas antes do 1º cabeçalho
+                if (l.indexOf('[NAO ENCONTRADO]') !== -1) {
+                    secaoAtual.naoEncontrados.push(l);
+                } else {
+                    secaoAtual.outros.push(l);
+                }
+            }
+            fecharSecao();
+            return resultado;
+        }
+
         // Finalização — todas as linhas processadas
-        outputEl.value        = saida.join(NL);
+        outputEl.value        = _saidaReordenadaParaExibicao().join(NL);
         resWrap.style.display = 'block';
         copyBtn.style.display = '';
 
-        var msg = '\u2713 Processado: ' + encontrados + ' linha' + (encontrados === 1 ? '' : 's') + ' com c\u00f3digos';
-        if (naoEncontrados > 0) msg += ', ' + naoEncontrados + ' n\u00e3o encontrado' + (naoEncontrados === 1 ? '' : 's');
-        if (codsMarcados.length > 0) msg += ' \u2014 clique em \ud83d\udccb Copiar para confirmar';
-        statusEl.textContent = msg;
-        statusEl.className   = naoEncontrados > 0 ? 'auto-status er' : 'auto-status ok';
+        function _atualizarMsgFinal() {
+            var msg = '\u2713 Processado: ' + encontrados + ' linha' + (encontrados === 1 ? '' : 's') + ' com c\u00f3digos';
+            if (naoEncontrados > 0) msg += ', ' + naoEncontrados + ' n\u00e3o encontrado' + (naoEncontrados === 1 ? '' : 's');
+            if (lpAtiva) {
+                msg += ' \u2014 lista personalizada (c\u00f3digos n\u00e3o marcados como usados)';
+            } else if (reaproveitarAtivo) {
+                msg += ' \u2014 reaproveitando c\u00f3digos (s\u00f3 marca como usado quando esgotar)';
+                if (codsMarcados.length > 0) msg += ' \u2014 clique em "Copiar resultado" para confirmar';
+            } else if (codsMarcados.length > 0) {
+                msg += ' \u2014 clique em "Copiar resultado" para confirmar';
+            }
+            if (!lpAtiva && naoEncontrados > 0 && _tentativaExtensaoAtual >= MAX_TENTATIVAS_EXTENSAO) {
+                msg += ' \u2014 limite de ' + MAX_TENTATIVAS_EXTENSAO + ' tentativa(s) de busca estendida atingido';
+            }
+            statusEl.textContent = msg;
+            statusEl.className   = naoEncontrados > 0 ? 'auto-status er' : 'auto-status ok';
+        }
+        _atualizarMsgFinal();
 
         // Armazena os códigos — só marca como usado quando o usuário copiar o resultado
         _autoCodsParaMarcar = codsMarcados;
 
-        btn.disabled = false;
+        // Botão só é reabilitado aqui se NENHUM modal pendente vai aparecer a seguir
+        // (revisão de excedente da lista personalizada, ou extensão de busca no
+        // banco). Enquanto um desses modais estiver pendente, o botão permanece
+        // desabilitado — evita que o usuário clique "Iniciar" de novo e crie um
+        // segundo processamento concorrente que sobrescreveria a saída do primeiro.
+        var _teraExcedentePendente = lpAtiva && _linhasPendentesExcedente.length > 0;
+        var _teraExtensaoPendente  = !lpAtiva && naoEncontrados > 0 && _tentativaExtensaoAtual < MAX_TENTATIVAS_EXTENSAO;
+        if (!_teraExcedentePendente && !_teraExtensaoPendente) {
+            btn.disabled = false;
+        }
+
+        // ── Formata os itens de uma combinação de forma legível para o modal ──────
+        // Ex.: "3x 08395 (R$16,90 cada)" + " + 1x 00123 (R$5,00 cada)"
+        function _formatarItensHumano(itens) {
+            var contagem = {};
+            var ordem    = [];
+            itens.forEach(function(it) {
+                if (!contagem[it.codigo]) { contagem[it.codigo] = { qtd: 0, preco: Number(it.preco || 0) }; ordem.push(it.codigo); }
+                contagem[it.codigo].qtd++;
+            });
+            return ordem.map(function(cod) {
+                var c = contagem[cod];
+                return c.qtd + 'x ' + cod + ' (R$' + c.preco.toFixed(2).replace('.', ',') + ' cada)';
+            }).join(' + ');
+        }
+
+        // ── Lista personalizada: revisão das linhas sem combinação exata ──────────
+        // Para cada linha marcada como [NAO ENCONTRADO], busca (sem o teto de
+        // +R$40) a combinação que EXCEDE o valor pedido com a menor diferença
+        // possível, usando só itens da própria lista personalizada (a busca já
+        // testa item sozinho E combinações de itens diferentes — "item + item" —
+        // via _autoEncontrarMelhorComRepeticao, que resolve por DP/guloso sobre
+        // TODO o pool disponível, não só o item isolado). Pergunta ao usuário,
+        // uma linha por vez, se aceita usar essa combinação excedente.
+        //
+        // FIX (2026-07-19): se NEM combinação excedente for encontrada — ou
+        // seja, o pool da lista personalizada está genuinamente esgotado pra
+        // aquele valor, mesmo tentando toda combinação possível — a linha não
+        // é mais pulada silenciosamente. Agora avisa explicitamente que todas
+        // as possibilidades foram tentadas e pergunta se o usuário quer
+        // remover da lista o(s) item(ns) que já bateram no estoque de parada
+        // (ou zero), ou prefere lidar com essa linha manualmente (fica
+        // [NAO ENCONTRADO] no resultado, sem remover nada da lista).
+        //
+        // Recalcula o pool a cada passo, pra refletir confirmações anteriores
+        // desta mesma revisão (remoções feitas aqui somem do pool imediatamente).
+        function _processarProximoExcedente(idxPendente) {
+            if (idxPendente >= _linhasPendentesExcedente.length) {
+                btn.disabled = false; // revisão concluída — libera o botão
+                // Só agora "saida" está definitivamente estável (a revisão de
+                // excedente já não vai mutar mais nenhum índice) — reordena pra
+                // exibição final. "outputEl.value" já tinha sido atualizado várias
+                // vezes durante a revisão (sem reordenar, ver callback de aceite
+                // abaixo), então este é o ÚNICO ponto que precisa reordenar de fato.
+                outputEl.value = _saidaReordenadaParaExibicao().join(NL);
+                _atualizarMsgFinal(); // tallies finais após a revisão
+                return;
+            }
+
+            var pend = _linhasPendentesExcedente[idxPendente];
+            var poolExcedenteAgora = _poolLpDisponivelAgora();
+            var resExc = _autoEncontrarMelhorComRepeticao(
+                poolExcedenteAgora, pend.valor, FAIXA_EXCEDENTE_LP, _usosLPPorCod, _estoqueParadaPorCod
+            );
+            // Mesma camada defensiva da busca normal — ver comentário acima.
+            resExc = _validarResultadoLista(resExc, _usosLPPorCod, _estoqueParadaPorCod);
+
+            if (resExc && resExc.itens && resExc.itens.length) {
+                _modalConfirm(
+                    'Linha: "' + pend.linha.trim() + '" \u2014 valor R$' + pend.valor.toFixed(2).replace('.', ',') +
+                    '\\n\\nNenhuma combina\u00e7\u00e3o dentro da faixa normal (+R$40) foi encontrada.' +
+                    '\\n\\nDeseja usar esta combina\u00e7\u00e3o da lista personalizada, que excede o valor pedido em R$' +
+                    resExc.diff.toFixed(2).replace('.', ',') + ' (soma R$' + resExc.soma.toFixed(2).replace('.', ',') + ')?' +
+                    '\\n\\n' + _formatarItensHumano(resExc.itens),
+                    function() {
+                        resExc.itens.forEach(function(it) {
+                            _usosLPPorCod[it.codigo] = (_usosLPPorCod[it.codigo] || 0) + 1;
+                        });
+                        saida[pend.idx] = pend.linha + TAB + _formatarCodigosCompactado(resExc.itens);
+                        encontrados++;
+                        naoEncontrados--;
+                        outputEl.value = saida.join(NL);
+                        _processarProximoExcedente(idxPendente + 1);
+                    },
+                    function() {
+                        _processarProximoExcedente(idxPendente + 1);
+                    },
+                    {
+                        titulo:  'Combina\u00e7\u00e3o excede o valor (' + (idxPendente + 1) + '/' + _linhasPendentesExcedente.length + ')',
+                        okLabel: 'Usar esta combina\u00e7\u00e3o',
+                        okClass: 'btn btn-p btn-sm'
+                    }
+                );
+                return;
+            }
+
+            // Nada encontrado — nem item sozinho, nem combinação, nem excedente.
+            // Identifica quais itens da lista personalizada já bateram no piso
+            // (estoque de parada configurado, ou zero quando não configurado):
+            // são os candidatos naturais a remover, já que são eles que estão
+            // impedindo qualquer combinação de fechar essa linha.
+            var _esgotados = poolPersonalizado.filter(function(it) {
+                return _qtdMaximaDisponivel(it, _usosLPPorCod, _estoqueParadaPorCod) <= 0;
+            });
+
+            if (!_esgotados.length) {
+                // Pool não está esgotado — o problema é outro (ex: nenhum preço
+                // chega nem perto do valor pedido). Não há o que remover; avisa
+                // via toast (não trava a revisão com um modal sem ação útil) e segue.
+                toast(
+                    'Linha "' + pend.linha.trim() + '" (R$' + pend.valor.toFixed(2).replace('.', ',') +
+                    '): nenhuma combina\u00e7\u00e3o poss\u00edvel foi encontrada na lista personalizada.',
+                    5000
+                );
+                _processarProximoExcedente(idxPendente + 1);
+                return;
+            }
+
+            // Distingue, por item, o MOTIVO real do esgotamento — essencial pra
+            // não confundir o usuário: o estoque real no banco (Firebird) NUNCA
+            // muda por causa deste processamento (esta ferramenta é somente-
+            // leitura). O que esgota é um contador SIMULADO de consumo
+            // (_usosLPPorCod), que só existe durante este clique em "Iniciar" —
+            // ele soma quantas vezes o código já foi usado em linhas ANTERIORES
+            // desta mesma lista, pra nunca sugerir mais unidades do que o
+            // estoque realmente suporta.
+            var _linhasItensScroll = [];
+            var _temConsumoNestaExecucao = false;
+            var _temLimiteJaAtingido     = false;
+            _esgotados.forEach(function(it) {
+                var usos = _usosLPPorCod[it.codigo] || 0;
+                if (usos > 0) {
+                    _temConsumoNestaExecucao = true;
+                    _linhasItensScroll.push(
+                        '\u2022 ' + it.codigo + ' \u2014 ' + it.descricao +
+                        ' (usado ' + usos + 'x em linha(s) anterior(es) desta mesma lista)'
+                    );
+                } else {
+                    _temLimiteJaAtingido = true;
+                    _linhasItensScroll.push(
+                        '\u2022 ' + it.codigo + ' \u2014 ' + it.descricao +
+                        ' (j\u00e1 estava no limite antes de come\u00e7ar este processamento)'
+                    );
+                }
+            });
+
+            var _explicacaoMotivos = 'Motivo de cada item:';
+            if (_temConsumoNestaExecucao) {
+                _explicacaoMotivos +=
+                    '\\n\\u2014 "usado Nx" = j\u00e1 foi consumido em linha(s) anterior(es) desta mesma execu\u00e7\u00e3o ' +
+                    '(o estoque real no banco N\u00c3O mudou \u2014 esta ferramenta nunca escreve no Firebird; ' +
+                    '\u00e9 s\u00f3 um contador interno pra n\u00e3o sugerir mais unidades do que sobra de verdade).';
+            }
+            if (_temLimiteJaAtingido) {
+                _explicacaoMotivos +=
+                    '\\n\\u2014 "j\u00e1 estava no limite" = estoque de parada (ou zero) atingido desde ANTES deste processamento come\u00e7ar.';
+            }
+
+            _modalConfirm(
+                'Linha: "' + pend.linha.trim() + '" \u2014 valor R$' + pend.valor.toFixed(2).replace('.', ',') +
+                '\\n\\nTentei todas as possibilidades (item sozinho, combina\u00e7\u00e3o com outros itens da lista, ' +
+                'e at\u00e9 combina\u00e7\u00f5es que excedem o valor pedido), mas nenhum resultado foi encontrado.' +
+                '\\n\\n' + _explicacaoMotivos,
+                function() { // Sim — remove da lista personalizada
+                    var _codsEsgotados = _esgotados.map(function(it) { return it.codigo; });
+                    _removerCodigosListaPersonalizada(_codsEsgotados);
+                    // Some do pool desta sessão também, pra não continuar sendo
+                    // considerado (e tentado de novo) nas linhas restantes.
+                    var _codsEsgotadosSet = {};
+                    _codsEsgotados.forEach(function(c) { _codsEsgotadosSet[c] = true; });
+                    disponiveis = disponiveis.filter(function(it) { return !_codsEsgotadosSet[it.codigo]; });
+                    poolPersonalizado = poolPersonalizado.filter(function(it) { return !_codsEsgotadosSet[it.codigo]; });
+                    _processarProximoExcedente(idxPendente + 1);
+                },
+                function() { // Não — usar manualmente (deixa como [NAO ENCONTRADO])
+                    _processarProximoExcedente(idxPendente + 1);
+                },
+                {
+                    titulo:      'Nenhuma combina\u00e7\u00e3o encontrada (' + (idxPendente + 1) + '/' + _linhasPendentesExcedente.length + ')',
+                    okLabel:     'Remover da lista',
+                    okClass:     'btn btn-d btn-sm',
+                    itensScroll: _linhasItensScroll,
+                    msgApos:     'Deseja remover esse(s) item(ns) da lista personalizada agora? ' +
+                                 'Se preferir, cancele e resolva essa linha manualmente \u2014 ela fica marcada como [NAO ENCONTRADO].'
+                }
+            );
+        }
+
+        if (lpAtiva && _linhasPendentesExcedente.length > 0) {
+            // Limite de segurança: com uma textarea muito grande e a lista
+            // personalizada esgotada, poderiam sobrar centenas/milhares de linhas
+            // pendentes — abrir um modal sequencial pra cada uma seria impraticável
+            // (o usuário teria que clicar centenas de vezes). Revisa só as
+            // primeiras MAX_REVISAO_EXCEDENTE; o restante continua [NAO ENCONTRADO].
+            var MAX_REVISAO_EXCEDENTE = 50;
+            if (_linhasPendentesExcedente.length > MAX_REVISAO_EXCEDENTE) {
+                toast(
+                    _linhasPendentesExcedente.length + ' linhas sem combina\u00e7\u00e3o \u2014 revisando ' +
+                    'as primeiras ' + MAX_REVISAO_EXCEDENTE + ' (as demais continuam [NAO ENCONTRADO]).',
+                    6000
+                );
+                _linhasPendentesExcedente = _linhasPendentesExcedente.slice(0, MAX_REVISAO_EXCEDENTE);
+            }
+            _processarProximoExcedente(0);
+        }
+
+        // ── Pergunta se quer estender a busca no banco quando há itens não encontrados ────
+        // (substitui a antiga pergunta de "ampliar a faixa de preço", que não ajudava
+        // quando o item simplesmente não estava entre os carregados — o problema
+        // normalmente é cobertura do catálogo, não faixa de preço).
+        // Só vale no modo padrão (sem lista personalizada): a lista personalizada já
+        // restringe a busca de propósito a um conjunto fixo de códigos configurados —
+        // ampliar o catálogo geral não faz sentido nesse contexto.
+        if (!lpAtiva && naoEncontrados > 0 && _tentativaExtensaoAtual < MAX_TENTATIVAS_EXTENSAO) {
+            var _proximaTentativa = _tentativaExtensaoAtual + 1;
+            _modalConfirm(
+                naoEncontrados + ' item' + (naoEncontrados === 1 ? '' : 's') +
+                ' n\u00e3o encontrado' + (naoEncontrados === 1 ? '' : 's') +
+                ' no cat\u00e1logo carregado.' +
+                '\\n\\nDeseja estender a busca no banco por mais itens correspondentes?' +
+                '\\n\\n(tentativa ' + _proximaTentativa + ' de ' + MAX_TENTATIVAS_EXTENSAO + ')',
+                function() {
+                    statusEl.textContent = 'Buscando mais itens no banco (tentativa ' +
+                        _proximaTentativa + '/' + MAX_TENTATIVAS_EXTENSAO + ')...';
+                    statusEl.className = 'auto-status';
+                    btn.disabled = true;
+                    _buscarMaisItensBanco(function(ok, qtd, temMais) {
+                        if (!ok) {
+                            toast('N\u00e3o foi poss\u00edvel buscar mais itens no banco.', 4000);
+                            btn.disabled = false;
+                            return;
+                        }
+                        if (qtd === 0) {
+                            toast('O cat\u00e1logo do banco j\u00e1 est\u00e1 totalmente carregado \u2014 nada mais para buscar.', 5000);
+                            btn.disabled = false;
+                            return;
+                        }
+                        toast(qtd + ' item(ns) adicional(is) carregado(s) do banco.' +
+                              (temMais ? '' : ' (cat\u00e1logo esgotado)'), 4000);
+                        // Limpa resultado anterior e reprocessa a lista original com o catálogo ampliado
+                        resWrap.style.display = 'none';
+                        copyBtn.style.display = 'none';
+                        _autoCodsParaMarcar   = [];
+                        iniciarModoAuto(_faixaAutoAtual, _proximaTentativa);
+                    });
+                },
+                function() {
+                    btn.disabled = false; // usuário cancelou — libera o botão
+                },
+                {
+                    titulo:  'Itens n\u00e3o encontrados',
+                    okLabel: 'Buscar mais no banco',
+                    okClass: 'btn btn-p btn-sm'
+                }
+            );
+        }
     }
 
     // Inicia o processamento assíncrono (yield imediato para o browser renderizar)
@@ -2289,6 +4461,7 @@ function iniciarModoAuto() {
 // ── Sticky thead via JS (contorna overflow-x:auto que quebra position:sticky) ─
 (function() {
     var _rafId = null;
+    var _btnTopoVisivel = false; // cache para evitar tocar no DOM toda vez sem necessidade
     function _doSyncThead() {
         _rafId = null;
         var tw    = document.getElementById('tw');
@@ -2311,6 +4484,14 @@ function iniciarModoAuto() {
         }
         thead.style.transform = translateY > 0 ? 'translateY(' + translateY + 'px)' : '';
         thead.style.boxShadow = translateY > 0 ? '0 3px 10px rgba(0,0,0,.45)' : '';
+
+        // Botão "voltar ao topo": aparece após rolar 1 viewport
+        var deveAparecer = scrollY > (window.innerHeight || 600) * 0.6;
+        if (deveAparecer !== _btnTopoVisivel) {
+            _btnTopoVisivel = deveAparecer;
+            var btnTopo = document.getElementById('btnTopo');
+            if (btnTopo) btnTopo.classList.toggle('on', deveAparecer);
+        }
     }
     function _syncThead() {
         if (_rafId) return;
@@ -2321,6 +4502,17 @@ function iniciarModoAuto() {
     // Expõe para renderTabela chamar após re-render
     window._syncThead = _syncThead;
 })();
+
+// ── Voltar ao topo (scroll suave) ─────────────────────────────────────────────
+function voltarAoTopo() {
+    // scrollTo com behavior:'smooth' é suportado em todos os browsers modernos;
+    // fallback defensivo para ambientes muito antigos que ignoram o objeto de opções
+    try {
+        window.scrollTo({ top: 0, left: 0, behavior: 'smooth' });
+    } catch (_e) {
+        window.scrollTo(0, 0);
+    }
+}
 
 // ── Inicialização ─────────────────────────────────────────────────────────────
 function ajustarStickyOffsets() {
@@ -2402,10 +4594,20 @@ function _carregarConfigs(tentativa) {
         _cfgSetVal('cfgFbPort',  r.fbPort       != null ? r.fbPort  : '');
         _cfgSetVal('cfgFdbPath', r.fdbPath      || '');
         _cfgSetVal('cfgFbUser',  r.fbUser       || '');
-        _cfgSetVal('cfgFbPass',  r.fbPassword   || '');
+        // SEGURANÇA: a senha nunca é devolvida pela API — o campo fica em
+        // branco (deixar em branco ao salvar mantém a senha atual). O
+        // placeholder indica se já existe uma senha configurada.
+        var _campoSenha = document.getElementById('cfgFbPass');
+        if (_campoSenha) {
+            _campoSenha.value = '';
+            _campoSenha.placeholder = r.senhaConfigurada
+                ? '(senha já configurada \u2014 deixe em branco para manter)'
+                : 'masterkey';
+        }
         _cfgSetVal('cfgPorta',   r.portaEstoque != null ? r.portaEstoque : '');
         _cfgSetVal('cfgAppName', r.appName      || '');
         _cfgSetVal('cfgEstMin',  r.estoqueMinimo != null ? r.estoqueMinimo : '');
+        _cfgSetVal('cfgMaxItens',r.maxItens      != null ? r.maxItens      : '');
         _cfgSetVal('cfgProib',   Array.isArray(r.proibidosExtra) ? r.proibidosExtra.join('\\n') : '');
 
         // Popula lista de proibidos embutidos (usa API ou fallback de _S)
@@ -2444,6 +4646,8 @@ function salvarConfigs() {
     var httpPortVal = parseInt(_cfgGetVal('cfgPorta')  || '7888', 10);
     var estMinRaw   = _cfgGetVal('cfgEstMin');
     var estMinVal   = estMinRaw !== '' && estMinRaw != null ? parseFloat(estMinRaw) : 5;
+    var maxItensRaw = _cfgGetVal('cfgMaxItens');
+    var maxItensVal = maxItensRaw !== '' && maxItensRaw != null ? parseInt(maxItensRaw, 10) : 2000;
 
     // Valida portas no cliente antes de enviar
     if (isNaN(fbPortVal)  || fbPortVal  < 1024 || fbPortVal  > 65534) {
@@ -2461,6 +4665,11 @@ function salvarConfigs() {
         if (btn) btn.disabled = false;
         return;
     }
+    if (isNaN(maxItensVal) || maxItensVal < 100 || maxItensVal > 5000) {
+        if (st) { st.textContent = 'M\u00e1x. itens inv\u00e1lido (100\u20135000).'; st.className = 'cfg-status er'; }
+        if (btn) btn.disabled = false;
+        return;
+    }
 
     var payload = {
         fbHost:         (_cfgGetVal('cfgFbHost')  || '').trim(),
@@ -2471,6 +4680,7 @@ function salvarConfigs() {
         portaEstoque:   httpPortVal,
         appName:        (_cfgGetVal('cfgAppName') || '').trim(),
         estoqueMinimo:  estMinVal,
+        maxItens:       maxItensVal,
         proibidosExtra: proibLista.join('\\n')
     };
 
@@ -2491,6 +4701,12 @@ function salvarConfigs() {
         _S.estoqueMinimo = estMinVal;
         var hdrEstMin = document.getElementById('hdrEstMin');
         if (hdrEstMin) hdrEstMin.textContent = estMinVal;
+        // Propaga o novo maxItens imediatamente
+        _S.maxItens = maxItensVal;
+        var hdrMaxItens = document.getElementById('hdrMaxItens');
+        if (hdrMaxItens) hdrMaxItens.textContent = maxItensVal;
+        // Regenera as 5 opções do select e reposiciona a seleção
+        _atualizarSelLimite(maxItensVal);
         // Se dados foram recarregados no servidor, atualiza a tabela ap\u00f3s breve delay
         if (r.mensagem && r.mensagem.indexOf('recarregado') !== -1) {
             setTimeout(function() { _dadosFingerprint = ''; carregarItens(); }, 1400);
@@ -2515,7 +4731,49 @@ document.addEventListener("DOMContentLoaded", function() {
     _elPrc    = document.getElementById("numPrc");
     _elGrupar = document.getElementById("chkGrupar");
     _elAcima  = document.getElementById("chkAcima");
+    _elBuscaMulti = document.getElementById("txtBuscaMulti");
+    // Popula o select de limite com 5 opções calculadas a partir de _S.maxItens
+    _atualizarSelLimite(_S.maxItens);
+    // Inicializa o label de sort no header com o valor persistido
+    _atualizarHdrSortLabel();
+    _restaurarPrefReaproveitar();
     carregarItens();
+    // Carrega a lista personalizada salva no servidor (lista-personalizada.json)
+    _carregarListaPersonalizadaServidor();
+
+    // ── SSE: recebe notificações do servidor em vez de poluir com polling ───
+    // O servidor emite "dados" após: carregarItens, marcar-usado, resetar.
+    // Quando o banco ainda está carregando (dados.carregando), fazemos um
+    // único poll de /api/itens para obter o estado completo; depois o SSE
+    // assume e não há mais polling periódico.
+    if (typeof EventSource !== 'undefined') {
+        var _sse = new EventSource('/api/sse');
+        _sse.addEventListener('dados', function(e) {
+            try {
+                var info = JSON.parse(e.data);
+                if (info.carregando) {
+                    // Banco em carregamento: continua polling simples até terminar
+                    clearTimeout(_pollT);
+                    _pollT = setTimeout(carregarItens, POLL_INTERVALO_MS);
+                } else {
+                    // Dados mudaram — recarrega imediatamente sem poll periódico
+                    clearTimeout(_pollT);
+                    carregarItens();
+                }
+            } catch (_) {}
+        });
+        _sse.onerror = function() {
+            // SSE caiu (rede temporária, servidor reiniciando) — fallback para
+            // um único poll após 3s; quando reconectar, o EventSource se
+            // reconnecta automaticamente (comportamento padrão do browser)
+            clearTimeout(_pollT);
+            _pollT = setTimeout(carregarItens, 3000);
+        };
+    } else {
+        // Navegador não suporta EventSource (raro) — fallback para polling
+        _pollT = setTimeout(carregarItens, POLL_INTERVALO_MS);
+    }
+
     setTimeout(function() {
         ajustarStickyOffsets();
         if (window._syncThead) window._syncThead();
@@ -2555,6 +4813,398 @@ function lerBody(req, maxBytes) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HANDLERS DE ROTA
+// ─────────────────────────────────────────────────────────────────────────────
+// Por que cada rota é uma função nomeada em vez de um bloco if/else dentro do
+// listener do servidor: o listener único acumulava TODAS as rotas (10+) numa
+// única função, chegando a complexidade ciclomática >100 — qualquer alteração
+// em uma rota exigia entender o fluxo de controle de todas as outras ao redor.
+// Como função independente, cada rota fica testável e legível isoladamente,
+// e adicionar uma rota nova não aumenta a complexidade das existentes.
+//
+// Assinatura comum: async function handleXxx(req, res, json, erro)
+//   json(dados, status?) — responde com JSON (status default 200)
+//   erro(msg, status?)   — responde com {ok:false, erro:msg} (status default 500)
+// Ambos já fechados sobre o `res` da requisição atual (ver dispatchRequest).
+
+async function handleGetRoot(req, res, json, erro) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(gerarHTML());
+}
+
+// "Sessão" de busca estendida para o Modo Automático: retorna o próximo lote
+// de itens do catálogo completo (_catalogoCompleto), a partir de onde a
+// última sessão parou (_catalogoCursor). Nunca repete itens já servidos — o
+// cursor só avança. Lote limitado a LIMITE_SESSAO_BUSCA para não travar o
+// navegador com um payload grande de uma vez.
+// ─────────────────────────────────────────────────────────────────────────────
+// SSE — Server-Sent Events (substitui o polling de 1800ms no cliente)
+// O cliente abre EventSource('/api/sse') e recebe "dados" quando o catálogo
+// muda (após carregarItens, marcar-usado, resetar-usados) — em vez de
+// consultar /api/itens a cada 1,8s independente de haver mudança.
+// ─────────────────────────────────────────────────────────────────────────────
+const _sseClients = new Set();  // Set<{res, intervalo}> — um por aba aberta
+
+function emitirEventoSse(evento, dados) {
+    const msg = "event: " + evento + "\ndata: " + JSON.stringify(dados || {}) + "\n\n";
+    for (const cliente of _sseClients) {
+        try { cliente.res.write(msg); } catch (_) { _sseClients.delete(cliente); }
+    }
+}
+
+async function handleSse(req, res) {
+    res.writeHead(200, {
+        "Content-Type":  "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "Connection":    "keep-alive",
+        "X-Accel-Buffering": "no"  // evita buffer em proxies nginx
+    });
+    res.flushHeaders();
+
+    // `cliente` é declarado ANTES do setInterval que o referencia (achado #3
+    // da revisão 2026-07-11: antes a ordem era invertida — funcionava porque
+    // o callback só roda 25s depois, quando `cliente` já existe, mas forçava
+    // o leitor a pular pra frente pra entender a referência).
+    const cliente = { res, intervalo: null };
+    _sseClients.add(cliente);
+
+    // Ping a cada 25s — mantém o TCP vivo e avisa o cliente se cair
+    cliente.intervalo = setInterval(function() {
+        try { res.write(": ping\n\n"); } catch (_) { _sseClients.delete(cliente); clearInterval(cliente.intervalo); }
+    }, 25000);
+
+    // Notifica o estado atual imediatamente ao conectar
+    res.write("event: dados\ndata: " + JSON.stringify({ carregando: _carregando, total: _itensBrutos.length }) + "\n\n");
+
+    req.once("close", function() {
+        _sseClients.delete(cliente);
+        clearInterval(cliente.intervalo);
+    });
+}
+
+async function handleBuscarMaisItens(req, res, json, erro) {
+    if (!_catalogoCompleto.length) {
+        json({ ok: true, itens: [], temMais: false, totalCatalogo: 0 });
+        return;
+    }
+    const inicio = _catalogoCursor;
+    const fim    = Math.min(inicio + LIMITE_SESSAO_BUSCA, _catalogoCompleto.length);
+    const lote   = _catalogoCompleto.slice(inicio, fim).map(item => ({
+        codigo:      item.codigo,
+        descricao:   item.descricao,
+        codbarras:   item.codbarras,
+        estoque:     item.estoque,
+        preco:       item.preco,
+        ultimaVenda: item.ultimaVenda,
+        usado:       !!_usados[item.codigo]
+    }));
+    _catalogoCursor = fim; // avança o cursor — próxima sessão continua daqui, nunca repete
+    logTs("Busca estendida: sess\u00e3o serviu " + lote.length + " item(ns) (\u00edndices " +
+          inicio + "\u2013" + (fim - 1) + " de " + _catalogoCompleto.length + ").");
+    json({
+        ok:            true,
+        itens:         lote,
+        temMais:       fim < _catalogoCompleto.length,
+        totalCatalogo: _catalogoCompleto.length
+    });
+}
+
+async function handleGetItens(req, res, json, erro) {
+    const itens = _itensOrdenados.map(item => ({
+        codigo:      item.codigo,
+        descricao:   item.descricao,
+        codbarras:   item.codbarras,
+        estoque:     item.estoque,
+        preco:       item.preco,
+        ultimaVenda: item.ultimaVenda,
+        usado:       !!_usados[item.codigo]
+    }));
+    json({
+        ok:             true,
+        carregando:     _carregando,
+        erro:           _erroConexao,
+        total:          _itensBrutos.length,
+        totalUsados:    _usadosCount,
+        itensAbaixoMin: _itensAbaixoMin,
+        estoqueMinimo:  _cfgVivo.estoqueMinimo,
+        ultimaAtualiz:  _ultimaAtualiz ? _ultimaAtualiz.toISOString() : null,
+        camposLog:      _camposLog,
+        anoAtual:       ANO_ATUAL,
+        lpEstoquesReais: _lpEstoquesReais,
+        itens
+    });
+}
+
+async function handleMarcarUsado(req, res, json, erro) {
+    let body;
+    try { body = await lerBody(req); } catch (e) { erro("Body inválido: " + e.message, 400); return; }
+    let parsed;
+    try { parsed = JSON.parse(body); } catch (_) { erro("JSON inválido.", 400); return; }
+
+    const codigo = String(parsed && parsed.codigo != null ? parsed.codigo : "").trim();
+    if (!codigo) { erro("Campo 'codigo' obrigatório.", 400); return; }
+
+    // Lookup O(1) via Set (substitui _itensBrutos.some(i => i.codigo === codigo))
+    const existeNosBrutos = _codigosSet.has(codigo);
+    if (!existeNosBrutos) {
+        // Marca mesmo assim para robustez (item pode ter sumido após refresh)
+        logTs("AVISO: marcar-usado para código não encontrado nos itens: " + codigo);
+    }
+
+    // Mantém _usadosCount em sincronia (incrementa apenas se era novo)
+    if (!_usados[codigo]) _usadosCount++;
+    _usados[codigo] = true;
+    reordenarFila();
+    salvarUsados();
+    logTs("Marcado como usado: " + codigo);
+    json({ ok: true });
+    emitirEventoSse("dados", { totalUsados: _usadosCount });
+}
+
+async function handleResetarUsados(req, res, json, erro) {
+    const n = _usadosCount;
+    _usados      = Object.create(null);
+    _usadosCount = 0;
+    reordenarFila();
+    salvarUsados();
+    logTs("Usados resetados — " + n + " item(s) voltaram à fila.");
+    json({ ok: true, liberados: n });
+    emitirEventoSse("dados", { totalUsados: 0 });
+}
+
+// Lida pelo cliente ao carregar a página (DOMContentLoaded), igual ao que
+// handleGetItens já faz para o estado "usado" de cada item.
+async function handleGetListaPersonalizada(req, res, json, erro) {
+    json({ ok: true, itens: _listaPersonalizada });
+}
+
+// Grava a lista inteira (substitui a anterior) e persiste em disco
+// imediatamente — mesma filosofia de marcar-usado/resetar-usados.
+async function handlePostListaPersonalizada(req, res, json, erro) {
+    let body;
+    try { body = await lerBody(req, 1024 * 64); } catch (e) { erro("Body inválido: " + e.message, 400); return; }
+    let parsed;
+    try { parsed = JSON.parse(body); } catch (_) { erro("JSON inválido.", 400); return; }
+    if (!parsed || !Array.isArray(parsed.itens)) { erro("Campo 'itens' (array) obrigatório.", 400); return; }
+
+    _listaPersonalizada = _sanitizarListaPersonalizada(parsed.itens);
+    salvarListaPersonalizadaDisco();
+    logTs("Lista personalizada salva: " + _listaPersonalizada.length + " c\u00f3digo(s).");
+    json({ ok: true, total: _listaPersonalizada.length });
+}
+
+async function handlePostAtualizar(req, res, json, erro) {
+    if (_loadLock || _carregando) {
+        json({ ok: false, erro: "Já em carregamento. Aguarde." });
+        return;
+    }
+    json({ ok: true, mensagem: "Iniciando atualização..." });
+    // Executa em background (não bloqueia a resposta)
+    setImmediate(() => {
+        carregarItens().catch(e => logErro("ERRO /api/atualizar: " + (e.message || e)));
+    });
+}
+
+async function handleGetStatus(req, res, json, erro) {
+    json({
+        ok:           true,
+        carregando:   _carregando,
+        erro:         _erroConexao,
+        total:        _itensBrutos.length,
+        totalUsados:  _usadosCount,
+        ultimaAtualiz: _ultimaAtualiz ? _ultimaAtualiz.toISOString() : null,
+        anoAtual:     ANO_ATUAL,
+        porta:        PORTA,
+        banco:        FDB_HOST + ":" + FDB_PATH,
+        camposLog:    _camposLog
+    });
+}
+
+async function handleGetConfig(req, res, json, erro) {
+    json({
+        ok:                 true,
+        fbHost:             _cfgVivo.fbHost,
+        fbPort:             _cfgVivo.fbPort,
+        fdbPath:            _cfgVivo.fbPath,
+        fbUser:             _cfgVivo.fbUser,
+        // SEGURANÇA: a senha NUNCA é devolvida em texto puro pela API — só um
+        // booleano indicando se já existe uma senha salva. O cliente usa isso
+        // pra exibir o placeholder certo; deixar o campo em branco ao salvar
+        // mantém a senha atual (ver handlePostConfig), mesmo padrão usado por
+        // qualquer formulário de troca de senha.
+        senhaConfigurada:   !!_cfgVivo.fbPassword,
+        portaEstoque:       _cfgVivo.portaEstoque,
+        appName:            _cfgVivo.appName,
+        proibidosExtra:     _cfgVivo.proibidosExtra,
+        estoqueMinimo:      _cfgVivo.estoqueMinimo,
+        maxItens:           _cfgVivo.maxItens,
+        proibidosEmbutidos: PROIBIDOS_EMBUTIDOS,
+        defaults: {
+            fbHost:        "192.168.1.65",
+            fbPort:        3050,
+            fdbPath:       "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB",
+            fbUser:        "SYSDBA",
+            fbPassword:    "masterkey",
+            portaEstoque:  7888,
+            appName:       "Consulta Estoque",
+            estoqueMinimo: 5,
+            maxItens:      2000
+        }
+    });
+}
+
+// ── Helpers de handlePostConfig (extraídos para reduzir a complexidade da
+// função principal — cada um trata um aspecto isolado da requisição) ─────────
+
+// Lê e valida o body, retornando os valores já normalizados ou null (e já
+// responde com o erro 400 apropriado) se algo for inválido.
+async function _lerEValidarPayloadConfig(req, erro) {
+    let body;
+    try { body = await lerBody(req, 1024 * 64); } catch (e) { erro("Body inválido: " + e.message, 400); return null; }
+    let parsed;
+    try { parsed = JSON.parse(body); } catch (_) { erro("JSON inválido.", 400); return null; }
+    if (!parsed || typeof parsed !== "object") { erro("Payload inválido.", 400); return null; }
+
+    const novaPortaFb   = parseInt(parsed.fbPort       || "3050", 10);
+    const novaPortaHttp = parseInt(parsed.portaEstoque || String(PORTA), 10);
+    const novoEstMin    = parsed.estoqueMinimo != null ? parseFloat(parsed.estoqueMinimo) : _cfgVivo.estoqueMinimo;
+    const novoMaxItens  = parsed.maxItens      != null ? parseInt(parsed.maxItens, 10)    : _cfgVivo.maxItens;
+    if (isNaN(novaPortaFb)   || novaPortaFb   < 1024 || novaPortaFb   > 65534) { erro("fbPort inválida (1024–65534).", 400); return null; }
+    if (isNaN(novaPortaHttp) || novaPortaHttp < 1024 || novaPortaHttp > 65534) { erro("portaEstoque inválida (1024–65534).", 400); return null; }
+    if (isNaN(novoEstMin)    || novoEstMin    < 0     || novoEstMin    > 9999)  { erro("estoqueMinimo inválido (0–9999).", 400); return null; }
+    if (isNaN(novoMaxItens)  || novoMaxItens  < 100   || novoMaxItens  > 5000)  { erro("maxItens inválido (100–5000).", 400); return null; }
+
+    let novosProibExtra = [];
+    const rawProb = String(parsed.proibidosExtra || "").trim();
+    if (rawProb) {
+        const sep = rawProb.includes("\n") ? "\n" : ",";
+        novosProibExtra = rawProb.split(sep)
+            .map(p => p.trim().toUpperCase())
+            .filter(p => p.length > 0);
+    }
+
+    return {
+        fbHost:        String(parsed.fbHost     || "").trim() || _cfgVivo.fbHost,
+        fbPath:        String(parsed.fdbPath    || "").trim() || _cfgVivo.fbPath,
+        fbUser:        String(parsed.fbUser     || "").trim() || _cfgVivo.fbUser,
+        fbPassword:    String(parsed.fbPassword || "").trim() || _cfgVivo.fbPassword,
+        appName:       String(parsed.appName    || "").trim() || _cfgVivo.appName,
+        fbPort:        novaPortaFb,
+        portaEstoque:  novaPortaHttp,
+        estoqueMinimo: novoEstMin,
+        maxItens:      novoMaxItens,
+        proibidosExtra: novosProibExtra
+    };
+}
+
+// Compara o payload normalizado contra _cfgVivo e retorna quais grupos de
+// configuração mudaram — usado para decidir o que persistir/recarregar.
+function _detectarMudancasConfig(novo) {
+    return {
+        dbMudou:       novo.fbHost !== _cfgVivo.fbHost   || novo.fbPath !== _cfgVivo.fbPath ||
+                       novo.fbPort !== _cfgVivo.fbPort   || novo.fbUser !== _cfgVivo.fbUser ||
+                       novo.fbPassword !== _cfgVivo.fbPassword,
+        probMudou:     JSON.stringify(novo.proibidosExtra) !== JSON.stringify(_cfgVivo.proibidosExtra),
+        estMinMudou:   novo.estoqueMinimo !== _cfgVivo.estoqueMinimo,
+        maxItensMudou: novo.maxItens      !== _cfgVivo.maxItens,
+        portaHMudou:   novo.portaEstoque  !== _cfgVivo.portaEstoque,
+        nameMudou:     novo.appName       !== _cfgVivo.appName
+    };
+}
+
+// Persiste em config.json, preservando campos de outros módulos que não
+// passam por esta tela (merge sobre o arquivo existente, não substituição).
+function _persistirConfig(novo) {
+    let cfgAtual = {};
+    try {
+        const rawCfg = fs.readFileSync(CONFIG_PATH, "utf8").replace(/^\uFEFF/, "");
+        cfgAtual = JSON.parse(rawCfg);
+    } catch (_) { /* não existe ainda — começa do zero */ }
+
+    const cfgNovo = Object.assign({}, cfgAtual, {
+        appName:        novo.appName,
+        fbHost:         novo.fbHost,
+        fbPort:         novo.fbPort,
+        fdbPath:        novo.fbPath,
+        fbUser:         novo.fbUser,
+        fbPassword:     novo.fbPassword,
+        portaEstoque:   novo.portaEstoque,
+        estoqueMinimo:  novo.estoqueMinimo,
+        maxItens:       novo.maxItens,
+        proibidos:      novo.proibidosExtra
+    });
+
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfgNovo, null, 2), "utf8"); // pode lançar — chamador trata
+}
+
+async function handlePostConfig(req, res, json, erro) {
+    const novo = await _lerEValidarPayloadConfig(req, erro);
+    if (!novo) return; // erro já respondido por _lerEValidarPayloadConfig
+
+    const mud = _detectarMudancasConfig(novo);
+    const reiniciarNecessario = mud.portaHMudou || mud.nameMudou;
+
+    try {
+        _persistirConfig(novo);
+        logTs("Config salvo: " + CONFIG_PATH);
+    } catch (e) {
+        erro("Falha ao salvar config.json: " + e.message, 500);
+        return;
+    }
+
+    // Aplica imediatamente as configurações que não precisam de restart
+    Object.assign(_cfgVivo, {
+        fbHost: novo.fbHost, fbPath: novo.fbPath, fbPort: novo.fbPort, fbUser: novo.fbUser,
+        fbPassword: novo.fbPassword, portaEstoque: novo.portaEstoque, appName: novo.appName,
+        estoqueMinimo: novo.estoqueMinimo, maxItens: novo.maxItens, proibidosExtra: novo.proibidosExtra
+    });
+
+    // Invalida cache do HTML se o nome da app, estoque mínimo, maxItens ou a
+    // lista de proibidos mudou (o cliente usa _S.proibidosExtra na
+    // verificação defensiva do modo automático — precisa ficar atual)
+    if (mud.nameMudou || mud.estMinMudou || mud.maxItensMudou || mud.probMudou) _htmlCache = null;
+
+    // Reconstrói regex de proibidos se a lista mudou
+    if (mud.probMudou) _refazerProibidos(novo.proibidosExtra);
+
+    // Recarrega dados do banco se conexão, proibidos, estoque mínimo ou maxItens mudaram
+    const precisaRecarregar = mud.dbMudou || mud.probMudou || mud.estMinMudou || mud.maxItensMudou;
+    if (precisaRecarregar && !_loadLock) {
+        logTs("Config alterado — recarregando itens em background...");
+        setImmediate(() => carregarItens().catch(e => logErro("ERRO reload pós-config: " + (e.message || e))));
+    }
+
+    const msgs = [];
+    if (precisaRecarregar) msgs.push("Dados recarregados do banco.");
+    if (reiniciarNecessario) {
+        msgs.push("Reinicie o servidor para aplicar: " +
+            [mud.nameMudou ? "nome da aplicação" : null, mud.portaHMudou ? "porta HTTP" : null]
+                .filter(Boolean).join(" e ") + ".");
+    }
+
+    json({ ok: true, reiniciarNecessario, mensagem: msgs.join(" ") || "Configurações salvas com sucesso." });
+}
+
+// ── Tabela de despacho ────────────────────────────────────────────────────────
+// Chave: "MÉTODO caminho". Adicionar uma rota nova = adicionar uma linha aqui
+// + a função handler correspondente acima — não toca em nenhuma rota existente.
+const ROTAS = {
+    "GET /":                              handleGetRoot,
+    "GET /index.html":                    handleGetRoot,
+    "GET /api/buscar-mais-itens":         handleBuscarMaisItens,
+    "GET /api/sse":                        handleSse,
+    "GET /api/itens":                     handleGetItens,
+    "POST /api/marcar-usado":             handleMarcarUsado,
+    "POST /api/resetar-usados":           handleResetarUsados,
+    "GET /api/lista-personalizada":       handleGetListaPersonalizada,
+    "POST /api/lista-personalizada":      handlePostListaPersonalizada,
+    "POST /api/atualizar":                handlePostAtualizar,
+    "GET /api/status":                    handleGetStatus,
+    "GET /api/config":                    handleGetConfig,
+    "POST /api/config":                   handlePostConfig
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SERVIDOR HTTP
 // ─────────────────────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
@@ -2590,261 +5240,28 @@ const server = http.createServer(async (req, res) => {
 
     res.on("error", e => logTs("AVISO res[" + rota + "]: " + e.message));
 
+    const handler = ROTAS[req.method + " " + rota];
     try {
-        // ── GET / ─────────────────────────────────────────────────────────────
-        if ((rota === "/" || rota === "/index.html") && req.method === "GET") {
-            res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-            res.end(gerarHTML());
+        if (handler) {
+            await handler(req, res, json, erro);
             return;
         }
-
-        // ── GET /api/itens ────────────────────────────────────────────────────
-        if (rota === "/api/itens" && req.method === "GET") {
-            const itens = _itensOrdenados.map(item => ({
-                codigo:      item.codigo,
-                descricao:   item.descricao,
-                codbarras:   item.codbarras,
-                estoque:     item.estoque,
-                preco:       item.preco,
-                ultimaVenda: item.ultimaVenda,
-                usado:       !!_usados[item.codigo]
-            }));
-            json({
-                ok:             true,
-                carregando:     _carregando,
-                erro:           _erroConexao,
-                total:          _itensBrutos.length,
-                totalUsados:    _usadosCount,
-                itensAbaixoMin: _itensAbaixoMin,
-                estoqueMinimo:  _cfgVivo.estoqueMinimo,
-                ultimaAtualiz:  _ultimaAtualiz ? _ultimaAtualiz.toISOString() : null,
-                camposLog:      _camposLog,
-                anoAtual:       ANO_ATUAL,
-                itens
-            });
-            return;
-        }
-
-        // ── POST /api/marcar-usado ────────────────────────────────────────────
-        if (rota === "/api/marcar-usado" && req.method === "POST") {
-            let body;
-            try { body = await lerBody(req); } catch (e) { erro("Body inválido: " + e.message, 400); return; }
-            let parsed;
-            try { parsed = JSON.parse(body); } catch (_) { erro("JSON inválido.", 400); return; }
-
-            const codigo = String(parsed && parsed.codigo != null ? parsed.codigo : "").trim();
-            if (!codigo) { erro("Campo 'codigo' obrigatório.", 400); return; }
-
-            // Lookup O(1) via Set (substitui _itensBrutos.some(i => i.codigo === codigo))
-            const existeNosBrutos = _codigosSet.has(codigo);
-            if (!existeNosBrutos) {
-                // Marca mesmo assim para robustez (item pode ter sumido após refresh)
-                logTs("AVISO: marcar-usado para código não encontrado nos itens: " + codigo);
-            }
-
-            // Mantém _usadosCount em sincronia (incrementa apenas se era novo)
-            if (!_usados[codigo]) _usadosCount++;
-            _usados[codigo] = true;
-            reordenarFila();
-            salvarUsados();
-            logTs("Marcado como usado: " + codigo);
-            json({ ok: true });
-            return;
-        }
-
-        // ── POST /api/resetar-usados ──────────────────────────────────────────
-        if (rota === "/api/resetar-usados" && req.method === "POST") {
-            const n = _usadosCount;
-            _usados      = Object.create(null);
-            _usadosCount = 0;
-            reordenarFila();
-            salvarUsados();
-            logTs("Usados resetados — " + n + " item(s) voltaram à fila.");
-            json({ ok: true, liberados: n });
-            return;
-        }
-
-        // ── POST /api/atualizar ───────────────────────────────────────────────
-        if (rota === "/api/atualizar" && req.method === "POST") {
-            if (_loadLock || _carregando) {
-                json({ ok: false, erro: "Já em carregamento. Aguarde." });
-                return;
-            }
-            json({ ok: true, mensagem: "Iniciando atualização..." });
-            // Executa em background (não bloqueia a resposta)
-            setImmediate(() => {
-                carregarItens().catch(e => logTs("ERRO /api/atualizar: " + (e.message || e)));
-            });
-            return;
-        }
-
-        // ── GET /api/status ───────────────────────────────────────────────────
-        if (rota === "/api/status" && req.method === "GET") {
-            json({
-                ok:           true,
-                carregando:   _carregando,
-                erro:         _erroConexao,
-                total:        _itensBrutos.length,
-                totalUsados:  _usadosCount,
-                ultimaAtualiz: _ultimaAtualiz ? _ultimaAtualiz.toISOString() : null,
-                anoAtual:     ANO_ATUAL,
-                porta:        PORTA,
-                banco:        FDB_HOST + ":" + FDB_PATH,
-                camposLog:    _camposLog
-            });
-            return;
-        }
-
-        // ── GET /api/config ───────────────────────────────────────────────────
-        if (rota === "/api/config" && req.method === "GET") {
-            json({
-                ok:                 true,
-                fbHost:             _cfgVivo.fbHost,
-                fbPort:             _cfgVivo.fbPort,
-                fdbPath:            _cfgVivo.fbPath,
-                fbUser:             _cfgVivo.fbUser,
-                fbPassword:         _cfgVivo.fbPassword,
-                portaEstoque:       _cfgVivo.portaEstoque,
-                appName:            _cfgVivo.appName,
-                proibidosExtra:     _cfgVivo.proibidosExtra,
-                estoqueMinimo:      _cfgVivo.estoqueMinimo,
-                proibidosEmbutidos: PROIBIDOS_EMBUTIDOS,
-                defaults: {
-                    fbHost:        "192.168.1.65",
-                    fbPort:        3050,
-                    fdbPath:       "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB",
-                    fbUser:        "SYSDBA",
-                    fbPassword:    "masterkey",
-                    portaEstoque:  7888,
-                    appName:       "Consulta Estoque",
-                    estoqueMinimo: 5
-                }
-            });
-            return;
-        }
-
-        // ── POST /api/config ──────────────────────────────────────────────────
-        if (rota === "/api/config" && req.method === "POST") {
-            let body;
-            try { body = await lerBody(req, 1024 * 64); } catch (e) { erro("Body inválido: " + e.message, 400); return; }
-            let parsed;
-            try { parsed = JSON.parse(body); } catch (_) { erro("JSON inválido.", 400); return; }
-            if (!parsed || typeof parsed !== "object") { erro("Payload inválido.", 400); return; }
-
-            // Valida e normaliza portas e limites numéricos
-            const novaPortaFb    = parseInt(parsed.fbPort        || "3050", 10);
-            const novaPortaHttp  = parseInt(parsed.portaEstoque  || String(PORTA), 10);
-            const novoEstMin     = parsed.estoqueMinimo != null ? parseFloat(parsed.estoqueMinimo) : _cfgVivo.estoqueMinimo;
-            if (isNaN(novaPortaFb)   || novaPortaFb   < 1024 || novaPortaFb   > 65534) { erro("fbPort inválida (1024–65534).", 400); return; }
-            if (isNaN(novaPortaHttp) || novaPortaHttp < 1024 || novaPortaHttp > 65534) { erro("portaEstoque inválida (1024–65534).", 400); return; }
-            if (isNaN(novoEstMin)    || novoEstMin    < 0     || novoEstMin    > 9999)  { erro("estoqueMinimo inválido (0–9999).", 400); return; }
-
-            // Sanitiza strings
-            const novoFbHost  = String(parsed.fbHost       || "").trim() || _cfgVivo.fbHost;
-            const novoFbPath  = String(parsed.fdbPath      || "").trim() || _cfgVivo.fbPath;
-            const novoFbUser  = String(parsed.fbUser       || "").trim() || _cfgVivo.fbUser;
-            const novoFbPass  = String(parsed.fbPassword   || "").trim() || _cfgVivo.fbPassword;
-            const novoAppName = String(parsed.appName      || "").trim() || _cfgVivo.appName;
-
-            // Sanitiza proibidos extras (aceita lista separada por \n ou ,)
-            let novosProibExtra = [];
-            const rawProb = String(parsed.proibidosExtra || "").trim();
-            if (rawProb) {
-                const sep = rawProb.includes("\n") ? "\n" : ",";
-                novosProibExtra = rawProb.split(sep)
-                    .map(p => p.trim().toUpperCase())
-                    .filter(p => p.length > 0);
-            }
-
-            // Detecta o que realmente mudou
-            const dbMudou     = novoFbHost !== _cfgVivo.fbHost   || novoFbPath !== _cfgVivo.fbPath    ||
-                                novaPortaFb !== _cfgVivo.fbPort  || novoFbUser !== _cfgVivo.fbUser    ||
-                                novoFbPass  !== _cfgVivo.fbPassword;
-            const probMudou    = JSON.stringify(novosProibExtra) !== JSON.stringify(_cfgVivo.proibidosExtra);
-            const estMinMudou  = novoEstMin !== _cfgVivo.estoqueMinimo;
-            const portaHMudou  = novaPortaHttp !== _cfgVivo.portaEstoque;
-            const nameMudou   = novoAppName   !== _cfgVivo.appName;
-            const reiniciarNecessario = portaHMudou || nameMudou;
-
-            // Lê config.json existente para preservar campos de outros módulos
-            let cfgAtual = {};
-            try {
-                const rawCfg = fs.readFileSync(CONFIG_PATH, "utf8").replace(/^\uFEFF/, "");
-                cfgAtual = JSON.parse(rawCfg);
-            } catch (_) { /* não existe ainda — começa do zero */ }
-
-            // Merge: preserva campos existentes, atualiza apenas os do formulário
-            const cfgNovo = Object.assign({}, cfgAtual, {
-                appName:      novoAppName,
-                fbHost:       novoFbHost,
-                fbPort:       novaPortaFb,
-                fdbPath:      novoFbPath,
-                fbUser:       novoFbUser,
-                fbPassword:   novoFbPass,
-                portaEstoque:   novaPortaHttp,
-                estoqueMinimo:  novoEstMin,
-                proibidos:      novosProibExtra
-            });
-
-            try {
-                fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfgNovo, null, 2), "utf8");
-                logTs("Config salvo: " + CONFIG_PATH);
-            } catch (e) {
-                erro("Falha ao salvar config.json: " + e.message, 500);
-                return;
-            }
-
-            // Aplica imediatamente as configurações que não precisam de restart
-            _cfgVivo.fbHost         = novoFbHost;
-            _cfgVivo.fbPath         = novoFbPath;
-            _cfgVivo.fbPort         = novaPortaFb;
-            _cfgVivo.fbUser         = novoFbUser;
-            _cfgVivo.fbPassword     = novoFbPass;
-            _cfgVivo.portaEstoque   = novaPortaHttp;
-            _cfgVivo.appName        = novoAppName;
-            _cfgVivo.estoqueMinimo  = novoEstMin;
-            _cfgVivo.proibidosExtra = novosProibExtra;
-
-            // Invalida cache do HTML se o nome da app ou o estoque mínimo mudou
-            if (nameMudou || estMinMudou) _htmlCache = null;
-
-            // Reconstrói regex de proibidos se a lista mudou
-            if (probMudou) _refazerProibidos(novosProibExtra);
-
-            // Recarrega dados do banco se conexão ou proibidos mudaram
-            if ((dbMudou || probMudou || estMinMudou) && !_loadLock) {
-                logTs("Config alterado — recarregando itens em background...");
-                setImmediate(() => carregarItens().catch(e => logTs("ERRO reload pós-config: " + (e.message || e))));
-            }
-
-            const msgs = [];
-            if (dbMudou || probMudou || estMinMudou) msgs.push("Dados recarregados do banco.");
-            if (reiniciarNecessario)   msgs.push("Reinicie o servidor para aplicar: " +
-                [nameMudou ? "nome da aplicação" : null, portaHMudou ? "porta HTTP" : null]
-                    .filter(Boolean).join(" e ") + ".");
-
-            json({ ok: true, reiniciarNecessario, mensagem: msgs.join(" ") || "Configurações salvas com sucesso." });
-            return;
-        }
-
-        // ── 404 ───────────────────────────────────────────────────────────────
         if (!res.headersSent) {
             res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
             res.end("Rota não encontrada: " + rota);
         }
-
     } catch (e) {
-        logTs("ERRO na requisição [" + rota + "]: " + String(e.message || e));
+        logErro("ERRO na requisição [" + rota + "]: " + String(e.message || e));
         erro("Erro interno do servidor.", 500);
     }
 });
 
 server.on("error", err => {
     if (err.code === "EADDRINUSE") {
-        logTs("ERRO: Porta " + PORTA + " já está em uso.");
+        logErro("ERRO: Porta " + PORTA + " já está em uso.");
         logTs("Adicione 'portaEstoque': XXXX no config.json para usar outra porta.");
     } else {
-        logTs("ERRO no servidor: " + (err.message || err));
+        logErro("ERRO no servidor: " + (err.message || err));
     }
     process.exit(1);
 });
@@ -2866,7 +5283,7 @@ server.listen(PORTA, "0.0.0.0", () => {
     logTs("Acesse: http://localhost:" + PORTA);
     logTs("Banco:  " + FDB_HOST + ":" + FDB_PATH);
     logTs("Ano:    sem filtro de ano (todos os itens com estoque > 0)");
-    logTs("Limite: " + MAX_ITENS + " itens | Proibidos: " + PROIBIDOS.length + " termos");
+    logTs("Limite: " + _cfgVivo.maxItens + " itens | Proibidos: " + PROIBIDOS.length + " termos");
     logTs("══════════════════════════════════════════════════");
 
     // Carregamento inicial
@@ -2876,8 +5293,15 @@ server.listen(PORTA, "0.0.0.0", () => {
         } else {
             logTs("AVISO: Dados não carregados. Causa: " + (_erroConexao || "desconhecida"));
             logTs("A interface está disponível — use o botão 'Atualizar' após corrigir a conexão.");
+            // Se não há config.json com fbHost, escaneia a rede em background
+            // pra tentar descobrir automaticamente (scan é disparado também no
+            // callback de falha da conexão, mas apenas se err != null — aqui
+            // cobrimos o caso de config ausente mas FDB local não encontrado)
+            if (!cfg.fbHost) {
+                setImmediate(function() { autoDetectarHost().catch(function() {}); });
+            }
         }
     }).catch(e => {
-        logTs("ERRO no carregamento inicial: " + String(e.message || e));
+        logErro("ERRO no carregamento inicial: " + String(e.message || e));
     });
 });
