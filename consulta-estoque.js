@@ -3,27 +3,51 @@
 /**
  * consulta-estoque.js
  *
- * @version 5.17.0
+ * @version 5.28.0
  * @changelog
- *   5.17.0 - 2026-07-25 - BUG REAL corrigido: alerta "código não existe
- *     mais no banco" disparava para códigos que EXISTEM e têm estoque
- *     real, quando o código digitado na lista personalizada tinha MENOS
- *     de 5 dígitos (ex.: "8883" em vez de "08883"). Causa: as correções
- *     anteriores (v5.11.0/v5.12.0) só sabiam REMOVER zeros à esquerda pra
- *     comparar formas — nunca ACRESCENTAR. Como a regra de negócio deste
- *     catálogo é códigos sempre com exatamente 5 dígitos (7403 -> 07403,
- *     703 -> 00703, 8883 -> 08883), um código digitado mais curto nunca
- *     gerava a variante de busca preenchida, então a consulta dedicada
- *     nunca tentava "08883" — só "8883", que não existe no banco assim.
- *     Nova função _codigoPadrao5Digitos() (servidor) /
- *     _codigoPadrao5DigitosCliente() (cliente) preenche com zeros à
- *     esquerda até completar 5 dígitos; usada tanto na consulta dedicada
- *     quanto na reconciliação de resultado (servidor) e no fallback de
- *     matching do pool do Modo Automático (cliente). Mantidas as duas
- *     formas de normalização anteriores (sem-zeros) como buscas
- *     adicionais, para não regredir casos já cobertos antes.
+ *   5.28.0 - 2026-08-08 - Coluna "Cód. Barras" também copia, e a lógica de
+ *     cópia por coluna foi generalizada:
  *
- * Servidor de relatório de estoque disponível (Firebird + Node.js).
+ *     [1] CÓD. BARRAS COPIÁVEL
+ *         Clicar no cabeçalho copia todos os códigos de barras da busca atual,
+ *         um por linha, com tooltip e ícone iguais aos da coluna "Código".
+ *
+ *     [2] GENERALIZAÇÃO EM VEZ DE DUPLICAÇÃO
+ *         Em vez de clonar a implementação da v5.27.0, ela virou genérica:
+ *         _copiarColunaVisivel(campo, ...) e _thCopiarHtml(...) atendem as duas
+ *         colunas, e o CSS passou da classe específica .th-cod-* para a
+ *         genérica .th-copiar-*. Duplicar significaria que toda correção futura
+ *         precisaria ser lembrada em dois lugares.
+ *
+ *     [3] TRATAMENTO DE CÓDIGO DE BARRAS AUSENTE (diferença real entre as
+ *         colunas, e o motivo de a generalização não ser trivial)
+ *         Todo item tem código, mas nem todo item tem barras cadastrado.
+ *         Portanto:
+ *           - Itens sem valor são PULADOS, não viram linha em branco: uma
+ *             linha vazia no meio da colagem quebraria importação em planilha
+ *             ou no ERP.
+ *           - O tooltip conta os valores REALMENTE preenchidos, não _vis.length
+ *             — prometer "138 códigos de barras" e entregar 96 seria pior do
+ *             que não informar número nenhum.
+ *           - Após copiar, se algum item ficou de fora por não ter barras, o
+ *             toast informa quantos foram. Sem isso o usuário poderia achar que
+ *             levou a lista toda e só perceber a diferença depois de colar.
+ *           - Se nenhum item da busca tiver barras, avisa e não mexe na área de
+ *             transferência (não apaga o que já estava lá).
+ *
+ *     [4] ALINHAMENTO PRESERVADO POR COLUNA
+ *         O contêiner flex do cabeçalho poderia impor um alinhamento próprio e
+ *         substituir o text-align de cada coluna. "Código" segue centralizado
+ *         (pedido explícito da v5.24.0) e "Cód. Barras" segue à esquerda como
+ *         sempre foi: o padrão é flex-start e só .th-cod recebe o centro, para
+ *         nenhuma coluna mudar de aparência como efeito colateral de virar
+ *         copiável.
+ *
+ *     Continua lendo de _vis (lista completa do filtro) e não do DOM — ver
+ *     comentário na função: com a renderização incremental, varrer as linhas
+ *     copiaria apenas o lote já rolado.
+ *
+  * Servidor de relatório de estoque disponível (Firebird + Node.js).
  * NÃO depende de gerar-relatorio-html.js nem servidor-relatorio.js.
  * Lê config.json apenas para: fbHost, fdbPath, proibidos, appName.
  * Porta padrão: 7888 (configurável via config.json → portaEstoque)
@@ -60,8 +84,30 @@ const LISTA_PERSONALIZADA_PATH = path.join(__dirname, "lista-personalizada.json"
 const ANO_ATUAL   = new Date().getFullYear();
 const MAX_ITENS   = 2000;
 const LIMITE_SESSAO_BUSCA = 1000; // itens por "sessão" de busca estendida (Modo Automático) — evita travar o navegador
-const SQL_LIMIT_BRUTO     = 200000; // teto do SELECT FIRST — muito acima do maxItens configurável (máx 5000)
+// ── Teto configurável de itens carregados do banco ───────────────────────────
+// Era 5000. Elevado para 20000 na v5.23.0 porque o gargalo que justificava o
+// teto baixo foi removido: até então a tabela era montada inteira num único
+// innerHTML, e o custo medido por linha é ~435 bytes de HTML e ~20 nós de DOM
+// — ou seja, 5000 itens = ~2 MB de HTML e ~100.000 nós DE UMA VEZ, a cada
+// filtro/ordenação, o que congela um PC de loja por vários segundos.
+// Com a renderização incremental (ver _renderLote no client-side), o DOM passa
+// a receber apenas o lote visível (120–300 linhas), então o custo de render
+// deixou de crescer com maxItens.
+//
+// Por que 20000 e não "ilimitado": o que ainda cresce linearmente é a MEMÓRIA
+// do array _itens no navegador (~1 KB/item ≈ 20 MB em 20000) e o custo O(n) de
+// cada filtro/ordenação, que roda a cada busca. 20000 mantém o filtro na casa
+// de poucas dezenas de ms mesmo em máquina fraca; acima disso a digitação
+// começa a engasgar de novo, agora por um motivo diferente (CPU, não DOM), que
+// só uma indexação server-side resolveria de verdade.
+const MAX_ITENS_TETO      = 20000;
+const SQL_LIMIT_BRUTO     = 200000; // teto do SELECT FIRST — muito acima do maxItens configurável (máx MAX_ITENS_TETO)
                                      // pra garantir que o banco devolva o catálogo inteiro de uma vez
+const CONEXAO_TIMEOUT_MS  = 15000;  // teto para Firebird.attach() nunca travar _loadLock indefinidamente
+                                     // quando o host está inacessível (firewall/IP errado) — o driver não
+                                     // garante timeout próprio de conexão em todas as plataformas; sem este
+                                     // teto, um host que nunca responde nem nunca dá erro deixa _loadLock
+                                     // preso em "true" para sempre, bloqueando qualquer atualização futura.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UTILITÁRIOS
@@ -157,6 +203,28 @@ const PORTA = (() => {
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────
+// VALORES-PADRÃO (fonte única) — achado #A da revisão 2026-08-06: antes os
+// mesmos valores (host, porta, caminho do FDB, usuário, senha, estoqueMinimo,
+// maxItens...) estavam duplicados em 3 pontos independentes do arquivo
+// (detectarFdb(), inicialização de _cfgVivo e o bloco "defaults" devolvido por
+// GET /api/config) — mudar um default exigia lembrar de editar os outros dois,
+// e diferenças entre eles já causaram o placeholder da UI ("masterkey") ficar
+// diferente do valor realmente aplicado em runtime. Centralizado aqui: qualquer
+// mudança de default futura é feita em UM único lugar.
+// ─────────────────────────────────────────────────────────────────────────────
+const DEFAULTS = Object.freeze({
+    fbHost:        "192.168.1.65",
+    fbPort:        3050,
+    fdbPath:       "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB",
+    fbUser:        "SYSDBA",
+    fbPassword:    "masterkey",
+    portaEstoque:  7888,
+    appName:       "Consulta Estoque",
+    estoqueMinimo: 5,
+    maxItens:      MAX_ITENS
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DETECÇÃO DO FDB
 // Prioridade: (1) FDB local no disco, (2) config.json, (3) scan de rede na
 // subnet local pela porta Firebird (3050) — resultado é salvo no config.json
@@ -211,7 +279,7 @@ function detectarFdb() {
         const dbPath = fdbPathDoIni
             || (cfg.fdbPath && String(cfg.fdbPath).trim()
                 ? String(cfg.fdbPath).trim()
-                : "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB");
+                : DEFAULTS.fdbPath);
         logTs("FDB via config.json: " + host + ":" + dbPath);
         return { host, dbPath };
     }
@@ -219,9 +287,8 @@ function detectarFdb() {
     // Nenhuma fonte definida — usa padrão e agenda scan de rede em background.
     // O scan não bloqueia o startup: o servidor sobe imediatamente com o padrão
     // e atualizará _cfgVivo + salva no config.json quando encontrar o servidor.
-    const dbPath = fdbPathDoIni
-        || "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB";
-    const host   = "192.168.1.65"; // padrão; scan atualizará se errado
+    const dbPath = fdbPathDoIni || DEFAULTS.fdbPath;
+    const host   = DEFAULTS.fbHost; // padrão; scan atualizará se errado
     logTs("FDB sem config.json — usando padrão: " + host + ":" + dbPath);
     return { host, dbPath };
 }
@@ -348,8 +415,12 @@ let _htmlCache      = null;             // Cache do HTML estático — gerado ap
 const _ENGINE_SRC = "/**\n * estoque-engine.js\n *\n * @version 1.3.0\n * @changelog\n *   1.3.0 - 2026-07-10 - Modo Agrupar (encontrarGruposAsync) não funcionava\n *     corretamente com a fase extra de subset-sum (DP) introduzida na v1.1.0.\n *     Revertido para o algoritmo da versão anterior comprovadamente estável\n *     (mesma lógica testada e usada em produção antes da extração para este\n *     módulo): apenas pares e triplas, com índices estritamente crescentes\n *     (a<b / a<b<c — sem duplicar o mesmo conjunto de itens em ordens\n *     diferentes) e limite de candidatos/resultados para nunca travar o\n *     browser. Roda em um único setTimeout (sem chunking multi-fase, sem\n *     necessidade de guard de geração entre fases internas — só no início/\n *     fim, mais simples e com muito menos superfície para bugs). Continua\n *     filtrando por estoqueMinimo/proibidos ANTES de montar os candidatos\n *     (correção que a v1.1.0 trouxe e que continua válida) e mantém a\n *     deduplicação final por assinatura de códigos como trava de segurança.\n *     Efeito colateral aceito: combinações de 4+ itens deixam de ser\n *     buscadas (eram uma tentativa de melhoria que se mostrou não confiável)\n *     — o modo Agrupar volta a cobrir pares e triplas, como na versão que\n *     funcionava.\n *\n * ARQUITETURA:\n *   - UMD wrapper: expõe via module.exports (Node) ou window globals (browser)\n *   - Funções puras: nenhuma lê/escreve globais — toda dependência é parâmetro\n *   - Os únicos \"globals\" usados são o fallback em _ehProibidoCliente e\n *     _termosSemMatch, que aceitam o valor explícito como 1º opção\n *   - encontrarGruposAsync / encontrarCombinacoesComRepeticaoAsync aceitam um\n *     objeto de geração externo e um callback de status opcionais\n *\n * USO NOS TESTES:\n *   const engine = require('./estoque-engine.js');\n *   const { _qtdMaximaDisponivel } = engine;\n *\n * USO NO BROWSER (via script inline pelo servidor):\n *   // Todas as funções ficam globais automaticamente via UMD\n *   _qtdMaximaDisponivel(item, usos, parada, piso);\n */\n\n/* global window, _S, _itens */\n(function (root, factory) {\n    \"use strict\";\n    if (typeof module !== \"undefined\" && module.exports) {\n        // Node.js — require()\n        module.exports = factory();\n    } else {\n        // Browser — expõe tudo como global (igual ao comportamento anterior)\n        var api = factory();\n        for (var k in api) {\n            if (Object.prototype.hasOwnProperty.call(api, k)) root[k] = api[k];\n        }\n    }\n}(typeof globalThis !== \"undefined\" ? globalThis : this, function () {\n    \"use strict\";\n\n    // ── Constantes exportadas ─────────────────────────────────────────────────\n    // Centralizadas aqui para que testes e servidor usem sempre os mesmos valores.\n    var FLOAT_EPS              = 0.005;  // tolerância float (~meio centavo)\n    var FAIXA_COMBINAR         = 40;     // tolerância acima do valor-alvo no modo Combinar\n    var FAIXA_EXCEDENTE_LP     = 99999;  // sentinela \"sem teto\" para busca de excedente\n    var PRECO_SENTINEL_ZERADO  = 0.01;   // preço sentinela de item \"zerado\" no ERP legado\n    var MAX_COMBINAR_RESULTADOS = 20;    // máx. combinações retornadas pelo modo Combinar\n\n    // ── _qtdMaximaDisponivel ──────────────────────────────────────────────────\n    // Quantas unidades de um item ainda podem ser usadas sem violar nenhum\n    // dos três pisos de estoque (parada, mínimo ou zero absoluto).\n    //\n    // Três conceitos de piso, como camadas independentes:\n    //   1. Estoque de parada (estoqueParadaPorCod[codigo]) — prevalece quando definido.\n    //   2. Estoque mínimo (pisoPadrao) — usado quando não há parada específica.\n    //   3. Zero absoluto — trava incondicional; nunca retorna valor que tornaria\n    //      o estoque simulado negativo, mesmo que piso ou dados venham inválidos.\n    function _qtdMaximaDisponivel(item, usosAcumulados, estoqueParadaPorCod, pisoPadrao) {\n        if (!item) return 0;\n        var estoqueAtual = Number(item.estoque || 0);\n        if (!Number.isFinite(estoqueAtual) || estoqueAtual < 0) return 0;\n        var usados = (usosAcumulados && usosAcumulados[item.codigo]) || 0;\n        if (!Number.isFinite(usados) || usados < 0) usados = 0;\n        var limite   = estoqueParadaPorCod ? estoqueParadaPorCod[item.codigo] : null;\n        var pisoBase = (typeof pisoPadrao === \"number\" && Number.isFinite(pisoPadrao)) ? pisoPadrao : 0;\n        var piso     = (limite != null && !isNaN(limite)) ? Number(limite) : pisoBase;\n        if (!Number.isFinite(piso) || piso < 0) piso = 0;\n        var restante = estoqueAtual - usados - piso;\n        return restante > 0 ? Math.floor(restante) : 0;\n    }\n\n    // ── _grupoRespeitaLimites ─────────────────────────────────────────────────\n    // Trava final: verifica se um grupo de itens (podendo repetir códigos)\n    // respeita, código a código, a quantidade máxima calculada por\n    // _qtdMaximaDisponivel. Usado antes de aceitar uma combinação no fallback\n    // de força bruta de _autoEncontrarMelhorComRepeticao.\n    function _grupoRespeitaLimites(grupo, usosAcumulados, estoqueParadaPorCod, pisoPadrao) {\n        if (!grupo || !grupo.length) return true;\n        var contagem = {};\n        var refs     = {};\n        for (var gi = 0; gi < grupo.length; gi++) {\n            var cod = grupo[gi].codigo;\n            contagem[cod] = (contagem[cod] || 0) + 1;\n            refs[cod] = grupo[gi];\n        }\n        for (var cod2 in contagem) {\n            if (!Object.prototype.hasOwnProperty.call(contagem, cod2)) continue;\n            if (contagem[cod2] > _qtdMaximaDisponivel(refs[cod2], usosAcumulados, estoqueParadaPorCod, pisoPadrao)) {\n                return false;\n            }\n        }\n        return true;\n    }\n\n    // ── _autoEncontrarMelhor (modo padrão — sem repetição de código) ──────────\n    // Busca em 4 fases: item exato → par exato → tripla exata → melhor match\n    // em [valor, valor+40]. Nunca usa o mesmo código mais de uma vez.\n    function _autoEncontrarMelhor(disponiveis, valor, faixaExtra) {\n        if (!valor || valor <= 0 || !disponiveis || !disponiveis.length) return null;\n        var _extra  = (typeof faixaExtra === \"number\" && faixaExtra >= 0) ? faixaExtra : 0;\n        var EPS     = FLOAT_EPS;\n        var alvoMax = valor + 40 + _extra;\n        var candsExatos = [];\n        var candsFaixa  = [];\n        for (var _ci = 0; _ci < disponiveis.length; _ci++) {\n            var _item = disponiveis[_ci];\n            var _cp   = Number(_item.preco || 0);\n            if (_cp <= 0) continue;\n            _item._p = _cp;\n            if (_cp <= alvoMax + EPS) {\n                candsFaixa.push(_item);\n                if (_cp <= valor + EPS) candsExatos.push(_item);\n            }\n        }\n        if (!candsFaixa.length) return null;\n\n        // Fase 1: item único exato\n        for (var _f1 = 0; _f1 < candsExatos.length; _f1++) {\n            if (Math.abs(candsExatos[_f1]._p - valor) <= EPS) {\n                return { itens: [candsExatos[_f1]], soma: +candsExatos[_f1]._p.toFixed(2), diff: 0 };\n            }\n        }\n\n        // Mapa preço→itens (centavos) para lookup O(1) de complemento\n        var _precoMap = Object.create(null);\n        for (var _pmi = 0; _pmi < candsExatos.length; _pmi++) {\n            var _pKey = Math.round(candsExatos[_pmi]._p * 100);\n            if (!_precoMap[_pKey]) _precoMap[_pKey] = [];\n            _precoMap[_pKey].push(candsExatos[_pmi]);\n        }\n\n        // Fase 2: par exato\n        for (var _f2 = 0; _f2 < candsExatos.length; _f2++) {\n            var _pa2  = candsExatos[_f2]._p;\n            var _pb2  = valor - _pa2;\n            if (_pb2 <= EPS) continue;\n            var _lista2 = _precoMap[Math.round(_pb2 * 100)];\n            if (!_lista2) continue;\n            for (var _li2 = 0; _li2 < _lista2.length; _li2++) {\n                if (_lista2[_li2].codigo === candsExatos[_f2].codigo) continue;\n                var _soma2 = _pa2 + _lista2[_li2]._p;\n                if (Math.abs(_soma2 - valor) <= EPS) {\n                    return { itens: [candsExatos[_f2], _lista2[_li2]], soma: +_soma2.toFixed(2), diff: 0 };\n                }\n            }\n        }\n\n        // Fase 3: tripla exata (O(n²) + hash para 3º)\n        var _tripCands = candsExatos.filter(function(i) { return i._p < valor - EPS; });\n        if (_tripCands.length > 200) _tripCands = _tripCands.slice(0, 200);\n        outer3ex:\n        for (var _a3 = 0; _a3 < _tripCands.length; _a3++) {\n            var _pa3 = _tripCands[_a3]._p;\n            for (var _b3 = _a3 + 1; _b3 < _tripCands.length; _b3++) {\n                var _ab3 = _pa3 + _tripCands[_b3]._p;\n                if (_ab3 >= valor - EPS) continue;\n                var _lista3 = _precoMap[Math.round((valor - _ab3) * 100)];\n                if (!_lista3) continue;\n                for (var _li3 = 0; _li3 < _lista3.length; _li3++) {\n                    var _c3 = _lista3[_li3];\n                    if (_c3.codigo === _tripCands[_a3].codigo || _c3.codigo === _tripCands[_b3].codigo) continue;\n                    var _soma3 = _ab3 + _c3._p;\n                    if (Math.abs(_soma3 - valor) <= EPS) {\n                        return { itens: [_tripCands[_a3], _tripCands[_b3], _c3], soma: +_soma3.toFixed(2), diff: 0 };\n                    }\n                }\n            }\n        }\n\n        // Fase 4: melhor match em [valor, valor+40]\n        candsFaixa.sort(function(a, b) { return Math.abs(a._p - valor) - Math.abs(b._p - valor); });\n        if (candsFaixa.length > 80) candsFaixa = candsFaixa.slice(0, 80);\n        var _melhor = null;\n        function _atualizar(grupo, soma) {\n            var diff = +(soma - valor).toFixed(2);\n            if (diff < -EPS || diff > 40 + _extra + EPS) return;\n            if (!_melhor || diff < _melhor.diff) {\n                _melhor = { itens: grupo.slice(), soma: +soma.toFixed(2), diff: diff };\n            }\n        }\n        for (var _s4 = 0; _s4 < candsFaixa.length; _s4++) {\n            _atualizar([candsFaixa[_s4]], candsFaixa[_s4]._p);\n            if (_melhor && _melhor.diff < EPS) return _melhor;\n        }\n        outer2f:\n        for (var _a4 = 0; _a4 < candsFaixa.length; _a4++) {\n            for (var _b4 = _a4 + 1; _b4 < candsFaixa.length; _b4++) {\n                var _s2f = candsFaixa[_a4]._p + candsFaixa[_b4]._p;\n                if (_s2f > alvoMax + EPS) continue;\n                _atualizar([candsFaixa[_a4], candsFaixa[_b4]], _s2f);\n                if (_melhor && _melhor.diff < EPS) break outer2f;\n            }\n        }\n        if (_melhor && _melhor.diff < EPS) return _melhor;\n        outer3f:\n        for (var _a5 = 0; _a5 < candsFaixa.length; _a5++) {\n            var _pa5 = candsFaixa[_a5]._p;\n            for (var _b5 = _a5 + 1; _b5 < candsFaixa.length; _b5++) {\n                var _ab5 = _pa5 + candsFaixa[_b5]._p;\n                if (_ab5 > alvoMax + EPS) continue;\n                for (var _c5 = _b5 + 1; _c5 < candsFaixa.length; _c5++) {\n                    var _s3f = _ab5 + candsFaixa[_c5]._p;\n                    if (_s3f > alvoMax + EPS) continue;\n                    _atualizar([candsFaixa[_a5], candsFaixa[_b5], candsFaixa[_c5]], _s3f);\n                    if (_melhor && _melhor.diff < EPS) break outer3f;\n                }\n            }\n        }\n        return _melhor;\n    }\n\n    // ── _autoEncontrarMelhorComRepeticao (lista personalizada / Combinar) ─────\n    // DP bounded-knapsack via binary splitting + fallback de força bruta.\n    // O mesmo item pode aparecer mais de uma vez, nunca ultrapassando\n    // _qtdMaximaDisponivel(item, usosAcumulados, estoqueParadaPorCod, pisoPadrao).\n    function _autoEncontrarMelhorComRepeticao(pool, valor, faixaExtra, usosAcumulados, estoqueParadaPorCod, pisoPadrao) {\n        usosAcumulados      = usosAcumulados      || {};\n        estoqueParadaPorCod = estoqueParadaPorCod || {};\n        if (!valor || valor <= 0 || !pool || !pool.length) return null;\n        var _extra  = (typeof faixaExtra === \"number\" && faixaExtra >= 0) ? faixaExtra : 0;\n        var EPS     = FLOAT_EPS;\n        var alvoMax = valor + 40 + _extra;\n\n        var cands = [];\n        for (var _ci = 0; _ci < pool.length; _ci++) {\n            var _cp = Number(pool[_ci].preco || 0);\n            if (_cp > 0 && _qtdMaximaDisponivel(pool[_ci], usosAcumulados, estoqueParadaPorCod, pisoPadrao) > 0) {\n                cands.push(pool[_ci]);\n            }\n        }\n        if (!cands.length) return null;\n        if (cands.length > 30) cands = cands.slice(0, 30);\n\n        // Teto do DP exato (bounded-knapsack). Acima disso o custo O(moedas×cents)\n        // fica caro demais para rodar síncrono no meio de _buscarProxima — nesses\n        // casos (valores altos) cai no fallback guloso logo abaixo, que sempre\n        // consegue formar uma soma (ainda que não ótima) somando vários itens.\n        var DP_MAX_CENTS = 120000; // R$1200 — antes 60000 (R$600), por isso valores\n                                    // altos nunca eram encontrados: o DP nem rodava\n                                    // e o força-bruta antigo (máx. 4 itens) raramente\n                                    // alcança somas grandes.\n        var alvoCents   = Math.round(valor * 100);\n        var maxCents    = Math.round(alvoMax * 100);\n\n        if (alvoCents > 0 && maxCents > 0 && maxCents <= DP_MAX_CENTS) {\n            var moedas = [];\n            for (var _pc = 0; _pc < cands.length; _pc++) {\n                var _precoC  = Math.round(Number(cands[_pc].preco) * 100);\n                if (_precoC <= 0 || _precoC > maxCents) continue;\n                var _limQtd  = _qtdMaximaDisponivel(cands[_pc], usosAcumulados, estoqueParadaPorCod, pisoPadrao);\n                if (_limQtd <= 0) continue;\n                var _restQtd = _limQtd;\n                var _bloco   = 1;\n                while (_restQtd > 0) {\n                    var _qtdBloco = Math.min(_bloco, _restQtd);\n                    moedas.push({ item: cands[_pc], qtd: _qtdBloco, custo: _precoC * _qtdBloco });\n                    _restQtd -= _qtdBloco;\n                    _bloco   *= 2;\n                }\n            }\n            if (moedas.length > 150) moedas = moedas.slice(0, 150);\n\n            if (moedas.length) {\n                var dp = new Array(maxCents + 1);\n                for (var _zi = 0; _zi <= maxCents; _zi++) dp[_zi] = null;\n                dp[0] = { count: 0, lastMoeda: -1, prevV: -1 };\n                for (var mIdx = 0; mIdx < moedas.length; mIdx++) {\n                    var moeda = moedas[mIdx];\n                    for (var v = maxCents; v >= moeda.custo; v--) {\n                        if (dp[v - moeda.custo]) {\n                            var cnt = dp[v - moeda.custo].count + moeda.qtd;\n                            if (!dp[v] || cnt < dp[v].count) {\n                                dp[v] = { count: cnt, lastMoeda: mIdx, prevV: v - moeda.custo };\n                            }\n                        }\n                    }\n                }\n                var melhorV = dp[alvoCents] ? alvoCents : -1;\n                if (melhorV < 0) {\n                    for (var v2 = alvoCents + 1; v2 <= maxCents; v2++) {\n                        if (dp[v2]) { melhorV = v2; break; }\n                    }\n                }\n                if (melhorV >= 0) {\n                    var itensResult = [];\n                    var cur = melhorV;\n                    var _guard = 0;\n                    while (cur > 0 && dp[cur] && _guard < 5000) {\n                        var _mu = moedas[dp[cur].lastMoeda];\n                        for (var _rep = 0; _rep < _mu.qtd; _rep++) itensResult.push(_mu.item);\n                        cur = dp[cur].prevV;\n                        _guard++;\n                    }\n                    if (itensResult.length) {\n                        var sf = melhorV / 100;\n                        return { itens: itensResult, soma: +sf.toFixed(2), diff: +(sf - valor).toFixed(2) };\n                    }\n                }\n            }\n        }\n\n        // ── Fallback guloso (valores acima do teto do DP, ex: DP_MAX_CENTS) ──────\n        // Para valores altos o força-bruta abaixo (até 4 itens) quase nunca alcança\n        // a soma-alvo — por isso \"valores altos nunca eram achados\". O guloso monta\n        // a combinação item a item (maior preço que ainda cabe primeiro), respeitando\n        // _qtdMaximaDisponivel a cada passo, até cair dentro de [valor, valor+faixa]\n        // ou esgotar candidatos. Não é sempre a soma ótima, mas encontra uma\n        // combinação válida onde o DP e o força-bruta de poucos itens falhavam.\n        if (maxCents > DP_MAX_CENTS) {\n            var _usosG = {};\n            for (var _ug in usosAcumulados) if (Object.prototype.hasOwnProperty.call(usosAcumulados, _ug)) _usosG[_ug] = usosAcumulados[_ug];\n            var _gulosos = cands.slice().sort(function(x, y) { return Number(y.preco) - Number(x.preco); });\n            var _somaG = 0;\n            var _itensG = [];\n            var _guardG = 0;\n            var _restanteCents = maxCents;\n            while (_restanteCents > 0 && _guardG < 2000) {\n                _guardG++;\n                var _achouAlgum = false;\n                for (var _gi = 0; _gi < _gulosos.length; _gi++) {\n                    var _git = _gulosos[_gi];\n                    var _gpc = Math.round(Number(_git.preco) * 100);\n                    if (_gpc <= 0 || _gpc > _restanteCents) continue;\n                    if (_qtdMaximaDisponivel(_git, _usosG, estoqueParadaPorCod, pisoPadrao) <= 0) continue;\n                    _itensG.push(_git);\n                    _usosG[_git.codigo] = (_usosG[_git.codigo] || 0) + 1;\n                    _somaG += _gpc;\n                    _restanteCents = maxCents - _somaG;\n                    _achouAlgum = true;\n                    if (_somaG >= alvoCents) break;\n                    break; // reavalia do maior candidato novamente (limites de qtd mudam)\n                }\n                if (!_achouAlgum) break;\n                if (_somaG >= alvoCents) break;\n            }\n            if (_itensG.length && _somaG >= alvoCents - EPS * 100 && _somaG <= maxCents + EPS * 100) {\n                var sfG = _somaG / 100;\n                return { itens: _itensG, soma: +sfG.toFixed(2), diff: +(sfG - valor).toFixed(2) };\n            }\n            // Não fechou dentro da faixa com o guloso — cai para o força-bruta\n            // abaixo, que ainda pode achar uma combinação pequena e exata.\n        }\n\n        // Fallback força bruta (até 4 itens, com repetição)\n        var sorted = cands.slice().sort(function(x, y) { return Number(x.preco) - Number(y.preco); });\n        var n = sorted.length;\n        var precos = sorted.map(function(i) { return Number(i.preco); });\n        var _melhorR = null;\n        function _atualizarR(grupo, soma) {\n            var diff = +(soma - valor).toFixed(2);\n            if (diff < -EPS || diff > 40 + _extra + EPS) return;\n            if (!_grupoRespeitaLimites(grupo, usosAcumulados, estoqueParadaPorCod, pisoPadrao)) return;\n            if (!_melhorR || diff < _melhorR.diff) {\n                _melhorR = { itens: grupo.slice(), soma: +soma.toFixed(2), diff: diff };\n            }\n        }\n        for (var s1 = 0; s1 < n; s1++) {\n            if (precos[s1] > alvoMax + EPS) break;\n            _atualizarR([sorted[s1]], precos[s1]);\n            if (_melhorR && _melhorR.diff < EPS) return _melhorR;\n        }\n        for (var a2 = 0; a2 < n; a2++) {\n            if (precos[a2] > alvoMax + EPS) break;\n            for (var b2 = a2; b2 < n; b2++) {\n                var s2 = precos[a2] + precos[b2];\n                if (s2 > alvoMax + EPS) break;\n                _atualizarR([sorted[a2], sorted[b2]], s2);\n                if (_melhorR && _melhorR.diff < EPS) return _melhorR;\n            }\n        }\n        for (var a3 = 0; a3 < n; a3++) {\n            if (precos[a3] > alvoMax + EPS) break;\n            for (var b3 = a3; b3 < n; b3++) {\n                var ab3 = precos[a3] + precos[b3];\n                if (ab3 > alvoMax + EPS) break;\n                for (var c3 = b3; c3 < n; c3++) {\n                    var s3 = ab3 + precos[c3];\n                    if (s3 > alvoMax + EPS) break;\n                    _atualizarR([sorted[a3], sorted[b3], sorted[c3]], s3);\n                    if (_melhorR && _melhorR.diff < EPS) return _melhorR;\n                }\n            }\n        }\n        for (var a4 = 0; a4 < n; a4++) {\n            if (precos[a4] > alvoMax + EPS) break;\n            for (var b4 = a4; b4 < n; b4++) {\n                var ab4 = precos[a4] + precos[b4];\n                if (ab4 > alvoMax + EPS) break;\n                for (var c4 = b4; c4 < n; c4++) {\n                    var abc4 = ab4 + precos[c4];\n                    if (abc4 > alvoMax + EPS) break;\n                    for (var d4 = c4; d4 < n; d4++) {\n                        var s4 = abc4 + precos[d4];\n                        if (s4 > alvoMax + EPS) break;\n                        _atualizarR([sorted[a4], sorted[b4], sorted[c4], sorted[d4]], s4);\n                        if (_melhorR && _melhorR.diff < EPS) return _melhorR;\n                    }\n                }\n            }\n        }\n        return _melhorR;\n    }\n\n    // ── _ehProibidoCliente ────────────────────────────────────────────────────\n    // Verifica se a descrição de um item contém termo da lista de proibidos.\n    // Aceita as listas explicitamente (preferido nos testes); como fallback\n    // em contexto browser lê window._S se as listas não forem fornecidas.\n    function _ehProibidoCliente(descricao, proibidosEmbutidos, proibidosExtra) {\n        if (!descricao) return false;\n        var upper = String(descricao).toUpperCase();\n        /* global window, _S */\n        var lista  = proibidosEmbutidos != null ? proibidosEmbutidos\n                   : (typeof _S !== \"undefined\" && _S.proibidosEmbutidos ? _S.proibidosEmbutidos : []);\n        var extras = proibidosExtra != null ? proibidosExtra\n                   : (typeof _S !== \"undefined\" && _S.proibidosExtra    ? _S.proibidosExtra    : []);\n        for (var i = 0; i < lista.length; i++) {\n            if (lista[i] && upper.indexOf(String(lista[i]).toUpperCase()) !== -1) return true;\n        }\n        for (var j = 0; j < extras.length; j++) {\n            if (extras[j] && upper.indexOf(String(extras[j]).toUpperCase()) !== -1) return true;\n        }\n        return false;\n    }\n\n    // ── _validarResultadoPadrao ───────────────────────────────────────────────\n    // Camada defensiva: rejeita resultado que viola código duplicado, estoque\n    // mínimo ou itens proibidos. Aceita listas de proibidos explicitamente\n    // (para testes determinísticos) com fallback para globais no browser.\n    function _validarResultadoPadrao(resultado, estoqueMinimo, usosAcumulados, pisoPadrao, proibidosEmbutidos, proibidosExtra) {\n        if (!resultado || !resultado.itens || !resultado.itens.length) return null;\n        var permiteRepeticao = !!usosAcumulados;\n        var vistos = Object.create(null);\n        for (var i = 0; i < resultado.itens.length; i++) {\n            var it = resultado.itens[i];\n            if (vistos[it.codigo] && !permiteRepeticao) return null;\n            vistos[it.codigo] = true;\n            if (Number(it.estoque || 0) < Number(estoqueMinimo || 0)) return null;\n            if (_ehProibidoCliente(it.descricao, proibidosEmbutidos, proibidosExtra)) return null;\n        }\n        if (permiteRepeticao && !_grupoRespeitaLimites(resultado.itens, usosAcumulados, null, pisoPadrao)) {\n            return null;\n        }\n        return resultado;\n    }\n\n    // ── _validarResultadoLista ────────────────────────────────────────────────\n    // Equivalente de _validarResultadoPadrao para a lista personalizada.\n    // Não verifica proibidos/estoqueMinimo (by design — lista personalizada\n    // é escolha manual do usuário). Só verifica piso de estoque/zero absoluto.\n    function _validarResultadoLista(resultado, usosAcumulados, estoqueParadaPorCod) {\n        if (!resultado || !resultado.itens || !resultado.itens.length) return null;\n        if (!_grupoRespeitaLimites(resultado.itens, usosAcumulados, estoqueParadaPorCod)) {\n            return null;\n        }\n        return resultado;\n    }\n\n    // ── _formatarCodigosCompactado ────────────────────────────────────────────\n    // Agrupa itens repetidos: [\"A\",\"A\",\"B\"] → \"2*A B\"\n    function _formatarCodigosCompactado(itens) {\n        var contagem = {};\n        var ordem    = [];\n        itens.forEach(function(it) {\n            if (!contagem[it.codigo]) { contagem[it.codigo] = 0; ordem.push(it.codigo); }\n            contagem[it.codigo]++;\n        });\n        return ordem.map(function(cod) {\n            return contagem[cod] > 1 ? (contagem[cod] + \"*\" + cod) : cod;\n        }).join(\" \");\n    }\n\n    // ── _diffTermosFaltantes ──────────────────────────────────────────────────\n    // Subtração O(termos) usando um Set já calculado — evita re-varrer _itens.\n    function _diffTermosFaltantes(termos, encontradosSet) {\n        if (!encontradosSet) return termos;\n        return termos.filter(function(t) { return !encontradosSet.has(t); });\n    }\n\n    // ── _itemBateAlgumTermo ───────────────────────────────────────────────────\n    // Verdadeiro se o item bate com qualquer termo (union search).\n    function _itemBateAlgumTermo(it, termos) {\n        for (var i = 0; i < termos.length; i++) {\n            var t = termos[i];\n            if (it._descUp.indexOf(t) !== -1 || it._codUp.indexOf(t) !== -1 || it._barUp.indexOf(t) !== -1) {\n                return true;\n            }\n        }\n        return false;\n    }\n\n    // ── _termosSemMatch ───────────────────────────────────────────────────────\n    // Quais termos não têm nenhum item correspondente em itensArr.\n    // Aceita itensArr explícito (testes) ou faz fallback para o global _itens.\n    function _termosSemMatch(termos, itensArr) {\n        /* global _itens */\n        var catalogo = itensArr != null ? itensArr\n                     : (typeof _itens !== \"undefined\" ? _itens : []);\n        return termos.filter(function(termo) {\n            for (var i = 0; i < catalogo.length; i++) {\n                var it = catalogo[i];\n                if (it._descUp.indexOf(termo) !== -1 || it._codUp.indexOf(termo) !== -1 || it._barUp.indexOf(termo) !== -1) {\n                    return false;\n                }\n            }\n            return true;\n        });\n    }\n\n    // ── encontrarGruposAsync ──────────────────────────────────────────────────\n    // Combinações de 2-3 itens DISTINTOS que somam ao valor-alvo (modo Agrupar).\n    // Algoritmo restaurado da versão anterior comprovadamente estável (ver\n    // changelog v1.3.0): pares e triplas com índices estritamente crescentes\n    // (a<b / a<b<c — nunca repete o mesmo conjunto de itens em ordem\n    // diferente), rodando em UM ÚNICO setTimeout (sem chunking multi-fase).\n    // gen: objeto { valor: number } — incrementar cancela resultado tardio.\n    // onStatus: callback opcional (msg) para atualizar UI sem referência a DOM.\n    // cfg (opcional, 6º parâmetro): { estoqueMinimo, proibidosEmbutidos, proibidosExtra, maxResultados }\n    //   - estoqueMinimo: piso de estoque que cada item candidato deve respeitar (default 0)\n    //   - proibidosEmbutidos/proibidosExtra: listas repassadas para _ehProibidoCliente\n    //   - maxResultados: quantos grupos retornar no máximo (default 20)\n    function encontrarGruposAsync(itens, valor, onDone, gen, onStatus, cfg) {\n        if (!itens || !itens.length || !valor || valor <= 0) { if (onDone) onDone([]); return; }\n        cfg = cfg || {};\n        var estoqueMinimo      = typeof cfg.estoqueMinimo   === \"number\" ? cfg.estoqueMinimo   : 0;\n        var proibidosEmbutidos = cfg.proibidosEmbutidos != null ? cfg.proibidosEmbutidos : null;\n        var proibidosExtra     = cfg.proibidosExtra     != null ? cfg.proibidosExtra     : null;\n        var maxResultados      = typeof cfg.maxResultados === \"number\" ? cfg.maxResultados : 20;\n        var minhaGen = gen ? gen.valor++ : null; // guarda geração atual antes de incrementar\n\n        var alvoMin = valor;\n        var alvoMax = valor + FAIXA_COMBINAR;\n        var EPS     = FLOAT_EPS;\n\n        setTimeout(function() {\n            // Descarta resultado obsoleto: uma busca mais nova já foi disparada\n            // enquanto esta esperava o setTimeout (gen.valor mudou nesse meio-tempo).\n            if (gen && minhaGen !== null && gen.valor - 1 !== minhaGen) { return; }\n            if (onStatus) onStatus(\"Calculando combinações...\");\n\n            // Candidatos: preço válido dentro da faixa, não usado, estoque mínimo\n            // respeitado e não proibido — tudo filtrado ANTES de montar pares/triplas.\n            var cands = itens.filter(function(it) {\n                var p = Number(it.preco || 0);\n                if (!(p > PRECO_SENTINEL_ZERADO && p <= alvoMax + EPS && !it.usado)) return false;\n                if (Number(it.estoque || 0) < estoqueMinimo) return false;\n                if (_ehProibidoCliente(it.descricao, proibidosEmbutidos, proibidosExtra)) return false;\n                return true;\n            });\n            // Limita candidatos para não explodir O(n³) nas triplas\n            if (cands.length > 250) cands = cands.slice(0, 250);\n\n            // Pré-extrai preços numéricos uma única vez (evita Number() repetido nos loops internos)\n            var precos = new Array(cands.length);\n            for (var _pi = 0; _pi < cands.length; _pi++) precos[_pi] = Number(cands[_pi].preco);\n\n            var grupos  = [];\n            var LIMITE  = Math.max(maxResultados, 30); // teto de coleta antes de ordenar/cortar\n\n            // ── Pares — índices estritamente crescentes (a<b): cada conjunto\n            //    {A,B} é gerado UMA única vez, nunca como (A,B) e depois (B,A). ──\n            for (var a = 0; a < cands.length && grupos.length < LIMITE; a++) {\n                var pa = precos[a];\n                for (var b = a + 1; b < cands.length && grupos.length < LIMITE; b++) {\n                    var soma2 = pa + precos[b];\n                    if (soma2 >= alvoMin - EPS && soma2 <= alvoMax + EPS) {\n                        grupos.push({ itens: [cands[a], cands[b]], soma: +soma2.toFixed(2), diff: +(soma2 - valor).toFixed(2) });\n                    }\n                }\n            }\n\n            // ── Triplas — apenas se ainda precisamos de mais grupos; índices\n            //    estritamente crescentes (a<b<c) pela mesma razão dos pares. ──\n            if (grupos.length < LIMITE) {\n                for (var a2 = 0; a2 < cands.length && grupos.length < LIMITE; a2++) {\n                    var pa2 = precos[a2];\n                    if (pa2 >= alvoMax + EPS) continue;\n                    for (var b2 = a2 + 1; b2 < cands.length && grupos.length < LIMITE; b2++) {\n                        var ab2 = pa2 + precos[b2];\n                        if (ab2 >= alvoMax + EPS) continue;\n                        for (var c2 = b2 + 1; c2 < cands.length && grupos.length < LIMITE; c2++) {\n                            var soma3 = ab2 + precos[c2];\n                            if (soma3 >= alvoMin - EPS && soma3 <= alvoMax + EPS) {\n                                grupos.push({ itens: [cands[a2], cands[b2], cands[c2]], soma: +soma3.toFixed(2), diff: +(soma3 - valor).toFixed(2) });\n                            }\n                        }\n                    }\n                }\n            }\n\n            // ── Deduplicação por assinatura ────────────────────────────────────\n            // Trava de segurança extra: mesmo com índices crescentes já evitando\n            // permutações do mesmo conjunto, garante 1 card por combinação\n            // distinta de itens (assinatura = códigos ordenados, não a ordem\n            // de inserção — {A,B} e {B,A} colapsam na mesma chave).\n            var vistos       = Object.create(null);\n            var gruposUnicos = [];\n            for (var gi = 0; gi < grupos.length; gi++) {\n                var cods = [];\n                for (var ci = 0; ci < grupos[gi].itens.length; ci++) cods.push(String(grupos[gi].itens[ci].codigo));\n                cods.sort();\n                var assinatura = cods.join(\"|\");\n                if (vistos[assinatura]) continue;\n                vistos[assinatura] = true;\n                gruposUnicos.push(grupos[gi]);\n            }\n\n            if (onStatus) onStatus(\"\");\n\n            // Ordena do mais próximo ao valor-alvo usando transformação de\n            // Schwartzian: pré-computa Math.abs uma única vez por elemento.\n            var resultado = gruposUnicos\n                .map(function(g) { return { g: g, d: Math.abs(g.soma - valor) }; })\n                .sort(function(x, y) { return x.d - y.d; })\n                .slice(0, maxResultados)\n                .map(function(x) { return x.g; });\n            if (onDone) onDone(resultado);\n        }, 0);\n    }\n\n    // ── encontrarCombinacoesComRepeticaoAsync ─────────────────────────────────\n    // Modo Combinar: mesmo item pode aparecer múltiplas vezes (qtd×item).\n    // gen: objeto { valor: number } — incrementar cancela resultado tardio.\n    // onStatus: callback opcional (msg) em vez de document.getElementById.\n    function encontrarCombinacoesComRepeticaoAsync(itens, valor, onDone, cfg) {\n        cfg = cfg || {};\n        var estoqueMinimo   = typeof cfg.estoqueMinimo   === \"number\" ? cfg.estoqueMinimo   : 0;\n        var maxResultados   = typeof cfg.maxResultados   === \"number\" ? cfg.maxResultados   : MAX_COMBINAR_RESULTADOS;\n        var faixaCombinar   = typeof cfg.faixaCombinar   === \"number\" ? cfg.faixaCombinar   : FAIXA_COMBINAR;\n        var precoSentinel   = typeof cfg.precoSentinel   === \"number\" ? cfg.precoSentinel   : PRECO_SENTINEL_ZERADO;\n        var onStatus        = typeof cfg.onStatus        === \"function\" ? cfg.onStatus      : null;\n        var gen             = cfg.gen || null;\n        var minhaGen        = gen ? gen.valor++ : null;\n\n        if (!itens || !itens.length || !valor || valor <= 0) { if (onDone) onDone([]); return; }\n        if (onStatus) onStatus(\"Calculando...\");\n\n        var pool = itens.filter(function(it) {\n            return Number(it.preco || 0) > precoSentinel && Number(it.estoque || 0) > 0 && !it.usado;\n        });\n\n        var usosSimulados = {};\n        var resultados    = [];\n\n        function _buscarProxima() {\n            if (gen && minhaGen !== null && gen.valor - 1 !== minhaGen) return;\n            if (resultados.length >= maxResultados) { _entregar(); return; }\n\n            var poolAtual = pool.filter(function(it) {\n                return (Number(it.estoque || 0) - (usosSimulados[it.codigo] || 0) - estoqueMinimo) > 0;\n            });\n            if (!poolAtual.length) { _entregar(); return; }\n\n            var resultado = _autoEncontrarMelhorComRepeticao(poolAtual, valor, faixaCombinar, usosSimulados, null, estoqueMinimo);\n            if (!resultado || !resultado.itens || !resultado.itens.length) { _entregar(); return; }\n\n            resultado.itens.forEach(function(it) {\n                usosSimulados[it.codigo] = (usosSimulados[it.codigo] || 0) + 1;\n            });\n            resultados.push(resultado);\n            setTimeout(_buscarProxima, 0);\n        }\n\n        function _entregar() {\n            if (gen && minhaGen !== null && gen.valor - 1 !== minhaGen) return;\n            if (onStatus) {\n                var n = resultados.length;\n                onStatus(n ? n + \" combinação\" + (n > 1 ? \"ões\" : \"\") + \" encontrada\" + (n > 1 ? \"s\" : \"\") : \"\");\n            }\n            if (onDone) onDone(resultados);\n        }\n\n        setTimeout(_buscarProxima, 0);\n    }\n\n    // ── API pública ───────────────────────────────────────────────────────────\n    return {\n        // Constantes\n        FLOAT_EPS              : FLOAT_EPS,\n        FAIXA_COMBINAR         : FAIXA_COMBINAR,\n        FAIXA_EXCEDENTE_LP     : FAIXA_EXCEDENTE_LP,\n        PRECO_SENTINEL_ZERADO  : PRECO_SENTINEL_ZERADO,\n        MAX_COMBINAR_RESULTADOS: MAX_COMBINAR_RESULTADOS,\n        // Funções puras de estoque\n        _qtdMaximaDisponivel               : _qtdMaximaDisponivel,\n        _grupoRespeitaLimites              : _grupoRespeitaLimites,\n        _autoEncontrarMelhor               : _autoEncontrarMelhor,\n        _autoEncontrarMelhorComRepeticao   : _autoEncontrarMelhorComRepeticao,\n        _ehProibidoCliente                 : _ehProibidoCliente,\n        _validarResultadoPadrao            : _validarResultadoPadrao,\n        _validarResultadoLista             : _validarResultadoLista,\n        _formatarCodigosCompactado         : _formatarCodigosCompactado,\n        _diffTermosFaltantes               : _diffTermosFaltantes,\n        _itemBateAlgumTermo                : _itemBateAlgumTermo,\n        _termosSemMatch                    : _termosSemMatch,\n        // Funções assíncronas de busca\n        encontrarGruposAsync                        : encontrarGruposAsync,\n        encontrarCombinacoesComRepeticaoAsync        : encontrarCombinacoesComRepeticaoAsync\n    };\n}));";
 let _itensAbaixoMin = 0;               // Itens abaixo do estoqueMinimo incluídos p/ completar a lista
 let _catalogoCompleto = [];            // TODOS os itens válidos do banco (sem o corte de maxItens) —
-                                        // populado a cada carregarItens(), usado pela busca estendida
-let _catalogoCursor   = 0;             // próximo índice de _catalogoCompleto a servir numa "sessão" de busca estendida
+                                        // populado a cada carregarItens(), usado pela busca estendida.
+                                        // achado #F da revisão 2026-08-06: NÃO existe mais um cursor
+                                        // global aqui (_catalogoCursor foi removido) — cada cliente
+                                        // informa seu próprio offset a cada chamada de
+                                        // /api/buscar-mais-itens, tornando a rota stateless e segura
+                                        // para múltiplos clientes concorrentes (ver handleBuscarMaisItens).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG MUTÁVEL EM RUNTIME (/api/config aplica sem reiniciar, exceto porta e nome)
@@ -357,13 +428,13 @@ let _catalogoCursor   = 0;             // próximo índice de _catalogoCompleto 
 let _cfgVivo = {
     fbHost:         FDB_HOST,
     fbPath:         FDB_PATH,
-    fbPort:         (() => { const p = parseInt(cfg.fbPort  || "3050", 10); return (p > 0 && p < 65535) ? p : 3050; })(),
-    fbUser:         (cfg.fbUser     && String(cfg.fbUser).trim())     ? String(cfg.fbUser).trim()     : "SYSDBA",
-    fbPassword:     (cfg.fbPassword && String(cfg.fbPassword).trim()) ? String(cfg.fbPassword).trim() : "masterkey",
+    fbPort:         (() => { const p = parseInt(cfg.fbPort  || String(DEFAULTS.fbPort), 10); return (p > 0 && p < 65535) ? p : DEFAULTS.fbPort; })(),
+    fbUser:         (cfg.fbUser     && String(cfg.fbUser).trim())     ? String(cfg.fbUser).trim()     : DEFAULTS.fbUser,
+    fbPassword:     (cfg.fbPassword && String(cfg.fbPassword).trim()) ? String(cfg.fbPassword).trim() : DEFAULTS.fbPassword,
     portaEstoque:   PORTA,
     appName:        APP_NAME,
-    estoqueMinimo:  (() => { const v = parseFloat(cfg.estoqueMinimo); return (Number.isFinite(v) && v >= 0) ? v : 5; })(),
-    maxItens:       (() => { const v = parseInt(cfg.maxItens || "0", 10); return (v >= 100 && v <= 5000) ? v : MAX_ITENS; })(),
+    estoqueMinimo:  (() => { const v = parseFloat(cfg.estoqueMinimo); return (Number.isFinite(v) && v >= 0) ? v : DEFAULTS.estoqueMinimo; })(),
+    maxItens:       (() => { const v = parseInt(cfg.maxItens || "0", 10); return (v >= 100 && v <= MAX_ITENS_TETO) ? v : DEFAULTS.maxItens; })(),
     proibidosExtra: Array.isArray(cfg.proibidos) ? cfg.proibidos.map(p => String(p).trim()) : []
 };
 
@@ -726,7 +797,7 @@ async function carregarItens() {
 
     logTs("Conectando ao banco: " + _cfgVivo.fbHost + ":" + _cfgVivo.fbPath);
 
-    return new Promise(resolve => {
+    const tentativaConexao = new Promise(resolve => {
         // Por que o try/catch aqui (e não só dentro do callback): se
         // Firebird.attach() lançar uma excecao SINCRONA (antes de invocar o
         // callback — ex: config malformada rejeitada pelo driver), o callback
@@ -854,8 +925,18 @@ async function carregarItens() {
                 // forma (só valores são). Os VALORES desta query (quando existem
                 // parâmetros de usuário) são corretamente parametrizados via
                 // "params" em tx.query() — ver função query() (Firebird, mais acima).
-                // Busca TODOS os itens do catálogo (estoque >= 0, inclusive zerado).
-                // 3 fases no JS garantem prioridade: est>=5 → est 1-4 → est=0.
+                // Busca apenas itens com estoque REALMENTE disponível (> 0).
+                // Antes esta query usava ">= 0" e o JS classificava o que ficasse
+                // abaixo do estoqueMinimo como "complemento" para preencher a
+                // lista até maxItens — o efeito colateral era que itens ZERADOS
+                // entravam na lista quando sobrava espaço, violando a regra de
+                // nunca sugerir item sem estoque. Itens negativos já eram
+                // excluídos aqui e continuam sendo.
+                // Observação importante: isto NÃO afeta a detecção de zerado/
+                // negativado da lista personalizada — ela usa uma consulta
+                // dedicada (rLp, logo abaixo), propositalmente SEM filtro de
+                // estoque, exatamente para conseguir distinguir "chegou a zero"
+                // de "negativado" de "não existe mais no banco".
                 const sql = [
                     "SELECT FIRST " + SQL_LIMIT_BRUTO,
                     "  TRIM(CAST(p." + colCod  + " AS VARCHAR(30)))  AS CODIGO,",
@@ -865,7 +946,7 @@ async function carregarItens() {
                     "  "  + selPrc  + " AS PRECO,",
                     "  "  + selUltV + " AS ULTIMAVENDA",
                     "FROM " + nomTabela + " p",
-                    "WHERE CAST(p." + colEst + " AS DOUBLE PRECISION) >= 0",
+                    "WHERE CAST(p." + colEst + " AS DOUBLE PRECISION) > 0",
                     whereAno,
                     whereAtivo,
                     "ORDER BY CAST(p." + colEst + " AS DOUBLE PRECISION) DESC"
@@ -988,7 +1069,10 @@ async function carregarItens() {
 
                 // Prioridade: est >= estoqueMinimo (itensAcima).
                 // Complementa com est < estoqueMinimo (itensAbaixo) quando necessário
-                // para completar a lista enviada ao cliente.
+                // para completar a lista enviada ao cliente. Note que itensAbaixo
+                // contém apenas 0 < est < estoqueMinimo: itens ZERADOS não chegam
+                // até aqui (barrados no SQL e na guarda de arredondamento acima),
+                // então "completar a lista" nunca mais recorre a item sem estoque.
                 //
                 // IMPORTANTE: o loop varre TODAS as linhas retornadas pela query (sem
                 // parar em maxItens) para construir o catálogo COMPLETO (_catalogoCompleto),
@@ -1008,7 +1092,18 @@ async function carregarItens() {
                     if (!desc) continue;
                     if (ehProibido(desc)) continue;
 
-                    if (!Number.isFinite(est) || est < 0) continue;
+                    // Guarda pelo valor JÁ ARREDONDADO, que é o que o cliente
+                    // exibe e usa nos cálculos. O filtro "> 0" do SQL sozinho
+                    // deixaria passar resíduo de ponto flutuante (ESTOQUE é
+                    // DOUBLE PRECISION): um saldo de 0,0004, por exemplo, é
+                    // "> 0" para o banco, mas vira 0 ao ser arredondado para 3
+                    // casas — e apareceria na tela como um item de estoque 0,
+                    // exatamente o sintoma que a regra quer impedir. Arredondar
+                    // ANTES de decidir elimina a divergência entre o que foi
+                    // filtrado e o que é mostrado.
+                    if (!Number.isFinite(est)) continue;
+                    const estArredondado = Math.round(est * 1000) / 1000;
+                    if (estArredondado <= 0) continue;
                     if (!cod) continue;
                     if (codigosVistos.has(cod)) continue;
                     codigosVistos.add(cod);
@@ -1018,7 +1113,7 @@ async function carregarItens() {
                         codigo:      cod,
                         descricao:   desc,
                         codbarras:   String(row.CODBARRAS || "").trim(),
-                        estoque:     Math.round(est    * 1000) / 1000,
+                        estoque:     estArredondado,
                         preco:       Math.round(preco  * 100)  / 100,
                         ultimaVenda: row.ULTIMAVENDA ? toISO(row.ULTIMAVENDA) : null
                     };
@@ -1037,7 +1132,6 @@ async function carregarItens() {
                 const _nAcima  = Math.min(itensAcima.length, _cfgVivo.maxItens);
                 _catalogoCompleto = itensAcima.concat(itensAbaixo);
                 const itens        = _catalogoCompleto.slice(0, _cfgVivo.maxItens);
-                _catalogoCursor    = itens.length; // busca estendida continua a partir daqui
                 const _nAbaixo = itens.length - _nAcima;
                 _itensAbaixoMin = _nAbaixo;
                 const _nF1     = itens.length;
@@ -1058,7 +1152,7 @@ async function carregarItens() {
                     (_nAbaixo > 0 ? ", abaixo do m\u00ednimo: " + _nAbaixo : "") +
                     "). Usados na fila: " + _usadosCount + ". " +
                     "Cat\u00e1logo completo: " + _catalogoCompleto.length + " itens (" +
-                    Math.max(0, _catalogoCompleto.length - _catalogoCursor) + " dispon\u00edveis para extens\u00e3o)."
+                    Math.max(0, _catalogoCompleto.length - _itensBrutos.length) + " dispon\u00edveis para extens\u00e3o)."
                 );
                 if (!colUltV) {
                     logTs("AVISO: ULTIMAVENDA não encontrada — itens NÃO foram filtrados por ano de venda.");
@@ -1084,6 +1178,34 @@ async function carregarItens() {
             resolve(false);
         }
     });
+
+    // ── Teto de segurança: Firebird.attach() nunca trava o servidor pra sempre ──
+    // achado #B da revisão 2026-08-06: o try/catch acima só protege contra uma
+    // exceção SÍNCRONA de attach() — se o host estiver inacessível de um jeito
+    // que nem erro nem callback disparam (blackhole de rede, firewall que
+    // descarta pacotes em silêncio), o driver pode nunca chamar o callback.
+    // Nesse cenário _loadLock ficava travado em "true" para sempre, e todo
+    // carregamento futuro (poll, botão "Atualizar", SSE) era silenciosamente
+    // ignorado sem nenhum log de erro — o único jeito de recuperar era
+    // reiniciar o processo manualmente. Promise.race garante uma resposta
+    // (sucesso ou timeout) em no máximo CONEXAO_TIMEOUT_MS. Se o attach()
+    // "atrasado" eventualmente responder depois do timeout já ter liberado o
+    // lock, ele ainda roda até o fim (best-effort: os dados chegam mais tarde
+    // em vez de se perderem) — só não é mais o resultado que esta chamada
+    // específica devolve a quem esperou por ela.
+    const timeoutConexao = new Promise(resolve => {
+        setTimeout(() => {
+            if (!_loadLock) return; // já resolveu pela via normal — nada a fazer aqui
+            _erroConexao = "Timeout ao conectar no Firebird (" +
+                Math.round(CONEXAO_TIMEOUT_MS / 1000) + "s) — host/porta inacessível ou muito lento.";
+            _carregando = _loadLock = false;
+            logErro("ERRO: " + _erroConexao);
+            setImmediate(function() { autoDetectarHost().catch(function() {}); });
+            resolve(false);
+        }, CONEXAO_TIMEOUT_MS);
+    });
+
+    return Promise.race([tentativaConexao, timeoutConexao]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1112,6 +1234,17 @@ function gerarHTML() {
         proibidosEmbutidos: PROIBIDOS_EMBUTIDOS,
         proibidosExtra:     _cfgVivo.proibidosExtra || []
     }).replace(/<\//g, "<\\/");
+
+    // achado #E da revisão 2026-08-06: mesma proteção de serverCfg (acima),
+    // agora também aplicada ao código do engine embutido. _ENGINE_SRC é
+    // inserido bruto dentro de uma tag <script> — hoje o conteúdo de
+    // estoque-engine.js não contém a sequência "</script", então funciona,
+    // mas é uma dependência silenciosa e frágil: bastaria alguém adicionar um
+    // comentário ou mensagem de erro contendo esse texto no futuro para
+    // quebrar a página inteira (a tag fecharia prematuramente) sem nenhum
+    // aviso em tempo de build. Escapar aqui custa nada e remove essa classe
+    // inteira de regressão silenciosa.
+    const engineSrcSeguro = _ENGINE_SRC.replace(/<\//g, "<\\/");
 
     _htmlCache = `<!DOCTYPE html>
 <html lang="pt-BR">
@@ -1239,11 +1372,35 @@ thead th{
 thead{position:relative;z-index:70;will-change:transform}
 /* colunas fixas — table-layout:fixed garante uniformidade */
 .th-n  {width:38px; text-align:center}
-.th-cod{width:76px}
+.th-cod{width:76px; text-align:center}
+/* Cabecalhos que copiam a coluna inteira ("Codigo" e "Cod. Barras").
+   Regras escritas UMA vez sobre a classe generica .th-copiar em vez de
+   duplicadas por coluna: as duas se comportam igual, e duplicar significaria
+   que qualquer ajuste futuro teria de ser lembrado nos dois lugares.
+   Segue a mesma linguagem visual de .th-sort (cursor de mao, realce no hover)
+   para o usuario reconhecer de imediato que a celula responde a clique.
+   O icone usa flex:0 0 auto pelo mesmo motivo do indicador de ordenacao: o th
+   e estreito e tem overflow:hidden, entao sem isso o icone seria a primeira
+   coisa cortada pelo ellipsis, e o affordance desapareceria justamente nas
+   telas menores, onde ele e mais necessario. */
+th.th-copiar{cursor:pointer;user-select:none;transition:color .15s,background .15s}
+th.th-copiar:hover{color:var(--acc);background:var(--sur2)}
+th.th-copiar:active{background:var(--brd)}
+/* O flex NAO pode impor um alinhamento proprio: justify-content substituiria o
+   text-align de cada coluna. "Codigo" e centralizado (pedido explicito), mas
+   "Cod. Barras" e alinhado a esquerda como sempre foi — o padrao aqui e
+   flex-start e so .th-cod recebe o centro, para nenhuma coluna mudar de
+   aparencia por efeito colateral de virar copiavel. */
+.th-copiar-conteudo{display:flex;align-items:center;justify-content:flex-start;gap:4px;min-width:0}
+.th-cod .th-copiar-conteudo{justify-content:center}
+.th-copiar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.th-copiar-ico{flex:0 0 auto;display:inline-flex;align-items:center;opacity:.5;line-height:0;
+            transition:opacity .15s}
+th.th-copiar:hover .th-copiar-ico{opacity:1}
 .th-desc{/* preenche o espaço restante automaticamente */}
 .th-bar{width:138px}
-.th-est{width:84px; text-align:right}
-.th-prc{width:94px; text-align:right}
+.th-est{width:84px; text-align:center}
+.th-prc{width:94px; text-align:center}
 .th-uv {width:90px; text-align:center}
 .th-ac {width:80px; text-align:center}
 tbody tr{border-bottom:1px solid var(--brd);transition:background .1s}
@@ -1254,11 +1411,11 @@ tbody tr:hover:not(.tr-uso){background:var(--hov)}
 .tr-pm:hover{background:rgba(76,175,80,.13)!important}
 td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .td-n  {text-align:center;color:var(--txt3);font-size:11px}
-.td-cod{font-family:Consolas,monospace;font-size:12px;color:var(--txt2)}
+.td-cod{font-family:Consolas,monospace;font-size:12px;color:var(--txt2);text-align:center}
 .td-desc{white-space:normal;line-height:1.4;word-break:break-word}
 .td-bar{font-family:Consolas,monospace;font-size:11px;color:var(--txt2)}
-.td-est{text-align:right;font-weight:700;color:var(--ylw)}
-.td-prc{text-align:right;font-weight:600;color:var(--acc)}
+.td-est{text-align:center;font-weight:700;color:var(--ylw)}
+.td-prc{text-align:center;font-weight:600;color:var(--acc)}
 .td-uv {text-align:center;font-size:11px;color:var(--txt2)}
 .td-ac {text-align:center}
 .tr-uso td{color:var(--uso-txt)}
@@ -1282,10 +1439,20 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 
 /* ─ TOAST ────────────────────────────────────────────────────────────────── */
 .toast{position:fixed;top:22px;left:22px;background:var(--sur2);border:1px solid var(--brd);
-       color:var(--txt);padding:9px 16px;border-radius:8px;font-size:13px;
+       color:var(--txt);padding:9px 10px 9px 16px;border-radius:8px;font-size:13px;
        box-shadow:var(--shadow);z-index:9999;opacity:0;transform:translateY(-8px);
-       transition:all .22s;pointer-events:none;max-width:320px}
-.toast.on{opacity:1;transform:translateY(0)}
+       transition:opacity .22s,transform .22s;pointer-events:none;max-width:320px;
+       display:flex;align-items:flex-start;gap:10px}
+/* pointer-events volta a "auto" SO quando o toast esta visivel: enquanto
+   invisivel ele nao pode capturar cliques destinados ao que esta embaixo
+   (o elemento continua no DOM, ocupando a area do canto superior esquerdo). */
+.toast.on{opacity:1;transform:translateY(0);pointer-events:auto}
+.toast-msg{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
+.toast-x{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;
+         width:20px;height:20px;margin-top:-1px;padding:0;border:0;border-radius:5px;
+         background:transparent;color:var(--txt3);cursor:pointer;line-height:0;
+         transition:background .15s,color .15s}
+.toast-x:hover{background:var(--brd);color:var(--txt)}
 
 /* ─ MODAL CONFIRM ────────────────────────────────────────────────────────── */
 /* z-index alto o suficiente para ficar SEMPRE acima de qualquer outro overlay
@@ -1457,20 +1624,74 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
   z-index:9000}
 .btn-top.on{opacity:1;transform:translate(-50%,0) scale(1);pointer-events:auto}
 .btn-top:hover{background:var(--acc2);color:#fff;border-color:var(--acc2)}
-.btn-top:active{transform:scale(.92)}
+/* O :active PRECISA repetir o translate(-50%,0). Escrever apenas
+   "transform:scale(.92)" substituia a transform inteira, descartando a
+   centralizacao horizontal — no mousedown o botao pulava ~19px para a direita
+   (metade da propria largura), o ponteiro deixava de estar sobre ele e o
+   mouseup caia fora, entao o evento de clique nunca era disparado e a pagina
+   nao subia. transform e uma propriedade unica: nao existe "alterar so a
+   escala". Seletor com .on para vencer .btn-top.on por especificidade
+   (0,3,0 contra 0,2,0), sem depender da ordem das regras no arquivo. */
+.btn-top.on:active{transform:translate(-50%,0) scale(.92)}
 
 /* ─ SORT NOS TH ─────────────────────────────────────────────────────────── */
 .th-sort{cursor:pointer;user-select:none;transition:color .15s,background .15s}
 .th-sort:hover{color:var(--acc);background:rgba(78,168,222,.07)}
 .th-sort-ativo{color:var(--acc)!important}
-.sort-ico{display:inline-block;font-size:9px;margin-left:3px;opacity:.75;vertical-align:middle}
-.sort-ico-inativo{display:inline-block;font-size:9px;margin-left:3px;opacity:.22;vertical-align:middle}
+/* ── Ícone de ordenação ───────────────────────────────────────────────────────
+   "Sempre visível" aqui exige DUAS coisas, não só opacidade:
+
+   (1) Opacidade utilizável mesmo inativo. Antes o estado inativo usava
+       opacity:.22, praticamente invisível no fundo escuro — o usuário não
+       tinha como saber que a coluna era clicável. Agora inativo fica em .5
+       (discreto, mas legível) e o ativo em 1.
+
+   (2) Nao ser cortado. O seletor thead th usa overflow:hidden com
+       text-overflow:ellipsis, e as colunas ordenáveis são estreitas (th-prc tem 94px com 22px de
+       padding de cada lado = 50px úteis). Só aumentar a opacidade não bastaria:
+       em "PREÇO" o rótulo sozinho já consome quase toda a largura e o ícone
+       era o primeiro a ser cortado pelo ellipsis. Por isso o conteúdo do th
+       vira flex: o ÍCONE é flex:0 0 auto (nunca encolhe, nunca some) e quem
+       recebe o ellipsis é o RÓTULO. O texto abrevia; o indicador permanece. */
+.th-sort-conteudo{display:flex;align-items:center;justify-content:center;gap:4px;min-width:0}
+.th-sort-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.sort-ico{flex:0 0 auto;display:inline-flex;align-items:center;opacity:1;line-height:0}
+.sort-ico-inativo{opacity:.5}
+.th-sort:hover .sort-ico-inativo{opacity:.85}
 
 /* ─ RESPONSIVO ───────────────────────────────────────────────────────────── */
 @media(max-width:720px){
   .th-bar,.td-bar,.th-uv,.td-uv{display:none}
   input[type=text]{width:160px}
   .hdr-sub{display:none}
+}
+
+/* ─ DESEMPENHO EM MÁQUINAS FRACAS ─────────────────────────────────────────
+   1) contain:content nas linhas isola o layout de cada <tr>: ao inserir um
+      novo bloco de linhas (render incremental), o navegador não precisa
+      recalcular o layout das linhas já existentes — o custo de anexar deixa
+      de crescer com o tamanho da tabela.
+   2) content-visibility:auto no rodapé de carregamento evita pintar o que
+      está fora da viewport.
+   3) .perf-baixa (aplicada ao <html> quando detectamos hardware modesto ou o
+      usuário pede menos movimento) desliga TODA transição/animação de uma vez.
+      Feito por classe no elemento raiz — um único ponto de corte, sem precisar
+      caçar cada regra de transition individualmente. */
+tbody tr{contain:content}
+.tw-sentinela{height:1px}
+.tw-mais{padding:14px;text-align:center;color:var(--txt3);font-size:12px;content-visibility:auto}
+
+html.perf-baixa *,
+html.perf-baixa *::before,
+html.perf-baixa *::after{
+  transition:none!important;animation:none!important;scroll-behavior:auto!important}
+/* O spinner é informação de estado, não enfeite: preservado mesmo no modo leve,
+   só que mais lento (menos repaints por segundo). */
+html.perf-baixa .spin-svg{animation:sp 1.6s linear infinite!important}
+
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{transition:none!important;animation:none!important;scroll-behavior:auto!important}
+  .spin-svg{animation:sp 1.6s linear infinite!important}
 }
 </style>
 </head>
@@ -1498,7 +1719,7 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 <div class="ctrl">
   <div class="cg">
     <label class="cl cl-busca" for="txtBusca" title="Buscar (descri&ccedil;&atilde;o, c&oacute;digo, EAN, &gt;N, &lt;N)"><span class="cl-busca-txt">Buscar (descri&ccedil;&atilde;o, c&oacute;digo, EAN, &gt;N, &lt;N)</span><button type="button" class="lnk-toggle" id="btnBuscaMulti" onclick="toggleBuscaMulti()" title="Mudar para busca personalizada (v&aacute;rios c&oacute;digos, produtos e/ou c&oacute;digos de barra de uma vez, um por linha)" aria-label="Busca personalizada"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="4.5" x2="13" y2="4.5"/><line x1="3" y1="8" x2="13" y2="8"/><line x1="3" y1="11.5" x2="9" y2="11.5"/></svg></button></label>
-    <input type="text" id="txtBusca" placeholder="Nome, c&oacute;d, EAN, &gt;200, &lt;50..." title="Buscar por descri&ccedil;&atilde;o, c&oacute;digo, EAN, &gt;N (estoque m&iacute;nimo) ou &lt;N (estoque m&aacute;ximo)" oninput="filtrarDebounced()">
+    <input type="text" id="txtBusca" placeholder="Nome, c&oacute;d, EAN, &gt;200, nexgard&gt;10..." title="Buscar por descri&ccedil;&atilde;o, c&oacute;digo ou EAN. Filtro de estoque: &gt;N (estoque m&iacute;nimo) ou &lt;N (estoque m&aacute;ximo), sozinhos ou combinados com o texto. Ex: nexgard&gt;10 mostra produtos com &quot;nexgard&quot; no nome e 10 ou mais em estoque; nexgard&lt;10 mostra os com 10 ou menos." oninput="filtrarDebounced()">
     <textarea id="txtBuscaMulti" class="busca-multi-ta" style="display:none" title="Um c&oacute;digo, produto ou c&oacute;digo de barras por linha (ou separados por v&iacute;rgula)" placeholder="Um c&oacute;digo, produto ou c&oacute;digo de barras por linha (ou separados por v&iacute;rgula). Mistura os tipos livremente. Ex:&#10;08395&#10;7891234567890&#10;ARROZ" oninput="filtrarDebounced()"></textarea>
   </div>
 
@@ -1633,8 +1854,8 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
             <input class="cfg-inp" id="cfgEstMin" type="number" placeholder="5" min="0" max="9999" step="1" style="font-family:inherit">
           </div>
           <div class="cfg-field">
-            <label class="cfg-lbl" for="cfgMaxItens">M&aacute;x. itens carregados do banco (100&ndash;5000, padr&atilde;o: 2000) &mdash; aplicado imediatamente</label>
-            <input class="cfg-inp" id="cfgMaxItens" type="number" placeholder="2000" min="100" max="5000" step="100" style="font-family:inherit">
+            <label class="cfg-lbl" for="cfgMaxItens">M&aacute;x. itens carregados do banco (100&ndash;20000, padr&atilde;o: 2000) &mdash; aplicado imediatamente</label>
+            <input class="cfg-inp" id="cfgMaxItens" type="number" placeholder="2000" min="100" max="20000" step="100" style="font-family:inherit">
           </div>
           <div class="cfg-field">
             <label class="cfg-lbl" for="cfgAppName">Nome da aplica&ccedil;&atilde;o</label>
@@ -1794,11 +2015,11 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 </button>
 
 <!-- TOAST -->
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <!-- ESTOQUE ENGINE — mesmo módulo importado pelos testes unitários -->
 <script>
-${_ENGINE_SRC}
+${engineSrcSeguro}
 </script>
 
 <script>
@@ -1825,16 +2046,63 @@ var _dadosFingerprint = '';        // Fingerprint para evitar re-render sem muda
 var _gruposTimer    = null;        // Async de encontrarGrupos
 var _nUsadosVis     = 0;           // Contagem de usados nos itens visíveis (evita filter() extra)
 var _ultimoTermosEncontrados = null; // Set de termos (busca personalizada) que bateram na última filtrar()
+
+// ── PERFIL DE DESEMPENHO DA MÁQUINA ───────────────────────────────────────────
+// Detectado UMA vez no carregamento. Serve para calibrar tamanho de lote de
+// render e debounce: um PC de loja com 2 núcleos e 4 GB não pode receber a
+// mesma carga que uma workstation. Toda propriedade usada aqui é opcional no
+// padrão web (Safari/Firefox não expõem deviceMemory) — por isso cada leitura
+// tem fallback e o resultado só "piora" o perfil quando há evidência concreta
+// de hardware modesto; na ausência de dados, assume perfil normal (nunca
+// degrada a experiência de quem tem máquina boa por falta de informação).
+var _perfil = (function() {
+    var nucleos = 0, memoria = 0;
+    try { nucleos = Number(navigator.hardwareConcurrency) || 0; } catch (_) {}
+    try { memoria = Number(navigator.deviceMemory)        || 0; } catch (_) {}
+    var reduzirMovimento = false;
+    try {
+        reduzirMovimento = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    } catch (_) {}
+    // "Fraca" = evidência explícita de poucos núcleos OU pouca RAM.
+    var fraca = (nucleos > 0 && nucleos <= 4) || (memoria > 0 && memoria <= 4);
+    return {
+        nucleos:          nucleos,
+        memoria:          memoria,
+        fraca:            fraca,
+        reduzirMovimento: reduzirMovimento,
+        // Linhas por lote de render. Lote menor = cada inserção no DOM custa
+        // menos e a página responde antes; o resto entra conforme a rolagem.
+        loteRender:       fraca ? 120 : 300,
+        // Debounce da busca: em máquina fraca, esperar um pouco mais evita
+        // disparar filtro+render no meio da digitação.
+        debounceMs:       fraca ? 260 : 160
+    };
+})();
+
+// ── ESTADO DA RENDERIZAÇÃO INCREMENTAL ────────────────────────────────────────
+// _vis pode ter dezenas de milhares de itens, mas o DOM só recebe o que já foi
+// efetivamente rolado até. _renderCursor marca quantas linhas de _vis já estão
+// no DOM na renderização atual.
+var _renderCursor   = 0;
+var _renderObserver = null;  // IntersectionObserver da sentinela de "carregar mais"
 // Objetos de geração: o engine incrementa .valor ao iniciar, caller usa o mesmo
 // objeto para cancelar uma busca em andamento incrementando externamente.
 var _gruposGenObj   = { valor: 0 };
 var _combinarGenObj = { valor: 0 };
 
 // ── Sort por coluna: persistido no localStorage ───────────────────────────────
-// Valores válidos para _sortKey: 'estoque' | 'preco'
+// Valores válidos para _sortKey: 'estoque' | 'preco' | 'ultimaVenda'
 // Valores válidos para _sortDir: 'asc' | 'desc'
+// A lista de chaves aceitas é validada na leitura do localStorage: um valor
+// desconhecido (versão antiga, edição manual, storage corrompido) cai no
+// padrão 'estoque' em vez de deixar _sortKey inválido e a tabela sem ordem
+// definida.
+var _SORT_KEYS_VALIDAS = ['estoque', 'preco', 'ultimaVenda'];
 var _sortKey = (function() {
-    try { var v = localStorage.getItem('est-sort-key'); return (v === 'preco') ? 'preco' : 'estoque'; } catch(_) { return 'estoque'; }
+    try {
+        var v = localStorage.getItem('est-sort-key');
+        return (_SORT_KEYS_VALIDAS.indexOf(v) !== -1) ? v : 'estoque';
+    } catch(_) { return 'estoque'; }
 })();
 var _sortDir = (function() {
     try { var v = localStorage.getItem('est-sort-dir'); return (v === 'asc') ? 'asc' : 'desc'; } catch(_) { return 'desc'; }
@@ -1866,7 +2134,15 @@ var _elBusca = null, _elPrc = null, _elGrupar = null, _elAcima = null, _elBuscaM
 var _icons = {
     ok:   '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:middle;margin-right:4px"><path d="M2 8.5 6 13l8-9"/></svg>',
     warn: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:middle;margin-right:4px"><path d="M8 1.5 1.5 13.5h13z"/><line x1="8" y1="6" x2="8" y2="9.5"/><circle cx="8" cy="12" r=".7" fill="currentColor" stroke="none"/></svg>',
-    spin: '<svg class="spin-svg" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="5.5" stroke="rgba(78,168,222,.18)" stroke-width="2.5"/><path d="M8 2.5A5.5 5.5 0 0 1 13.5 8" stroke="var(--acc)" stroke-width="2.5" stroke-linecap="round"/></svg>'
+    spin: '<svg class="spin-svg" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="5.5" stroke="rgba(78,168,222,.18)" stroke-width="2.5"/><path d="M8 2.5A5.5 5.5 0 0 1 13.5 8" stroke="var(--acc)" stroke-width="2.5" stroke-linecap="round"/></svg>',
+    // Ícones de ordenação — mesmo padrão dos demais (viewBox 16x16, fill:none,
+    // stroke:currentColor, pontas arredondadas, aria-hidden). Herdam a cor do
+    // <th>, então acompanham automaticamente o realce de coluna ativa.
+    sortAsc:    '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9.75 8 5.75l4 4"/></svg>',
+    sortDesc:   '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6.25 8 10.25l4-4"/></svg>',
+    copiar:     '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5A1.5 1.5 0 0 0 9 2H4a2 2 0 0 0-2 2v5a1.5 1.5 0 0 0 1.5 1.5"/></svg>',
+    fechar:     '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>',
+    sortNeutro: '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.75 6.5 8 3.25l3.25 3.25"/><path d="M11.25 9.5 8 12.75 4.75 9.5"/></svg>'
 };
 
 // ── Modal confirm customizado (substitui confirm() nativo) ────────────────────
@@ -1944,6 +2220,76 @@ function _copiarTexto(txt, onOk) {
     } else { fallback(); }
 }
 
+// ── Copiar uma coluna inteira do resultado atual ──────────────────────────────
+// Usada pelo clique nos cabeçalhos "Código" e "Cód. Barras". Genérica de
+// propósito: as duas colunas se comportam igual, e duplicar a função faria
+// qualquer correção futura precisar ser lembrada nos dois lugares.
+//
+// PONTO CRÍTICO: lê de _vis (todos os itens que passaram no filtro), NÃO do
+// DOM. Desde a renderização incremental (v5.23.0) o <tbody> contém apenas o
+// lote já rolado — varrer as linhas da tabela copiaria só os primeiros 120–300
+// valores e o usuário não teria como perceber que faltou o resto, já que o
+// número copiado pareceria plausível. _vis é a lista completa do filtro atual,
+// independente de quanto foi rolado.
+//
+// A ordem segue exatamente a exibida na tela (mesma ordenação aplicada em
+// filtrar()), então o que é colado corresponde, linha a linha, ao que se vê.
+function _valoresColunaVisiveis(campo) {
+    var valores = [];
+    if (!_vis || !_vis.length) return valores;
+    for (var i = 0; i < _vis.length; i++) {
+        var v = _vis[i][campo];
+        v = String(v == null ? '' : v).trim();
+        // Itens sem valor são PULADOS, não viram linha em branco: nem todo
+        // produto tem código de barras cadastrado, e uma linha vazia no meio
+        // da colagem quebraria importação em planilha ou no ERP.
+        if (v) valores.push(v);
+    }
+    return valores;
+}
+
+function _copiarColunaVisivel(campo, rotuloSingular, rotuloPlural) {
+    if (!_vis || !_vis.length) {
+        toast('Nenhum item na busca atual para copiar.', 2500);
+        return;
+    }
+    var valores = _valoresColunaVisiveis(campo);
+    if (!valores.length) {
+        toast('Nenhum ' + rotuloSingular + ' preenchido nesta busca.', 2800);
+        return;
+    }
+
+    // Um valor por linha. Usa quebra simples (LF) em vez de CRLF: navegadores
+    // normalizam a quebra ao colar no Windows, e o retorno de carro extra
+    // sujaria colagens em campos de sistemas que o tratam como caractere
+    // literal. ATENCAO ao editar este bloco: por estar dentro de um template
+    // literal, escrever a sequencia de escape de nova linha aqui no COMENTARIO
+    // a transformaria numa quebra de verdade, partindo o comentario ao meio e
+    // jogando o resto do texto como codigo.
+    _copiarTexto(valores.join('\\n'), function() {
+        var plural = valores.length > 1;
+        var msg = valores.length + ' ' + (plural ? rotuloPlural : rotuloSingular) +
+                  ' copiado' + (plural ? 's' : '') + ' para a \u00e1rea de transfer\u00eancia.';
+        // Avisa quando parte dos itens ficou de fora por não ter valor
+        // cadastrado — sem isso o usuário poderia achar que copiou a lista
+        // toda e só descobrir a diferença depois de colar.
+        var faltando = _vis.length - valores.length;
+        if (faltando > 0) {
+            msg += ' (' + faltando + ' item' + (faltando > 1 ? 'ns' : '') +
+                   ' sem ' + rotuloSingular + ' ficou' + (faltando > 1 ? 'ram' : '') + ' de fora.)';
+        }
+        toast(msg, 3500);
+    });
+}
+
+function copiarCodigosVisiveis() {
+    _copiarColunaVisivel('codigo', 'c\u00f3digo', 'c\u00f3digos');
+}
+
+function copiarCodBarrasVisiveis() {
+    _copiarColunaVisivel('codbarras', 'c\u00f3digo de barras', 'c\u00f3digos de barras');
+}
+
 // ── Marcar item único como usado (sem precisar de elemento button) ────────────
 function marcarUsadoCodigo(cod) {
     if (!cod) return Promise.resolve(false);
@@ -1974,18 +2320,59 @@ function marcarGrupoUsado(grupoItens, onDone) {
 var _autoCodsParaMarcar = []; // códigos prontos para marcar após o usuário copiar o resultado
 
 // ── Toast simples ─────────────────────────────────────────────────────────────
+function fecharToast() {
+    var el = document.getElementById("toast");
+    if (!el) return;
+    clearTimeout(_toastT);
+    el.classList.remove("on");
+}
+
 function toast(msg, ms) {
     var el = document.getElementById("toast");
     if (!el) return;
-    el.textContent = msg;
+
+    // Conteudo montado por no, nao por innerHTML: a mensagem vem de varias
+    // origens (inclusive nomes de produto vindos do banco) e textContent
+    // neutraliza qualquer marcacao por construcao, sem depender de escape.
+    el.textContent = "";
+
+    var span = document.createElement("span");
+    span.className = "toast-msg";
+    span.textContent = msg;
+
+    var btn = document.createElement("button");
+    btn.className = "toast-x";
+    btn.type      = "button";
+    btn.title     = "Fechar";
+    btn.setAttribute("aria-label", "Fechar aviso");
+    btn.innerHTML = _icons.fechar;   // SVG estatico de _icons, sem dado dinamico
+    btn.onclick   = fecharToast;
+
+    el.appendChild(span);
+    el.appendChild(btn);
+
     el.classList.add("on");
     clearTimeout(_toastT);
-    _toastT = setTimeout(function() { el.classList.remove("on"); }, ms || 2500);
+    // O X nao substitui o fechamento automatico: continua sumindo sozinho no
+    // tempo de sempre, e o botao apenas antecipa isso para quem nao quer
+    // esperar. Passar ms = 0 desliga o auto-fechamento (fica ate o clique) -
+    // util para avisos que o usuario precisa ler com calma.
+    if (ms !== 0) {
+        _toastT = setTimeout(function() { el.classList.remove("on"); }, ms || 2500);
+    }
 }
 
 // ── Fetch helper ──────────────────────────────────────────────────────────────
+// X-Requested-With injetado em TODA requisição (inclusive GET, por
+// simplicidade — o servidor só exige o cabeçalho em POST /api/*, ver
+// dispatcher no server). Isso faz este mesmo header sair automaticamente em
+// toda chamada do app real, sem precisar lembrar de adicioná-lo em cada
+// callsite — condição para a proteção anti-CSRF do servidor funcionar sem
+// quebrar nenhuma chamada legítima (ver comentário no dispatcher, server-side).
 function apiFetch(url, opts) {
-    return fetch(url, opts || {})
+    opts = opts || {};
+    opts.headers = Object.assign({ "X-Requested-With": "XMLHttpRequest" }, opts.headers || {});
+    return fetch(url, opts)
         .then(function(r) {
             if (!r.ok) throw new Error("HTTP " + r.status);
             return r.json();
@@ -2079,8 +2466,14 @@ function carregarItens() {
 // resultados em _itens — sem duplicar código já presente e sem afetar o
 // _limiteItens normal da tabela principal (os itens extras só importam pro
 // processamento do Modo Automático em andamento).
+// achado #F da revisão 2026-08-06: o offset é informado explicitamente por
+// ESTE cliente (quantos itens ele já tem em _itens) — o servidor não guarda
+// mais nenhum cursor global compartilhado entre abas/PCs. Isso elimina a
+// condição de corrida em que duas pessoas usando "Modo Automático" ao mesmo
+// tempo avançavam o cursor uma da outra e recebiam lotes diferentes do que
+// esperavam, sem nenhum aviso.
 function _buscarMaisItensBanco(callback) {
-    apiFetch('/api/buscar-mais-itens').then(function(dados) {
+    apiFetch('/api/buscar-mais-itens?offset=' + encodeURIComponent(_itens.length)).then(function(dados) {
         if (!dados || !dados.ok) { callback(false, 0, false); return; }
         var novos = Array.isArray(dados.itens) ? dados.itens : [];
         if (novos.length) {
@@ -2340,20 +2733,45 @@ function filtrar() {
     atualizarPrcBox(temPrc ? prcN : 0);
     _atualizarBtnLimparFiltros(busca, temPrc, termosMulti.length > 0);
 
-    // ── Filtro de estoque: >N (estoque >= N) ou <N (estoque <= N) ──────────────
+    // ── Filtro de estoque combinado com texto ─────────────────────────────────
+    // Sintaxe aceita (busca simples):
+    //     >10              -> qualquer item com estoque >= 10
+    //     <10              -> qualquer item com estoque <= 10
+    //     nexgard>10       -> itens cuja descrição/código/barras contenha
+    //                         "nexgard" E tenham estoque >= 10
+    //     nexgard<10       -> o mesmo, com estoque <= 10
+    //     nexgard > 10     -> espaços ao redor do operador são tolerados
+    //
+    // Antes as duas expressões eram ANCORADAS sozinhas (/^>(\\d+)$/), ou seja,
+    // o filtro numérico só funcionava se fosse a ÚNICA coisa digitada:
+    // "nexgard>10" não casava com nada e caía na busca textual literal por
+    // "nexgard>10", que naturalmente não existe em nenhum produto — o
+    // resultado era sempre vazio, sem explicação visível. Agora um único
+    // regex captura, em qualquer combinação: texto antes (opcional, grupo 1),
+    // operador (grupo 2) e o número (grupo 3).
+    //
+    // O texto é capturado de forma NÃO-GULOSA e o número fica ancorado no fim,
+    // então uma descrição que por acaso contenha o próprio operador continua
+    // sendo tratada corretamente: a divisão acontece no último "<" ou ">"
+    // seguido apenas de número até o fim da string.
+    //
     // (só faz sentido na busca simples — em modo multi cada linha é um termo
     // literal de código/produto/barras, não uma expressão de comparação)
     var estoqueMin = null;
     var estoqueMax = null;
     var buscaTexto = busca;
-    var mEstMin = busca.match(/^>(\\d+(?:[.,]\\d*)?)$/);
-    var mEstMax = busca.match(/^<(\\d+(?:[.,]\\d*)?)$/);
-    if (mEstMin) {
-        estoqueMin = parseFloat(mEstMin[1].replace(',', '.'));
-        buscaTexto = '';
-    } else if (mEstMax) {
-        estoqueMax = parseFloat(mEstMax[1].replace(',', '.'));
-        buscaTexto = '';
+    var mEst = busca.match(/^(.*?)\\s*([<>])\\s*(\\d+(?:[.,]\\d*)?)\\s*$/);
+    if (mEst) {
+        var valorEstoque = parseFloat(mEst[3].replace(',', '.'));
+        // Number.isFinite protege contra entradas degeneradas que o regex
+        // aceita mas parseFloat não resolve (ex.: "5," -> NaN). Sem essa
+        // checagem, um NaN aqui faria TODA comparação de estoque retornar
+        // false e a tabela apareceria vazia sem motivo aparente.
+        if (Number.isFinite(valorEstoque)) {
+            if (mEst[2] === '>') estoqueMin = valorEstoque;
+            else                 estoqueMax = valorEstoque;
+            buscaTexto = mEst[1];   // texto antes do operador (pode ser vazio)
+        }
     }
     var buscaUpper = buscaTexto.toUpperCase();
 
@@ -2409,9 +2827,15 @@ function filtrar() {
     // — o preço vai pro painel Combinar). Ordenação padrão por coluna.
     _vis.sort(function(a, b) {
         if (a.usado !== b.usado) return (a.usado ? 1 : 0) - (b.usado ? 1 : 0);
-        var va = Number(_sortKey === 'preco' ? (a.preco || 0) : (a.estoque || 0));
-        var vb = Number(_sortKey === 'preco' ? (b.preco || 0) : (b.estoque || 0));
-        return _sortDir === 'desc' ? vb - va : va - vb;
+        var va = _chaveOrdenacao(a);
+        var vb = _chaveOrdenacao(b);
+        // Comparação por tipo: data vem como string ISO (comparável
+        // lexicograficamente), estoque/preço vêm como número. Subtrair strings
+        // daria NaN e deixaria a ordem indefinida — por isso o ramo explícito.
+        var cmp = (typeof va === 'string')
+            ? (va < vb ? -1 : (va > vb ? 1 : 0))
+            : (va - vb);
+        return _sortDir === 'desc' ? -cmp : cmp;
     });
 
     // Agenda renderTabela via requestAnimationFrame — nunca bloqueia o frame atual
@@ -2624,12 +3048,33 @@ function limparFiltros() {
 // Chamado pelo onclick dos TH de Estoque e Preço.
 // • Mesma coluna → inverte direção (asc ↔ desc)
 // • Outra coluna → muda coluna, direção padrão: estoque=desc, preço=asc
+// ── Chave de ordenação de um item ─────────────────────────────────────────────
+// Fonte única da verdade sobre COMO cada coluna ordena. Retorna número para
+// colunas numéricas e string ISO para data — quem compara decide o operador
+// (ver o sort em filtrar()).
+//
+// Itens nunca vendidos (ultimaVenda null/vazio) viram string vazia, que é
+// menor que qualquer data ISO. Efeito prático, e é intencional:
+//   - "mais recente primeiro" (desc) -> nunca vendidos aparecem por último;
+//   - "mais antigo primeiro"  (asc)  -> nunca vendidos aparecem primeiro.
+// Faz sentido nos dois casos: um item sem venda nenhuma é o extremo do
+// "parado há mais tempo", que é justamente o que se procura ao ordenar por
+// data crescente.
+function _chaveOrdenacao(item) {
+    if (_sortKey === 'preco')       return Number(item.preco || 0);
+    if (_sortKey === 'ultimaVenda') return String(item.ultimaVenda || ''); // ISO YYYY-MM-DD: ordem lexicográfica == cronológica
+    return Number(item.estoque || 0);
+}
+
 function toggleSort(key) {
     if (!key) return;
     if (_sortKey === key) {
         _sortDir = (_sortDir === 'desc') ? 'asc' : 'desc';
     } else {
         _sortKey = key;
+        // Direção inicial por coluna, escolhida pelo que é útil ver primeiro:
+        // preço -> ascendente (mais barato primeiro); estoque e última venda
+        // -> descendente (maior estoque / venda mais recente primeiro).
         _sortDir = (key === 'preco') ? 'asc' : 'desc';
     }
     try {
@@ -2647,15 +3092,20 @@ function toggleSort(key) {
 function _atualizarHdrSortLabel() {
     var el = document.getElementById('hdrSortLabel');
     if (!el) return;
-    var nome = (_sortKey === 'preco') ? 'Pre\u00e7o' : 'Estoque';
+    var nome = (_sortKey === 'preco')       ? 'Pre\u00e7o'
+             : (_sortKey === 'ultimaVenda') ? '\u00dalt. Venda'
+             : 'Estoque';
     var ico  = (_sortDir === 'desc') ? ' \u25bc' : ' \u25b2';
     el.textContent = nome + ico;
 }
 
 // ── Debounce para o campo de busca (evita filtrar() a cada tecla) ─────────────
+// Debounce adaptativo: máquina fraca espera um pouco mais entre teclas, para
+// não gastar CPU filtrando resultados intermediários que o usuário nem chegou a
+// ver. Em máquina normal continua nos 160 ms de antes.
 function filtrarDebounced() {
     clearTimeout(_filtrarTimer);
-    _filtrarTimer = setTimeout(filtrar, 160);
+    _filtrarTimer = setTimeout(filtrar, _perfil.debounceMs);
 }
 
 // Gera e injeta 5 opções distribuídas em [max/5 … max] no select "selLimite".
@@ -3035,6 +3485,15 @@ function renderTabela() {
     var stats = document.getElementById("stats");
     if (!tw) return;
 
+    // Desarma a sentinela do render ANTERIOR logo na entrada. renderTabela tem
+    // vários caminhos de saída antecipada (carregando / erro / lista vazia /
+    // sem resultados de filtro) e todos substituem o conteúdo de #tw — sem
+    // este desligamento, cada um deles deixaria para trás um IntersectionObserver
+    // apontando para um nó que não existe mais. Um por filtro digitado, para
+    // sempre. Desarmar aqui cobre todos os caminhos de uma vez.
+    _desarmarSentinela();
+    _renderCursor = 0;
+
     // Carregando
     if (_ldg && !_itens.length) {
         tw.innerHTML = '<div class="msg"><p>' + _icons.spin + 'Conectando ao banco de dados...</p></div>';
@@ -3102,76 +3561,203 @@ function renderTabela() {
 
     // Montar tabela via array de strings (mais performático para 500 linhas)
     // ── Helper para gerar TH de colunas sortáveis ─────────────────────────────
+    // Cabeçalho de coluna copiável ("Código" e "Cód. Barras"). Um só gerador
+    // para as duas: mesma marcação, mesmo comportamento.
+    //
+    // O title informa a QUANTIDADE exata que será copiada, para o usuário
+    // conferir antes de clicar se o filtro é o que ele espera — um "copiar
+    // tudo" sem número obrigaria a colar em algum lugar só para descobrir o
+    // que veio. A contagem é feita sobre os valores REALMENTE preenchidos, e
+    // não sobre _vis.length: nem todo produto tem código de barras cadastrado,
+    // então prometer "138 códigos de barras" e entregar 96 seria pior do que
+    // não informar número nenhum.
+    function _thCopiarHtml(campo, label, cls, rotuloSingular, rotuloPlural, fn) {
+        var qtd = _valoresColunaVisiveis(campo).length;
+        var titulo = qtd
+            ? 'Clique para copiar ' + (qtd > 1 ? 'os ' : 'o ') + qtd + ' ' +
+              (qtd > 1 ? rotuloPlural : rotuloSingular) + ' desta busca (um por linha)'
+            : 'Nenhum ' + rotuloSingular + ' preenchido nesta busca para copiar';
+        return '<th class="' + cls + ' th-copiar" onclick="' + fn + '()" title="' + esc(titulo) + '">' +
+               '<span class="th-copiar-conteudo">' +
+                   '<span class="th-copiar-label">' + label + '</span>' +
+                   '<span class="th-copiar-ico">' + _icons.copiar + '</span>' +
+               '</span></th>';
+    }
+
     function _thSortHtml(key, label, cls) {
         var ativo = (_sortKey === key);
+        // Icone SVG no lugar dos glifos Unicode usados antes: a renderizacao de
+        // caractere varia entre fontes e sistemas (tamanho, peso e alinhamento
+        // vertical inconsistentes; o glifo de seta dupla nem existe em toda
+        // fonte, virando retangulo vazio). O SVG herda currentColor, entao
+        // acompanha sozinho o realce da coluna ativa, sem regra extra de cor.
         var ico   = ativo
-            ? '<span class="sort-ico">' + (_sortDir === 'desc' ? '\u25bc' : '\u25b2') + '</span>'
-            : '<span class="sort-ico-inativo">\u21d5</span>';
+            ? (_sortDir === 'desc' ? _icons.sortDesc : _icons.sortAsc)
+            : _icons.sortNeutro;
+        var clsIco = ativo ? 'sort-ico' : 'sort-ico sort-ico-inativo';
         return '<th class="' + cls + ' th-sort' + (ativo ? ' th-sort-ativo' : '') +
                '" onclick="toggleSort(\\'' + key + '\\')" title="Ordenar por ' + label +
                ' (' + (ativo ? (_sortDir === 'desc' ? 'crescente' : 'decrescente') : 'clique para ordenar') + ')">' +
-               label + ico + '</th>';
+               '<span class="th-sort-conteudo">' +
+                   '<span class="th-sort-label">' + label + '</span>' +
+                   '<span class="' + clsIco + '">' + ico + '</span>' +
+               '</span></th>';
     }
 
-    var buf = [
-        "<table>",
-        "<thead><tr>",
-        '<th class="th-n">#</th>',
-        '<th class="th-cod">C\u00f3digo</th>',
-        '<th class="th-desc">Descri\u00e7\u00e3o</th>',
-        '<th class="th-bar">C\u00f3d. Barras</th>',
-        _thSortHtml('estoque', 'Estoque', 'th-est'),
-        _thSortHtml('preco',   'Pre\u00e7o',  'th-prc'),
-        '<th class="th-uv">\u00dalt. Venda</th>',
-        '<th class="th-ac">A\u00e7\u00e3o</th>',
-        "</tr></thead><tbody>"
-    ];
+    // Estrutura fixa: cabeçalho + tbody VAZIO + sentinela de carregamento.
+    // As linhas entram por _renderLote() em blocos, nunca todas de uma vez —
+    // ver comentário em _renderLote sobre o porquê.
+    tw.innerHTML =
+        "<table>" +
+        "<thead><tr>" +
+        '<th class="th-n">#</th>' +
+        _thCopiarHtml('codigo', 'C\u00f3digo', 'th-cod',
+                      'c\u00f3digo', 'c\u00f3digos', 'copiarCodigosVisiveis') +
+        '<th class="th-desc">Descri\u00e7\u00e3o</th>' +
+        _thCopiarHtml('codbarras', 'C\u00f3d. Barras', 'th-bar',
+                      'c\u00f3digo de barras', 'c\u00f3digos de barras', 'copiarCodBarrasVisiveis') +
+        _thSortHtml('estoque', 'Estoque', 'th-est') +
+        _thSortHtml('preco',   'Pre\u00e7o',  'th-prc') +
+        _thSortHtml('ultimaVenda', '\u00dalt. Venda', 'th-uv') +
+        '<th class="th-ac">A\u00e7\u00e3o</th>' +
+        '</tr></thead><tbody id="twBody"></tbody></table>' +
+        '<div class="tw-mais" id="twMais" style="display:none"></div>' +
+        '<div class="tw-sentinela" id="twSentinela"></div>';
 
-    for (var i = 0; i < _vis.length; i++) {
-        var it    = _vis[i];
-        var usado = !!it.usado;
-        var prc   = Number(it.preco || 0);
-
-        // Match de preço: item dentro da faixa informada
-        var pmatch = temPrc && prc > 0 && fx && prc >= fx.min && prc <= fx.max;
-
-        var trCls = (usado ? "tr-uso" : "") + (pmatch ? " tr-pm" : "");
-        buf.push("<tr" + (trCls.trim() ? ' class="' + trCls.trim() + '"' : "") + ">");
-        buf.push('<td class="td-n">' + (i + 1) + "</td>");
-        buf.push('<td class="td-cod">' + esc(it.codigo) + "</td>");
-
-        // Descrição + tags
-        var dHtml = esc(it.descricao);
-        if (usado)  dHtml += ' <span class="tag tag-fila">na fila</span>';
-        if (pmatch && !usado) dHtml += ' <span class="tag tag-pm">' + _icons.ok + 'faixa</span>';
-        buf.push('<td class="td-desc">' + dHtml + "</td>");
-
-        buf.push('<td class="td-bar">' + (it.codbarras ? esc(it.codbarras) : '<span style="color:var(--txt3)">-</span>') + "</td>");
-        buf.push('<td class="td-est">' + fmtEst(it.estoque) + "</td>");
-        buf.push('<td class="td-prc">' + fmtBRL(it.preco) + "</td>");
-        buf.push('<td class="td-uv">'  + fmtData(it.ultimaVenda) + "</td>");
-
-        // Botão de ação (usa data-cod para evitar problemas de escaping no onclick)
-        buf.push('<td class="td-ac">');
-        if (!usado) {
-            buf.push(
-                '<button class="btn btn-usar btn-sm" ' +
-                'data-cod="' + esc(it.codigo) + '" ' +
-                'onclick="marcarUsadoBtn(this)">' +
-                'Usar</button>'
-            );
-        } else {
-            buf.push('<span style="font-size:10px;color:var(--uso-txt)">na fila</span>');
-        }
-        buf.push("</td></tr>");
-    }
-
-    buf.push("</tbody></table>");
-    tw.innerHTML = buf.join("");
+    _renderCursor = 0;
+    _renderLote(temPrc, fx);
+    _armarSentinela(temPrc, fx);
 
     // Recalcula offsets e re-sincroniza thead após cada render
     ajustarStickyOffsets();
     if (window._syncThead) window._syncThead();
+}
+
+// ── Monta o HTML de UMA linha ─────────────────────────────────────────────────
+// Extraída do laço de renderTabela para que a mesma marcação seja usada tanto
+// no primeiro lote quanto nos lotes anexados por rolagem — uma única fonte da
+// verdade para o formato da linha (antes, qualquer mudança de layout teria de
+// ser replicada se houvesse mais de um ponto de montagem).
+function _linhaHtml(it, indice, temPrc, fx) {
+    var usado  = !!it.usado;
+    var prc    = Number(it.preco || 0);
+    var pmatch = temPrc && prc > 0 && fx && prc >= fx.min && prc <= fx.max;
+    var trCls  = (usado ? "tr-uso" : "") + (pmatch ? " tr-pm" : "");
+
+    var dHtml = esc(it.descricao);
+    if (usado)             dHtml += ' <span class="tag tag-fila">na fila</span>';
+    if (pmatch && !usado)  dHtml += ' <span class="tag tag-pm">' + _icons.ok + 'faixa</span>';
+
+    return "<tr" + (trCls.trim() ? ' class="' + trCls.trim() + '"' : "") + ">" +
+        '<td class="td-n">' + (indice + 1) + "</td>" +
+        '<td class="td-cod">' + esc(it.codigo) + "</td>" +
+        '<td class="td-desc">' + dHtml + "</td>" +
+        '<td class="td-bar">' + (it.codbarras ? esc(it.codbarras) : '<span style="color:var(--txt3)">-</span>') + "</td>" +
+        '<td class="td-est">' + fmtEst(it.estoque) + "</td>" +
+        '<td class="td-prc">' + fmtBRL(it.preco) + "</td>" +
+        '<td class="td-uv">'  + fmtData(it.ultimaVenda) + "</td>" +
+        '<td class="td-ac">' +
+            (!usado
+                ? '<button class="btn btn-usar btn-sm" data-cod="' + esc(it.codigo) + '" onclick="marcarUsadoBtn(this)">Usar</button>'
+                : '<span style="font-size:10px;color:var(--uso-txt)">na fila</span>') +
+        "</td></tr>";
+}
+
+// ── Anexa o próximo lote de linhas ao <tbody> ─────────────────────────────────
+// Por que em lotes, e não tudo de uma vez: cada linha custa ~435 bytes de HTML
+// e ~20 nós de DOM. Renderizar 5.000 itens de uma vez significa ~2 MB de HTML e
+// ~100.000 nós num único innerHTML — em PC de loja isso é um congelamento de
+// vários segundos, e acontecia a CADA filtro/ordenação/atualização, não só na
+// carga inicial. Anexando em lotes o custo por operação fica constante e o
+// usuário interage com a tabela imediatamente; o resto entra conforme rola.
+// insertAdjacentHTML('beforeend') preserva as linhas já existentes (não
+// re-parseia a tabela inteira, ao contrário de reatribuir innerHTML).
+function _renderLote(temPrc, fx) {
+    var tbody = document.getElementById('twBody');
+    if (!tbody) return;
+
+    var inicio = _renderCursor;
+    var fim    = Math.min(inicio + _perfil.loteRender, _vis.length);
+    if (fim <= inicio) { _atualizarRodapeRender(); return; }
+
+    var buf = [];
+    for (var i = inicio; i < fim; i++) buf.push(_linhaHtml(_vis[i], i, temPrc, fx));
+    tbody.insertAdjacentHTML('beforeend', buf.join(""));
+
+    _renderCursor = fim;
+    _atualizarRodapeRender();
+}
+
+// Rodapé discreto informando o quanto da lista já está na tela.
+function _atualizarRodapeRender() {
+    var el = document.getElementById('twMais');
+    if (!el) return;
+    if (_renderCursor >= _vis.length) {
+        el.style.display = 'none';
+        return;
+    }
+    el.style.display   = '';
+    el.textContent     = 'Mostrando ' + _renderCursor + ' de ' + _vis.length +
+                         ' \u2014 role para carregar mais';
+}
+
+// ── Sentinela de rolagem ──────────────────────────────────────────────────────
+// IntersectionObserver dispara o próximo lote quando o fim da tabela se aproxima
+// da viewport (margem de 600px = carrega ANTES do usuário chegar no fim, então
+// a rolagem parece contínua, sem "pulo" nem tela em branco).
+// Fallback: navegador sem IntersectionObserver recebe um listener de scroll com
+// throttle por rAF — nunca fica sem forma de ver o resto da lista.
+function _armarSentinela(temPrc, fx) {
+    var sentinela = document.getElementById('twSentinela');
+    if (!sentinela) return;
+
+    // Desliga o observer anterior: sem isso, cada render deixaria um observer
+    // órfão apontando para um nó removido — vazamento acumulativo a cada filtro.
+    _desarmarSentinela();
+
+    if (typeof IntersectionObserver === 'function') {
+        _renderObserver = new IntersectionObserver(function(entradas) {
+            for (var i = 0; i < entradas.length; i++) {
+                if (entradas[i].isIntersecting) {
+                    _renderLote(temPrc, fx);
+                    if (_renderCursor >= _vis.length) _desarmarSentinela();
+                    break;
+                }
+            }
+        }, { rootMargin: '600px 0px' });
+        _renderObserver.observe(sentinela);
+        return;
+    }
+
+    // ── Fallback sem IntersectionObserver ───────────────────────────────────
+    var pendente = false;
+    var onScroll = function() {
+        if (pendente) return;
+        pendente = true;
+        requestAnimationFrame(function() {
+            pendente = false;
+            var s = document.getElementById('twSentinela');
+            if (!s) { window.removeEventListener('scroll', onScroll); return; }
+            if (s.getBoundingClientRect().top - window.innerHeight < 600) {
+                _renderLote(temPrc, fx);
+                if (_renderCursor >= _vis.length) {
+                    window.removeEventListener('scroll', onScroll);
+                    _renderObserver = null;
+                }
+            }
+        });
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    // Guarda o desligamento num objeto com a mesma interface do observer, para
+    // que _desarmarSentinela() trate os dois casos sem precisar saber qual é.
+    _renderObserver = { disconnect: function() { window.removeEventListener('scroll', onScroll); } };
+}
+
+function _desarmarSentinela() {
+    if (_renderObserver && typeof _renderObserver.disconnect === 'function') {
+        try { _renderObserver.disconnect(); } catch (_) {}
+    }
+    _renderObserver = null;
 }
 
 // ── MODO AUTOMÁTICO ───────────────────────────────────────────────────────────
@@ -3464,13 +4050,29 @@ function toggleListaPersonalizada() {
     if (ativo && _lpDados.length === 0) {
         abrirListaPersonalizadaModal();
     }
-    // Ao ATIVAR a lista personalizada, verifica na hora se algum código já
-    // configurado esgotou (estoque zero) ou atingiu o estoque de parada
-    // individual — não espera o próximo ciclo de poll. Usa os dados de
-    // catálogo já carregados (_itens); se ainda não chegaram, a verificação
-    // do próximo carregarItens() cobre o caso.
-    if (ativo && _lpDados.length > 0 && _itens.length > 0) {
-        _verificarAlertasListaPersonalizada();
+    // Ao ATIVAR a lista personalizada, verifica se algum código já configurado
+    // esgotou (estoque zero) ou atingiu o estoque de parada individual — não
+    // espera o próximo ciclo de poll.
+    // FIX (2026-08-01): antes checava na hora com o que já estivesse em
+    // _lpEstoquesReais, sem forçar nada — se o usuário tivesse acabado de
+    // salvar a lista (ou qualquer outra mudança recente ainda não refletida
+    // no último poll), o checkbox reproduzia o mesmo falso "não existe mais
+    // no banco" que já foi corrigido em salvarListaPersonalizada() (v5.18/
+    // v5.19), só que por este caminho diferente. Agora usa a mesma
+    // sincronização forçada antes de checar.
+    if (ativo && _lpDados.length > 0) {
+        var _lblSincronizando = lbl.textContent;
+        lbl.textContent = 'Lista personalizada ativa (sincronizando...)';
+        // Desabilita "Iniciar" durante a sincronização — evita começar o Modo
+        // Automático com _itens/_lpEstoquesReais potencialmente em transição
+        // (o risco que estamos evitando aqui é justamente sobre estoque).
+        var _btnIniciarSync = document.getElementById('autoIniciarBtn');
+        if (_btnIniciarSync) _btnIniciarSync.disabled = true;
+        _sincronizarEstoqueTempoReal(function() {
+            lbl.textContent = _lblSincronizando;
+            if (_btnIniciarSync) _btnIniciarSync.disabled = false;
+            _verificarAlertasListaPersonalizada();
+        });
     }
     // "Reaproveitar código" só faz sentido no modo padrão — a lista
     // personalizada já tem reaproveitamento nativo (com estoque de parada
@@ -3544,8 +4146,11 @@ function salvarListaPersonalizada() {
     var btn = document.getElementById('lpSalvarBtn');
     if (!ta) return;
     var parsed = _parseListaPersonalizadaDetalhada(ta.value);
-    if (!parsed.length) {
-        if (st) { st.textContent = 'Adicione ao menos um c\u00f3digo antes de salvar.'; st.className = 'auto-status er'; }
+    // Só bloqueia quando o usuário digitou algo que não virou nenhum código
+    // válido (entrada malformada) — zerar a lista de propósito (apagar tudo
+    // do textarea e salvar) é uma ação legítima e precisa ser permitida.
+    if (!parsed.length && ta.value.trim()) {
+        if (st) { st.textContent = 'Nenhum c\u00f3digo v\u00e1lido reconhecido no texto digitado.'; st.className = 'auto-status er'; }
         return;
     }
 
@@ -3568,7 +4173,40 @@ function salvarListaPersonalizada() {
         _lpDados = parsed;
         _atualizarResumoLp();
         fecharListaPersonalizadaModal();
-        toast('\u2713 Lista personalizada salva: ' + parsed.length + ' c\u00f3digo' + (parsed.length === 1 ? '' : 's'), 2500);
+        toast(
+            parsed.length
+                ? '\u2713 Lista personalizada salva: ' + parsed.length + ' c\u00f3digo' + (parsed.length === 1 ? '' : 's')
+                : '\u2713 Lista personalizada esvaziada.',
+            2500
+        );
+
+        // FIX (2026-07-27): _lpEstoquesReais (estoque/descrição REAIS dos
+        // códigos da lista personalizada) só é recalculado dentro de
+        // carregarItens() no servidor — sem forçar isso aqui, um código
+        // RECÉM-salvo ficava fora dele até o próximo ciclo natural de
+        // poll/SSE, e a checagem de alerta (mais abaixo) achava que o
+        // código "não existe mais no banco" só por estar temporariamente
+        // desatualizado. Sincroniza de verdade antes de checar — mesma
+        // infraestrutura já usada pelo Modo Automático (ver iniciarModoAuto).
+        // Desabilita "Iniciar" durante a sincronização — mesmo motivo do
+        // toggleListaPersonalizada(): evita começar o Modo Automático com
+        // dados de estoque potencialmente em transição.
+        if (parsed.length) {
+            var _btnIniciarSalvar    = document.getElementById('autoIniciarBtn');
+            var _statusIniciarSalvar = document.getElementById('autoStatus');
+            if (_btnIniciarSalvar) _btnIniciarSalvar.disabled = true;
+            if (_statusIniciarSalvar) {
+                _statusIniciarSalvar.textContent = 'Sincronizando estoque com o banco ap\u00f3s salvar a lista...';
+                _statusIniciarSalvar.className   = 'auto-status';
+            }
+            _sincronizarEstoqueTempoReal(function() {
+                if (_btnIniciarSalvar) _btnIniciarSalvar.disabled = false;
+                if (_statusIniciarSalvar && _statusIniciarSalvar.textContent.indexOf('Sincronizando estoque com o banco ap\u00f3s salvar') === 0) {
+                    _statusIniciarSalvar.textContent = '';
+                }
+                _verificarAlertasListaPersonalizada();
+            });
+        }
     });
 }
 
@@ -3749,9 +4387,17 @@ function _aguardarCargaFrescaConcluir(onPronto, tentativa) {
 
 function _sincronizarEstoqueTempoReal(onPronto) {
     apiFetch('/api/atualizar', { method: 'POST' }).then(function(r) {
-        if (!r || !r.ok) { onPronto(); return; } // já em carregamento por outro motivo — segue com o que já tinha
+        // FIX (2026-08-01): "!r.ok" aqui geralmente significa "já tem um
+        // carregamento em andamento" (ex.: o próprio servidor disparou um
+        // refresh em background ao salvar a lista personalizada, ver
+        // handlePostListaPersonalizada) — NÃO significa que não há nada
+        // acontecendo. Antes, esse caso desistia na hora e seguia com
+        // _lpEstoquesReais/_itens desatualizados, current fresh. Agora
+        // espera esse carregamento (nosso ou de outra origem) terminar do
+        // mesmo jeito — só assim garante dados realmente frescos antes de
+        // liberar onPronto().
         _aguardarCargaFrescaConcluir(onPronto, 0);
-    }).catch(function() { onPronto(); });
+    }).catch(function() { onPronto(); }); // falha de rede de verdade — segue com o que já tinha
 }
 
 function iniciarModoAuto(faixaExtraOverride, tentativaExtensaoOverride) {
@@ -4439,7 +5085,33 @@ function _iniciarModoAutoAposSync(faixaExtraOverride, tentativaExtensaoOverride)
                         resWrap.style.display = 'none';
                         copyBtn.style.display = 'none';
                         _autoCodsParaMarcar   = [];
-                        iniciarModoAuto(_faixaAutoAtual, _proximaTentativa);
+                        // FIX (achado #G da revisão 2026-08-06): esta linha chamava
+                        // iniciarModoAuto(...) — a função PÚBLICA, que sempre começa
+                        // forçando uma sincronização completa com o banco
+                        // (_sincronizarEstoqueTempoReal → POST /api/atualizar →
+                        // carregarItens() completo no servidor). Duas consequências
+                        // destrutivas, nenhuma delas intencional:
+                        //   1) carregarItens() SUBSTITUI _itens inteiro pela primeira
+                        //      "página" (maxItens) fresca do servidor — descartando
+                        //      exatamente o lote que _buscarMaisItensBanco acabou de
+                        //      mesclar duas linhas acima. A extensão nunca "pegava".
+                        //   2) o servidor não guarda mais cursor global (ver achado
+                        //      #F), mas mesmo antes dessa mudança o efeito já era o
+                        //      mesmo: qualquer nova tentativa de "buscar mais no
+                        //      banco" pedia de novo o offset baseado em _itens.length,
+                        //      que tinha acabado de encolher de volta a maxItens —
+                        //      ou seja, a 2ª tentativa buscava o MESMO lote da 1ª,
+                        //      nunca avançava para o próximo, até esgotar as 5
+                        //      tentativas permitidas (MAX_TENTATIVAS_EXTENSAO) sem
+                        //      nunca alcançar itens além da segunda "página".
+                        // Chamando _iniciarModoAutoAposSync(...) diretamente (pulando
+                        // o resync), o merge feito por _buscarMaisItensBanco é
+                        // preservado e cada tentativa avança para um lote novo.
+                        // Resync completo aqui é desnecessário de qualquer forma: os
+                        // itens que já estavam em _itens acabaram de ser confirmados
+                        // frescos pelo próprio iniciarModoAuto() que iniciou este
+                        // processamento, poucos segundos atrás.
+                        _iniciarModoAutoAposSync(_faixaAutoAtual, _proximaTentativa);
                     });
                 },
                 function() {
@@ -4523,6 +5195,21 @@ function ajustarStickyOffsets() {
     if (hEl) r.setProperty('--hdr-h',   hEl.offsetHeight   + 'px');
     if (cEl) r.setProperty('--ctrl-h',  cEl.offsetHeight  + 'px');
     if (sEl) r.setProperty('--stats-h', sEl.offsetHeight + 'px');
+}
+// achado #H da revisão 2026-08-06: o listener de "resize" chamava
+// ajustarStickyOffsets() direto, sem throttle — "resize" pode disparar
+// dezenas de vezes por segundo durante um redimensionamento contínuo de
+// janela (ou rotação de tela em tablet), e cada disparo aqui faz 3 leituras
+// de offsetHeight (força reflow síncrono) + 3 escritas de custom property.
+// Mesmo throttle por requestAnimationFrame já usado em _syncThead (scroll),
+// aplicado aqui: no máximo 1 execução por frame, não 1 por evento.
+var _stickyOffsetsRaf = null;
+function _ajustarStickyOffsetsThrottled() {
+    if (_stickyOffsetsRaf) return;
+    _stickyOffsetsRaf = requestAnimationFrame(function() {
+        _stickyOffsetsRaf = null;
+        ajustarStickyOffsets();
+    });
 }
 // ── Modal de Configurações ────────────────────────────────────────────────────
 function abrirConfigs() {
@@ -4665,8 +5352,8 @@ function salvarConfigs() {
         if (btn) btn.disabled = false;
         return;
     }
-    if (isNaN(maxItensVal) || maxItensVal < 100 || maxItensVal > 5000) {
-        if (st) { st.textContent = 'M\u00e1x. itens inv\u00e1lido (100\u20135000).'; st.className = 'cfg-status er'; }
+    if (isNaN(maxItensVal) || maxItensVal < 100 || maxItensVal > 20000) {
+        if (st) { st.textContent = 'M\u00e1x. itens inv\u00e1lido (100\u201320000).'; st.className = 'cfg-status er'; }
         if (btn) btn.disabled = false;
         return;
     }
@@ -4726,6 +5413,15 @@ document.addEventListener('keydown', function(e) {
 });
 
 document.addEventListener("DOMContentLoaded", function() {
+    // Modo leve: desliga transições/animações via uma única classe no <html>
+    // (as regras estão no CSS, ver bloco "DESEMPENHO EM MÁQUINAS FRACAS").
+    // Aplicado quando o hardware é modesto OU quando o sistema operacional
+    // pede menos movimento — respeitar essa preferência é acessibilidade,
+    // não só desempenho.
+    if (_perfil.fraca || _perfil.reduzirMovimento) {
+        document.documentElement.classList.add('perf-baixa');
+    }
+
     // Cacheia referências DOM para evitar getElementById a cada keystroke
     _elBusca  = document.getElementById("txtBusca");
     _elPrc    = document.getElementById("numPrc");
@@ -4778,7 +5474,7 @@ document.addEventListener("DOMContentLoaded", function() {
         ajustarStickyOffsets();
         if (window._syncThead) window._syncThead();
     }, 80);
-    window.addEventListener("resize", ajustarStickyOffsets);
+    window.addEventListener("resize", _ajustarStickyOffsetsThrottled);
 });
 </script>
 </body>
@@ -4792,22 +5488,40 @@ setImmediate(function() { try { gerarHTML(); } catch (_) {} });
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPER: ler body da requisição HTTP com limite de tamanho
 // ─────────────────────────────────────────────────────────────────────────────
+// achado #C da revisão 2026-08-06: a versão anterior fazia `body += chunk`,
+// concatenando um Buffer numa string a cada evento "data". Isso força uma
+// decodificação UTF-8 PARCIAL a cada chunk — se um caractere multibyte
+// (qualquer acentuação, "é", "ç", etc.) for cortado exatamente na fronteira
+// entre dois chunks TCP, cada metade é decodificada isoladamente e vira
+// U+FFFD ("�"), corrompendo o texto de forma silenciosa (sem erro, sem log).
+// Como a maioria dos bodies desta API é pequena (cabe em 1 chunk) o bug quase
+// nunca se manifestava em teste manual — mas span de rede/proxy pode
+// fragmentar em chunks menores a qualquer momento, especialmente em bodies
+// maiores (ex.: POST /api/lista-personalizada, até 64 KB). Corrigido
+// acumulando Buffers brutos e decodificando UTF-8 uma ÚNICA vez no final,
+// sobre o payload completo — nunca corta um caractere ao meio. O limite de
+// tamanho também passa a contar bytes reais (chunk.length) em vez do
+// `.length` de uma string (que conta unidades UTF-16, não bytes — impreciso
+// para texto acentuado).
 function lerBody(req, maxBytes) {
     return new Promise((resolve, reject) => {
-        const limite = maxBytes || 1024 * 16; // 16 KB máx padrão
-        let body    = "";
-        let abortado = false;
+        const limite   = maxBytes || 1024 * 16; // 16 KB máx padrão
+        const pedacos   = [];
+        let totalBytes  = 0;
+        let abortado    = false;
 
         req.on("data", chunk => {
             if (abortado) return;
-            body += chunk;
-            if (body.length > limite) {
+            totalBytes += chunk.length;
+            if (totalBytes > limite) {
                 abortado = true;
                 try { req.destroy(); } catch (_) {}
                 reject(new Error("Body excede " + limite + " bytes."));
+                return;
             }
+            pedacos.push(chunk);
         });
-        req.on("end",   () => { if (!abortado) resolve(body); });
+        req.on("end",   () => { if (!abortado) resolve(Buffer.concat(pedacos).toString("utf8")); });
         req.on("error", e  => { if (!abortado) reject(e); });
     });
 }
@@ -4833,10 +5547,11 @@ async function handleGetRoot(req, res, json, erro) {
 }
 
 // "Sessão" de busca estendida para o Modo Automático: retorna o próximo lote
-// de itens do catálogo completo (_catalogoCompleto), a partir de onde a
-// última sessão parou (_catalogoCursor). Nunca repete itens já servidos — o
-// cursor só avança. Lote limitado a LIMITE_SESSAO_BUSCA para não travar o
-// navegador com um payload grande de uma vez.
+// de itens do catálogo completo (_catalogoCompleto), a partir do offset que
+// o PRÓPRIO CLIENTE informa (?offset=N — tipicamente quantos itens ele já
+// tem carregados). Lote limitado a LIMITE_SESSAO_BUSCA para não travar o
+// navegador com um payload grande de uma vez. Rota totalmente sem estado no
+// servidor — ver achado #F no comentário de _catalogoCompleto, acima.
 // ─────────────────────────────────────────────────────────────────────────────
 // SSE — Server-Sent Events (substitui o polling de 1800ms no cliente)
 // O cliente abre EventSource('/api/sse') e recebe "dados" quando o catálogo
@@ -4884,10 +5599,21 @@ async function handleSse(req, res) {
 
 async function handleBuscarMaisItens(req, res, json, erro) {
     if (!_catalogoCompleto.length) {
-        json({ ok: true, itens: [], temMais: false, totalCatalogo: 0 });
+        json({ ok: true, itens: [], temMais: false, totalCatalogo: 0, proximoOffset: 0 });
         return;
     }
-    const inicio = _catalogoCursor;
+
+    // offset vem do cliente (quantos itens ele já tem) — nunca de um contador
+    // global no servidor. Entrada inválida/ausente cai em 0 (reinicia do
+    // início do catálogo estendido) em vez de quebrar a requisição.
+    let offsetPedido = 0;
+    try {
+        const urlReq = new URL(req.url || "/", "http://localhost:" + PORTA);
+        const raw    = parseInt(urlReq.searchParams.get("offset") || "0", 10);
+        if (Number.isFinite(raw) && raw >= 0) offsetPedido = raw;
+    } catch (_) { /* URL malformada — segue com offsetPedido = 0 */ }
+
+    const inicio = Math.min(offsetPedido, _catalogoCompleto.length);
     const fim    = Math.min(inicio + LIMITE_SESSAO_BUSCA, _catalogoCompleto.length);
     const lote   = _catalogoCompleto.slice(inicio, fim).map(item => ({
         codigo:      item.codigo,
@@ -4898,12 +5624,12 @@ async function handleBuscarMaisItens(req, res, json, erro) {
         ultimaVenda: item.ultimaVenda,
         usado:       !!_usados[item.codigo]
     }));
-    _catalogoCursor = fim; // avança o cursor — próxima sessão continua daqui, nunca repete
     logTs("Busca estendida: sess\u00e3o serviu " + lote.length + " item(ns) (\u00edndices " +
-          inicio + "\u2013" + (fim - 1) + " de " + _catalogoCompleto.length + ").");
+          inicio + "\u2013" + (fim - 1) + " de " + _catalogoCompleto.length + ", offset pedido=" + offsetPedido + ").");
     json({
         ok:            true,
         itens:         lote,
+        proximoOffset: fim, // cliente usa este valor na próxima chamada
         temMais:       fim < _catalogoCompleto.length,
         totalCatalogo: _catalogoCompleto.length
     });
@@ -4991,6 +5717,21 @@ async function handlePostListaPersonalizada(req, res, json, erro) {
     salvarListaPersonalizadaDisco();
     logTs("Lista personalizada salva: " + _listaPersonalizada.length + " c\u00f3digo(s).");
     json({ ok: true, total: _listaPersonalizada.length });
+
+    // FIX (2026-07-27): _lpEstoquesReais só é (re)calculado dentro de
+    // carregarItens() — sem isto, um código RECÉM-adicionado ficava fora
+    // dele até o próximo ciclo natural de poll/SSE, e o cliente (que já
+    // tinha o código novo em _lpDados, mas não em _lpEstoquesReais) achava
+    // que ele "não existe mais no banco" só por estar temporariamente
+    // desatualizado — o alerta sumia sozinho assim que o próximo poll
+    // acontecia, o que confundia (parecia ser passageiro sem motivo claro).
+    // Dispara em background (não atrasa a resposta desta requisição, que já
+    // foi enviada acima) — mesmo padrão do /api/atualizar.
+    if (!_loadLock && !_carregando) {
+        setImmediate(() => {
+            carregarItens().catch(e => logErro("ERRO refresh p\u00f3s-lista-personalizada: " + (e.message || e)));
+        });
+    }
 }
 
 async function handlePostAtualizar(req, res, json, erro) {
@@ -5039,17 +5780,7 @@ async function handleGetConfig(req, res, json, erro) {
         estoqueMinimo:      _cfgVivo.estoqueMinimo,
         maxItens:           _cfgVivo.maxItens,
         proibidosEmbutidos: PROIBIDOS_EMBUTIDOS,
-        defaults: {
-            fbHost:        "192.168.1.65",
-            fbPort:        3050,
-            fdbPath:       "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB",
-            fbUser:        "SYSDBA",
-            fbPassword:    "masterkey",
-            portaEstoque:  7888,
-            appName:       "Consulta Estoque",
-            estoqueMinimo: 5,
-            maxItens:      2000
-        }
+        defaults: DEFAULTS
     });
 }
 
@@ -5072,7 +5803,7 @@ async function _lerEValidarPayloadConfig(req, erro) {
     if (isNaN(novaPortaFb)   || novaPortaFb   < 1024 || novaPortaFb   > 65534) { erro("fbPort inválida (1024–65534).", 400); return null; }
     if (isNaN(novaPortaHttp) || novaPortaHttp < 1024 || novaPortaHttp > 65534) { erro("portaEstoque inválida (1024–65534).", 400); return null; }
     if (isNaN(novoEstMin)    || novoEstMin    < 0     || novoEstMin    > 9999)  { erro("estoqueMinimo inválido (0–9999).", 400); return null; }
-    if (isNaN(novoMaxItens)  || novoMaxItens  < 100   || novoMaxItens  > 5000)  { erro("maxItens inválido (100–5000).", 400); return null; }
+    if (isNaN(novoMaxItens)  || novoMaxItens  < 100   || novoMaxItens  > MAX_ITENS_TETO)  { erro("maxItens inválido (100–" + MAX_ITENS_TETO + ").", 400); return null; }
 
     let novosProibExtra = [];
     const rawProb = String(parsed.proibidosExtra || "").trim();
@@ -5239,6 +5970,35 @@ const server = http.createServer(async (req, res) => {
     const erro = (msg, status) => json({ ok: false, erro: msg }, status || 500);
 
     res.on("error", e => logTs("AVISO res[" + rota + "]: " + e.message));
+
+    // ── Proteção contra CSRF cross-origin em rotas de mutação ──────────────────
+    // achado #D da revisão 2026-08-06: nenhuma rota POST validava de onde a
+    // requisição vinha. Como o servidor nunca envia cabeçalhos CORS permissivos
+    // (Access-Control-Allow-Origin), um `fetch()` cross-origin com JSON normal
+    // já é bloqueado pelo navegador — MAS só porque `Content-Type:
+    // application/json` força um preflight. Um site malicioso aberto na mesma
+    // rede local (ex.: outra aba do mesmo funcionário) pode contornar isso
+    // enviando o MESMO corpo JSON com `Content-Type: text/plain`, que é um
+    // "simple request" e NÃO dispara preflight — o navegador envia a
+    // requisição mesmo assim, e como este servidor nunca checava o cabeçalho,
+    // ela era aceita e executada (ex.: reescrever fbHost/fbPassword via
+    // POST /api/config, marcar itens como usados, apagar a lista
+    // personalizada). Exigir um cabeçalho CUSTOMIZADO (X-Requested-With) força
+    // TODO POST — mesmo com Content-Type simples — a passar por preflight;
+    // como não há Access-Control-Allow-Origin, o preflight falha e o
+    // navegador nunca chega a enviar a requisição de verdade. O cliente deste
+    // próprio app já envia esse cabeçalho em toda chamada (ver apiFetch()) —
+    // nenhuma funcionalidade legítima é afetada, inclusive entre máquinas
+    // diferentes da mesma rede local (isto não é uma restrição de
+    // firewall/CORS, é validação de origem da requisição).
+    if (req.method === "POST" && rota.indexOf("/api/") === 0) {
+        const origemConfiavel = req.headers["x-requested-with"] === "XMLHttpRequest";
+        if (!origemConfiavel) {
+            logErro("AVISO: POST " + rota + " bloqueado — cabeçalho X-Requested-With ausente/inválido (possível origem externa).");
+            erro("Requisição rejeitada: cabeçalho obrigatório ausente.", 403);
+            return;
+        }
+    }
 
     const handler = ROTAS[req.method + " " + rota];
     try {
