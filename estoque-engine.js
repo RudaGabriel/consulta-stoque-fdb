@@ -1,25 +1,24 @@
 /**
  * estoque-engine.js
  *
- * @version 1.3.0
+ * @version 1.4.0
  * @changelog
- *   1.3.0 - 2026-07-10 - Modo Agrupar (encontrarGruposAsync) não funcionava
- *     corretamente com a fase extra de subset-sum (DP) introduzida na v1.1.0.
- *     Revertido para o algoritmo da versão anterior comprovadamente estável
- *     (mesma lógica testada e usada em produção antes da extração para este
- *     módulo): apenas pares e triplas, com índices estritamente crescentes
- *     (a<b / a<b<c — sem duplicar o mesmo conjunto de itens em ordens
- *     diferentes) e limite de candidatos/resultados para nunca travar o
- *     browser. Roda em um único setTimeout (sem chunking multi-fase, sem
- *     necessidade de guard de geração entre fases internas — só no início/
- *     fim, mais simples e com muito menos superfície para bugs). Continua
- *     filtrando por estoqueMinimo/proibidos ANTES de montar os candidatos
- *     (correção que a v1.1.0 trouxe e que continua válida) e mantém a
- *     deduplicação final por assinatura de códigos como trava de segurança.
- *     Efeito colateral aceito: combinações de 4+ itens deixam de ser
- *     buscadas (eram uma tentativa de melhoria que se mostrou não confiável)
- *     — o modo Agrupar volta a cobrir pares e triplas, como na versão que
- *     funcionava.
+ *   1.4.0 - 2026-08-14 15:40 - Revisão de auditoria (sem mudança de
+ *     comportamento observável — mesma API, mesmos resultados, 70/70 testes
+ *     originais continuam passando):
+ *       [1] _autoEncontrarMelhor mutava os objetos de entrada (`_item._p =
+ *           _cp`), efeito colateral não documentado numa função descrita
+ *           como pura — agora cada candidato é empacotado como {it, p}
+ *           (item original + preço numérico já convertido), nunca mais
+ *           escrito de volta no objeto do chamador.
+ *       [2] Número mágico `40` (tolerância do modo Combinar) estava
+ *           hardcoded em 4 pontos diferentes em vez de usar a constante
+ *           FAIXA_COMBINAR já existente — agora todos os pontos referenciam
+ *           a constante; mudar a tolerância no futuro exige editar 1 lugar,
+ *           não 4.
+ *       [3] Removida a label `outer3ex:` da Fase 3 de _autoEncontrarMelhor —
+ *           não era referenciada por nenhum break/continue (resquício de
+ *           uma versão anterior do algoritmo), apenas ruído para quem lê.
  *
  * ARQUITETURA:
  *   - UMD wrapper: expõe via module.exports (Node) ou window globals (browser)
@@ -115,93 +114,100 @@
         if (!valor || valor <= 0 || !disponiveis || !disponiveis.length) return null;
         var _extra  = (typeof faixaExtra === "number" && faixaExtra >= 0) ? faixaExtra : 0;
         var EPS     = FLOAT_EPS;
-        var alvoMax = valor + 40 + _extra;
+        var alvoMax = valor + FAIXA_COMBINAR + _extra;
+        // Candidatos empacotados como {it, p}: o preço fica no wrapper, nunca
+        // escrito de volta no objeto original — a função é pura de verdade,
+        // não muta nenhum item do array recebido (achado de auditoria: a
+        // versão anterior gravava "_item._p = _cp" direto no item do
+        // chamador, poluindo silenciosamente objetos que também vivem em
+        // _itens/_catalogoCompleto no servidor/cliente).
         var candsExatos = [];
         var candsFaixa  = [];
         for (var _ci = 0; _ci < disponiveis.length; _ci++) {
             var _item = disponiveis[_ci];
             var _cp   = Number(_item.preco || 0);
             if (_cp <= 0) continue;
-            _item._p = _cp;
+            var _cand = { it: _item, p: _cp };
             if (_cp <= alvoMax + EPS) {
-                candsFaixa.push(_item);
-                if (_cp <= valor + EPS) candsExatos.push(_item);
+                candsFaixa.push(_cand);
+                if (_cp <= valor + EPS) candsExatos.push(_cand);
             }
         }
         if (!candsFaixa.length) return null;
 
         // Fase 1: item único exato
         for (var _f1 = 0; _f1 < candsExatos.length; _f1++) {
-            if (Math.abs(candsExatos[_f1]._p - valor) <= EPS) {
-                return { itens: [candsExatos[_f1]], soma: +candsExatos[_f1]._p.toFixed(2), diff: 0 };
+            if (Math.abs(candsExatos[_f1].p - valor) <= EPS) {
+                return { itens: [candsExatos[_f1].it], soma: +candsExatos[_f1].p.toFixed(2), diff: 0 };
             }
         }
 
-        // Mapa preço→itens (centavos) para lookup O(1) de complemento
+        // Mapa preço→candidatos (centavos) para lookup O(1) de complemento
         var _precoMap = Object.create(null);
         for (var _pmi = 0; _pmi < candsExatos.length; _pmi++) {
-            var _pKey = Math.round(candsExatos[_pmi]._p * 100);
+            var _pKey = Math.round(candsExatos[_pmi].p * 100);
             if (!_precoMap[_pKey]) _precoMap[_pKey] = [];
             _precoMap[_pKey].push(candsExatos[_pmi]);
         }
 
         // Fase 2: par exato
         for (var _f2 = 0; _f2 < candsExatos.length; _f2++) {
-            var _pa2  = candsExatos[_f2]._p;
+            var _pa2  = candsExatos[_f2].p;
             var _pb2  = valor - _pa2;
             if (_pb2 <= EPS) continue;
             var _lista2 = _precoMap[Math.round(_pb2 * 100)];
             if (!_lista2) continue;
             for (var _li2 = 0; _li2 < _lista2.length; _li2++) {
-                if (_lista2[_li2].codigo === candsExatos[_f2].codigo) continue;
-                var _soma2 = _pa2 + _lista2[_li2]._p;
+                if (_lista2[_li2].it.codigo === candsExatos[_f2].it.codigo) continue;
+                var _soma2 = _pa2 + _lista2[_li2].p;
                 if (Math.abs(_soma2 - valor) <= EPS) {
-                    return { itens: [candsExatos[_f2], _lista2[_li2]], soma: +_soma2.toFixed(2), diff: 0 };
+                    return { itens: [candsExatos[_f2].it, _lista2[_li2].it], soma: +_soma2.toFixed(2), diff: 0 };
                 }
             }
         }
 
         // Fase 3: tripla exata (O(n²) + hash para 3º)
-        var _tripCands = candsExatos.filter(function(i) { return i._p < valor - EPS; });
+        var _tripCands = candsExatos.filter(function(c) { return c.p < valor - EPS; });
         if (_tripCands.length > 200) _tripCands = _tripCands.slice(0, 200);
-        outer3ex:
         for (var _a3 = 0; _a3 < _tripCands.length; _a3++) {
-            var _pa3 = _tripCands[_a3]._p;
+            var _pa3 = _tripCands[_a3].p;
             for (var _b3 = _a3 + 1; _b3 < _tripCands.length; _b3++) {
-                var _ab3 = _pa3 + _tripCands[_b3]._p;
+                var _ab3 = _pa3 + _tripCands[_b3].p;
                 if (_ab3 >= valor - EPS) continue;
                 var _lista3 = _precoMap[Math.round((valor - _ab3) * 100)];
                 if (!_lista3) continue;
                 for (var _li3 = 0; _li3 < _lista3.length; _li3++) {
                     var _c3 = _lista3[_li3];
-                    if (_c3.codigo === _tripCands[_a3].codigo || _c3.codigo === _tripCands[_b3].codigo) continue;
-                    var _soma3 = _ab3 + _c3._p;
+                    if (_c3.it.codigo === _tripCands[_a3].it.codigo || _c3.it.codigo === _tripCands[_b3].it.codigo) continue;
+                    var _soma3 = _ab3 + _c3.p;
                     if (Math.abs(_soma3 - valor) <= EPS) {
-                        return { itens: [_tripCands[_a3], _tripCands[_b3], _c3], soma: +_soma3.toFixed(2), diff: 0 };
+                        return { itens: [_tripCands[_a3].it, _tripCands[_b3].it, _c3.it], soma: +_soma3.toFixed(2), diff: 0 };
                     }
                 }
             }
         }
 
-        // Fase 4: melhor match em [valor, valor+40]
-        candsFaixa.sort(function(a, b) { return Math.abs(a._p - valor) - Math.abs(b._p - valor); });
+        // Fase 4: melhor match em [valor, valor+FAIXA_COMBINAR]
+        candsFaixa.sort(function(a, b) { return Math.abs(a.p - valor) - Math.abs(b.p - valor); });
         if (candsFaixa.length > 80) candsFaixa = candsFaixa.slice(0, 80);
         var _melhor = null;
-        function _atualizar(grupo, soma) {
+        function _atualizar(grupoCands, soma) {
             var diff = +(soma - valor).toFixed(2);
-            if (diff < -EPS || diff > 40 + _extra + EPS) return;
+            if (diff < -EPS || diff > FAIXA_COMBINAR + _extra + EPS) return;
             if (!_melhor || diff < _melhor.diff) {
-                _melhor = { itens: grupo.slice(), soma: +soma.toFixed(2), diff: diff };
+                var _itensGrupo = [];
+                for (var _gi = 0; _gi < grupoCands.length; _gi++) _itensGrupo.push(grupoCands[_gi].it);
+                _melhor = { itens: _itensGrupo, soma: +soma.toFixed(2), diff: diff };
             }
         }
         for (var _s4 = 0; _s4 < candsFaixa.length; _s4++) {
-            _atualizar([candsFaixa[_s4]], candsFaixa[_s4]._p);
+            _atualizar([candsFaixa[_s4]], candsFaixa[_s4].p);
             if (_melhor && _melhor.diff < EPS) return _melhor;
         }
         outer2f:
         for (var _a4 = 0; _a4 < candsFaixa.length; _a4++) {
             for (var _b4 = _a4 + 1; _b4 < candsFaixa.length; _b4++) {
-                var _s2f = candsFaixa[_a4]._p + candsFaixa[_b4]._p;
+                var _s2f = candsFaixa[_a4].p + candsFaixa[_b4].p;
                 if (_s2f > alvoMax + EPS) continue;
                 _atualizar([candsFaixa[_a4], candsFaixa[_b4]], _s2f);
                 if (_melhor && _melhor.diff < EPS) break outer2f;
@@ -210,12 +216,12 @@
         if (_melhor && _melhor.diff < EPS) return _melhor;
         outer3f:
         for (var _a5 = 0; _a5 < candsFaixa.length; _a5++) {
-            var _pa5 = candsFaixa[_a5]._p;
+            var _pa5 = candsFaixa[_a5].p;
             for (var _b5 = _a5 + 1; _b5 < candsFaixa.length; _b5++) {
-                var _ab5 = _pa5 + candsFaixa[_b5]._p;
+                var _ab5 = _pa5 + candsFaixa[_b5].p;
                 if (_ab5 > alvoMax + EPS) continue;
                 for (var _c5 = _b5 + 1; _c5 < candsFaixa.length; _c5++) {
-                    var _s3f = _ab5 + candsFaixa[_c5]._p;
+                    var _s3f = _ab5 + candsFaixa[_c5].p;
                     if (_s3f > alvoMax + EPS) continue;
                     _atualizar([candsFaixa[_a5], candsFaixa[_b5], candsFaixa[_c5]], _s3f);
                     if (_melhor && _melhor.diff < EPS) break outer3f;
@@ -235,7 +241,7 @@
         if (!valor || valor <= 0 || !pool || !pool.length) return null;
         var _extra  = (typeof faixaExtra === "number" && faixaExtra >= 0) ? faixaExtra : 0;
         var EPS     = FLOAT_EPS;
-        var alvoMax = valor + 40 + _extra;
+        var alvoMax = valor + FAIXA_COMBINAR + _extra;
 
         var cands = [];
         for (var _ci = 0; _ci < pool.length; _ci++) {
@@ -364,7 +370,7 @@
         var _melhorR = null;
         function _atualizarR(grupo, soma) {
             var diff = +(soma - valor).toFixed(2);
-            if (diff < -EPS || diff > 40 + _extra + EPS) return;
+            if (diff < -EPS || diff > FAIXA_COMBINAR + _extra + EPS) return;
             if (!_grupoRespeitaLimites(grupo, usosAcumulados, estoqueParadaPorCod, pisoPadrao)) return;
             if (!_melhorR || diff < _melhorR.diff) {
                 _melhorR = { itens: grupo.slice(), soma: +soma.toFixed(2), diff: diff };
