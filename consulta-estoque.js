@@ -3,73 +3,46 @@
 /**
  * consulta-estoque.js
  *
- * @version 5.29.0
+ * @version 5.32.0
  * @changelog
- *   5.29.0 - 2026-08-14 17:05 - Revisão de auditoria de segurança/robustez
- *     (sem mudança de comportamento visível para o usuário final; 70/70
- *     testes originais continuam passando sem alteração):
+ *   5.32.0 - 2026-08-29 - Dois pedidos: (1) lista personalizada nunca pode
+ *     ter código duplicado; (2) código recém-adicionado + salvo aparecia
+ *     como "não existe mais no banco" (falso — sumia sozinho ao reiniciar
+ *     pelo .bat, sintoma de dado desatualizado, não de código ausente).
  *
- *     [1] SQL — VALIDAÇÃO DE IDENTIFICADOR (defesa em profundidade)
- *         Nomes de tabela/coluna descobertos por introspecção do schema
- *         (RDB$RELATIONS/RDB$RELATION_FIELDS) agora só são aceitos como
- *         candidatos se baterem no formato padrão de identificador Firebird
- *         (identificadorSqlValido()) antes de serem interpolados numa
- *         string SQL. Não muda a detecção em nenhum banco com nomes normais
- *         — só fecha a hipótese teórica de um identificador delimitado
- *         "exótico" (aspas, espaços) alterar a query.
+ *     [1] LISTA PERSONALIZADA — DUPLICATA NUNCA MAIS ENTRA
+ *         _sanitizarListaPersonalizada() (servidor) agora deduplica por
+ *         código, 1ª ocorrência vence — é o ÚNICO ponto de gravação
+ *         (POST /api/lista-personalizada), então a garantia vale sempre,
+ *         não importa a origem. Também retorna quantos foram removidos por
+ *         duplicata vs quantos por exceder o limite de 1000 — motivos
+ *         diferentes, nunca misturados numa mensagem só (testado: 1200
+ *         códigos únicos sem duplicata nenhuma não deve acusar
+ *         "duplicata", e sim "limite excedido"). _parseListaPersonalizadaDetalhada()
+ *         (cliente) também deduplica ao ler o texto colado, mesma regra —
+ *         defesa em dobro, não só no servidor.
  *
- *     [2] LISTA DE USADOS — CAP DE TAMANHO NO CÓDIGO
- *         POST /api/marcar-usado agora limita "codigo" a 50 caracteres
- *         (mesmo limite já aplicado em _sanitizarListaPersonalizada),
- *         evitando gravar em usados-estoque.json uma chave de tamanho
- *         arbitrário vinda de um payload malformado.
+ *     [2] FALSO "NÃO EXISTE MAIS NO BANCO" LOGO APÓS SALVAR — CORRIGIDO
+ *         Causa: salvarListaPersonalizada() espera _sincronizarEstoqueTempoReal
+ *         recalcular _lpEstoquesReais antes de checar alertas, mas o teto de
+ *         espera (SYNC_ESTOQUE_TIMEOUT_MS) era 6s — curto demais no mesmo
+ *         ambiente lento já identificado na v5.31.0 (carregarItens() levando
+ *         15-20s+). Ao vencer o teto, o código antigo aplicava os dados
+ *         (possivelmente ainda os de ANTES do save) e rodava o alerta do
+ *         mesmo jeito — um código recém-salvo, ainda fora de
+ *         _lpEstoquesReais, virava "não existe mais no banco" (falso).
+ *         Corrigido em duas frentes: SYNC_ESTOQUE_TIMEOUT_MS 6s -> 30s
+ *         (folga real sobre o ambiente observado); e _aguardarCargaFrescaConcluir
+ *         agora informa onPronto(sucesso) — sucesso=true só quando o
+ *         servidor confirmou !carregando de verdade. salvarListaPersonalizada()
+ *         só roda o alerta quando sucesso=true; se não (banco ainda mais
+ *         lento que o esperado), avisa que ainda está sincronizando e tenta
+ *         de novo uma vez, 8s depois — nunca mais afirma "não existe" com
+ *         base em dado sabidamente desatualizado.
  *
- *     [3] CONFIG — AVISO QUANDO A SENHA PADRÃO DO FIREBIRD ESTÁ EM USO
- *         Se config.json não define fbPassword, o servidor já caía (como
- *         sempre) na credencial padrão de instalação do Firebird — agora
- *         isso fica visível no log de startup em vez de silencioso, para
- *         quem nunca trocou a senha do banco saber que deveria.
- *
- *     [4] POST /api/config — MENSAGEM CORRIGIDA
- *         A resposta dizia "Dados recarregados do banco." mesmo quando o
- *         recarregamento era pulado por já haver um em andamento
- *         (_loadLock) — agora só afirma isso quando o recarregamento foi
- *         de fato dado início; caso contrário avisa que as novas
- *         configurações valem a partir do PRÓXIMO carregamento.
- *
- *     [5] ENDURECIMENTO CONTRA POLUIÇÃO DE PROTÓTIPO
- *         _lpEstoquesReais (servidor e cliente) e os mapas de reconciliação
- *         de código (_mapaCods/_mapaCodsNorm/_mapaCodsPad5) passam a usar
- *         Object.create(null) em vez de {} — mesmo padrão já usado em
- *         _usados e em _precoMap (estoque-engine.js). Nenhum acesso a esses
- *         objetos dependia do protótipo de Object (já usavam colchetes ou
- *         Object.prototype.hasOwnProperty.call), então o comportamento é
- *         idêntico; só fecha a hipótese teórica de uma chave "__proto__".
- *
- *     [6] SSE — LIMPEZA DE CLIENTE CENTRALIZADA
- *         emitirEventoSse(), o ping periódico e o evento "close" cada um
- *         repetia a mesma dupla remoção do Set + clearInterval — e o
- *         primeiro esquecia o clearInterval, deixando um timer órfão vivo
- *         por até 25s (autocorrigido no ping seguinte, mas inconsistente).
- *         Extraído para _removerClienteSse(), usado nos 3 pontos.
- *
- *     [7] ENGINE EMBUTIDA RESSINCRONIZADA
- *         _ENGINE_SRC (cópia embutida usada no <script> do cliente) foi
- *         regenerada a partir de estoque-engine.js v1.4.0 — ver changelog
- *         desse arquivo para o que mudou (mutação de item corrigida em
- *         _autoEncontrarMelhor, número mágico 40 → FAIXA_COMBINAR, label
- *         morta removida). As duas cópias continuam byte-a-byte idênticas.
- *
- *     [8] COMENTÁRIO DE MANUTENIBILIDADE
- *         Adicionado aviso explícito no topo do 2º <script> sobre a regra
- *         de barra invertida duplicada (regex client-side dentro da
- *         template literal do servidor) — closes a classe de bug em que um
- *         "\d" digitado sem dobrar vira "d" silenciosamente, sem erro de
- *         sintaxe em lugar nenhum. (Nota: a primeira tentativa de redigir
- *         este próprio aviso introduziu, por engano, a sequência literal
- *         "</script>" dentro do comentário — o que fecharia a tag
- *         prematuramente no navegador. Detectado por validar-client.js
- *         antes da entrega e corrigido; ver seção de achados.)
+ *     70/70 testes originais passando sem alteração (estoque-engine.js não
+ *     foi tocado nesta versão); dedup testado isoladamente em 3 cenários
+ *     (só duplicata, só limite, os dois juntos).
  *
  * Servidor de relatório de estoque disponível (Firebird + Node.js).
  * NÃO depende de gerar-relatorio-html.js nem servidor-relatorio.js.
@@ -127,16 +100,57 @@ const LIMITE_SESSAO_BUSCA = 1000; // itens por "sessão" de busca estendida (Mod
 const MAX_ITENS_TETO      = 20000;
 const SQL_LIMIT_BRUTO     = 200000; // teto do SELECT FIRST — muito acima do maxItens configurável (máx MAX_ITENS_TETO)
                                      // pra garantir que o banco devolva o catálogo inteiro de uma vez
-const CONEXAO_TIMEOUT_MS  = 15000;  // teto para Firebird.attach() nunca travar _loadLock indefinidamente
-                                     // quando o host está inacessível (firewall/IP errado) — o driver não
-                                     // garante timeout próprio de conexão em todas as plataformas; sem este
-                                     // teto, um host que nunca responde nem nunca dá erro deixa _loadLock
-                                     // preso em "true" para sempre, bloqueando qualquer atualização futura.
+// CONEXAO_TIMEOUT_MS — ACHADO (2026-08-29, caso real de produção): apesar do
+// nome, este teto NUNCA cobriu só o Firebird.attach() — o Promise.race
+// engloba o attach() E TUDO que roda dentro do callback dele (detecção de
+// tabela, a query principal, a consulta dedicada da lista personalizada).
+// Num ambiente real (Firebird remoto por rede local, tabela ESTOQUE com 93
+// colunas), attach() + detecção + a query principal levaram ~15-16s juntos —
+// bem em cima do teto antigo (15000ms), fazendo o race "vencer" por uma
+// fração de segundo e declarar "Timeout ao conectar" mesmo com o banco
+// respondendo normalmente, só que devagar. O carregamento REAL terminava
+// ~1s depois em background (best-effort, ver comentário mais abaixo), mas o
+// usuário via um erro de conexão falso e um scan de rede desnecessário.
+// Subido para 60s — ainda finito (nunca trava _loadLock pra sempre num host
+// genuinely inacessível), com folga real para bancos/redes lentos.
+const CONEXAO_TIMEOUT_MS  = 60000;
+// LP_QUERY_TIMEOUT_MS — teto de CADA lote da consulta dedicada da lista
+// personalizada (ver carregarItens() → bloco da lista personalizada,
+// abaixo). Antes era 15000ms fixo e inline — curto demais no mesmo ambiente
+// lento acima: a consulta dedicada chegou a estourar esse teto sozinha
+// (mesmo sendo uma busca por código, tipicamente rápida), derrubando TODA a
+// reconciliação da lista personalizada numa única tacada (rLp.e setado =
+// _lpEstoquesReais fica vazio = todo código aparece como "não existe mais
+// no banco", mesmo existindo). Subido para 45s, com folga generosa sobre o
+// que já foi observado necessário para a query principal (bem maior) nesse
+// mesmo ambiente.
+const LP_QUERY_TIMEOUT_MS = 45000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UTILITÁRIOS
 // ─────────────────────────────────────────────────────────────────────────────
 function p2(n) { return String(n).padStart(2, "0"); }
+
+// ── COLUNA ATIVO — FONTE ÚNICA DA REGRA DE "INATIVO" ────────────────────────
+// Usada em dois lugares (carregarItens(): whereAtivo da query principal E
+// reconciliação da consulta dedicada da lista personalizada, rLp) — mantida
+// aqui, uma única vez, para as duas nunca divergirem silenciosamente se o
+// critério for ajustado no futuro (bastaria editar esta lista).
+// Blacklist (não whitelist) de propósito: exclui só quem bate EXATAMENTE com
+// um destes marcadores comuns de ERP para produto cancelado/descontinuado —
+// nunca perde item com ATIVO = 'T', 'A', '1', 'Y' ou qualquer outro valor
+// válido que o banco use para "ativo".
+const ATIVO_VALORES_INATIVOS = ["N", "I", "X", "F"];
+
+// _valorColunaIndicaInativo: true SOMENTE quando o valor (já em texto, TRIM
+// aplicado aqui de novo por segurança mesmo a query já fazendo TRIM) bate
+// exatamente com um marcador da blacklist. NULL/undefined/qualquer outro
+// valor => false (ativo) — nunca bloqueia por engano quando o dado é
+// ausente ou desconhecido.
+function _valorColunaIndicaInativo(valorRaw) {
+    if (valorRaw == null) return false;
+    return ATIVO_VALORES_INATIVOS.indexOf(String(valorRaw).trim()) !== -1;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VALIDAÇÃO DE IDENTIFICADOR SQL (defesa em profundidade)
@@ -431,10 +445,13 @@ const { host: FDB_HOST, dbPath: FDB_PATH } = detectarFdb();
 // ESTADO GLOBAL
 // ─────────────────────────────────────────────────────────────────────────────
 let _itensBrutos    = [];               // Itens filtrados e carregados do banco
-let _lpEstoquesReais = Object.create(null); // {codigo: {estoque, descricao}} — SOMENTE códigos
-                                         // da lista personalizada, capturados direto de
-                                         // r.rows (ver carregarItens()), sem o corte de
-                                         // maxItens/estoqueMinimo/proibidos.
+let _lpEstoquesReais = Object.create(null); // {codigo: {estoque, preco, descricao, ativo}}
+                                         // — SOMENTE códigos da lista personalizada,
+                                         // capturados direto da consulta dedicada rLp (ver
+                                         // carregarItens()), sem o corte de maxItens/
+                                         // estoqueMinimo/proibidos. ativo é true/false
+                                         // quando o banco tem coluna ATIVO detectável, ou
+                                         // null quando não tem (não dá pra verificar).
 let _itensOrdenados = [];               // Fila de exibição: não-usados + usados
 let _usados         = Object.create(null); // { "CODIGO": true }
 let _usadosCount    = 0;               // Contador explícito — evita Object.keys(_usados).length
@@ -563,15 +580,32 @@ let _listaPersonalizada = []; // [{codigo, estoqueParada}, ...] — estoqueParad
 // Nunca confia cegamente no que vem do disco ou do POST do cliente: valida e
 // normaliza item a item, descartando qualquer entrada malformada em vez de
 // deixar o resto do sistema (parser/HTML) quebrar com dado inesperado.
+// Retorna { itens, duplicatas, cortados, limite } em vez de só o array —
+// duplicatas/cortados existem pra quem chama poder logar/avisar a causa
+// EXATA de qualquer código que não entrou (nunca misturar as duas: "removido
+// por ser duplicata" e "removido por exceder o limite de MAX_ITENS_LP" são
+// motivos diferentes, e uma mensagem genérica atribuindo tudo a "duplicata"
+// seria falsa quando o motivo real é o limite).
 function _sanitizarListaPersonalizada(arr) {
     const MAX_ITENS_LP = 1000;
     const out = [];
-    if (!Array.isArray(arr)) return out;
-    for (let i = 0; i < arr.length && out.length < MAX_ITENS_LP; i++) {
+    // A lista personalizada NUNCA pode ter código duplicado — ponto único de
+    // gravação (todo POST /api/lista-personalizada passa por aqui, sem
+    // exceção), então é aqui que essa garantia vale de verdade, não importa
+    // se o cliente já deduplicou ou não. 1ª ocorrência vence (mesmo critério
+    // já usado na reconciliação de _lpEstoquesReais, ver carregarItens()).
+    const vistos = new Set();
+    let duplicatas = 0;
+    let cortados = 0;
+    if (!Array.isArray(arr)) return { itens: out, duplicatas, cortados, limite: MAX_ITENS_LP };
+    for (let i = 0; i < arr.length; i++) {
         const it = arr[i];
         if (!it || typeof it !== "object") continue;
         const codigo = String(it.codigo == null ? "" : it.codigo).trim().slice(0, 50);
         if (!codigo) continue;
+        if (vistos.has(codigo)) { duplicatas++; continue; } // duplicata — não conta pro limite
+        if (out.length >= MAX_ITENS_LP) { cortados++; continue; } // único, mas excedeu o limite
+        vistos.add(codigo);
         let estoqueParada = null;
         if (it.estoqueParada != null && it.estoqueParada !== "") {
             const n = Number(it.estoqueParada);
@@ -579,15 +613,18 @@ function _sanitizarListaPersonalizada(arr) {
         }
         out.push({ codigo, estoqueParada });
     }
-    return out;
+    return { itens: out, duplicatas, cortados, limite: MAX_ITENS_LP };
 }
 
 function carregarListaPersonalizada() {
     try {
         const raw = fs.readFileSync(LISTA_PERSONALIZADA_PATH, "utf8").replace(/^\uFEFF/, "");
         const arr = JSON.parse(raw);
-        _listaPersonalizada = _sanitizarListaPersonalizada(arr);
-        logTs("Lista personalizada carregada: " + _listaPersonalizada.length + " c\u00f3digo(s).");
+        const resultado = _sanitizarListaPersonalizada(arr);
+        _listaPersonalizada = resultado.itens;
+        logTs("Lista personalizada carregada: " + _listaPersonalizada.length + " c\u00f3digo(s)." +
+              (resultado.duplicatas ? " (" + resultado.duplicatas + " duplicata(s) ignorada(s) no arquivo)" : "") +
+              (resultado.cortados   ? " (" + resultado.cortados   + " ignorado(s) por exceder o limite de " + resultado.limite + ")" : ""));
     } catch (_) { /* arquivo não existe ainda, OK */ }
 }
 
@@ -973,13 +1010,14 @@ async function carregarItens() {
                 // ATIVO = 'T', 'A', '1', 'Y' ou outros valores válidos do banco.
                 let whereAtivo = "";
                 if (colAtivo) {
-                    whereAtivo = "AND (p." + colAtivo + " IS NULL OR (" +
-                        "CAST(p." + colAtivo + " AS VARCHAR(1)) <> 'N' AND " +
-                        "CAST(p." + colAtivo + " AS VARCHAR(1)) <> 'I' AND " +
-                        "CAST(p." + colAtivo + " AS VARCHAR(1)) <> 'X' AND " +
-                        "CAST(p." + colAtivo + " AS VARCHAR(1)) <> 'F'" +
-                        "))";
-                    logTs("Filtro ATIVO (blacklist N/I/X/F) aplicado na coluna: " + colAtivo);
+                    // Gerado a partir de ATIVO_VALORES_INATIVOS (topo do arquivo) — mesmo
+                    // SQL de antes (N/I/X/F, ANDados), agora com uma única fonte de
+                    // verdade compartilhada com a reconciliação da lista personalizada.
+                    const condsAtivo = ATIVO_VALORES_INATIVOS
+                        .map(v => "CAST(p." + colAtivo + " AS VARCHAR(1)) <> '" + v + "'")
+                        .join(" AND ");
+                    whereAtivo = "AND (p." + colAtivo + " IS NULL OR (" + condsAtivo + "))";
+                    logTs("Filtro ATIVO (blacklist " + ATIVO_VALORES_INATIVOS.join("/") + ") aplicado na coluna: " + colAtivo);
                 }
 
                 // NOTA DE SEGURANÇA (achado #5 da revisão 2026-07-11): os nomes de
@@ -1045,34 +1083,100 @@ async function carregarItens() {
                 // _normalizarCodigoNumerico() e o bloco de reconciliação abaixo.
                 let rLp = { e: null, rows: [] };
                 if (!r.e && _listaPersonalizada.length) {
-                    const _lpCodsOriginais = Array.from(new Set(_listaPersonalizada.map(lp => lp.codigo).filter(Boolean))).slice(0, 500);
+                    const _lpCodsTodosUnicos = Array.from(new Set(_listaPersonalizada.map(lp => lp.codigo).filter(Boolean)));
+
+                    // Todas as formas de busca (original + sem zeros à esquerda +
+                    // preenchida a 5 dígitos) de TODOS os códigos — sem cortar nada
+                    // aqui. ACHADO (2026-08-29, caso real): um teto fixo de 500
+                    // códigos/1000 formas cortava código silenciosamente em listas
+                    // grandes (ex.: 563 códigos únicos → 63 nunca eram buscados e
+                    // apareciam como "não existe mais no banco" mesmo existindo).
+                    // _sanitizarListaPersonalizada já garante um teto superior
+                    // (MAX_ITENS_LP = 1000 códigos), então o que evita a consulta
+                    // ficar gigante agora é rodar em VÁRIOS lotes menores (abaixo),
+                    // nunca descartar código antes de tentar buscá-lo.
                     const _lpCodsBusca = new Set();
-                    _lpCodsOriginais.forEach(cod => {
+                    _lpCodsTodosUnicos.forEach(cod => {
                         _lpCodsBusca.add(cod);
                         const semZeros = _normalizarCodigoNumerico(cod);
                         if (semZeros !== null && semZeros !== cod) _lpCodsBusca.add(semZeros);
                         const padded5 = _codigoPadrao5Digitos(cod);
                         if (padded5 !== null && padded5 !== cod) _lpCodsBusca.add(padded5);
                     });
-                    const _lpCodsArr = Array.from(_lpCodsBusca).slice(0, 1000);
-                    if (_lpCodsArr.length) {
-                        const sqlLp = [
-                            "SELECT FIRST " + _lpCodsArr.length,
-                            "  TRIM(CAST(p." + colCod  + " AS VARCHAR(30)))  AS CODIGO,",
-                            "  TRIM(CAST(p." + colDesc + " AS VARCHAR(120))) AS DESCRICAO,",
-                            "  CAST(p." + colEst + " AS DOUBLE PRECISION)   AS ESTOQUE,",
-                            "  "  + selPrc  + " AS PRECO",
-                            "FROM " + nomTabela + " p",
-                            "WHERE TRIM(CAST(p." + colCod + " AS VARCHAR(30))) IN (" + _lpCodsArr.map(() => "?").join(",") + ")"
-                        ].join("\n");
-                        rLp = await query(db, sqlLp, _lpCodsArr, 15000);
-                        if (rLp.e) logErro("ERRO consulta lista personalizada (n\u00e3o-fatal, segue com fallback): " + String(rLp.e.message || rLp.e));
+                    const _lpCodsArr = Array.from(_lpCodsBusca);
+
+                    // LOTE_LP: tamanho de cada IN(...) — bem abaixo do limite prático
+                    // de parâmetros de uma lista IN no Firebird, com folga generosa.
+                    // Com o teto de 1000 códigos (_sanitizarListaPersonalizada) e até
+                    // 3 formas por código, o pior caso são ~3000 formas ≈ 8 lotes.
+                    const LOTE_LP = 400;
+                    const _lotesLp = [];
+                    for (let _li = 0; _li < _lpCodsArr.length; _li += LOTE_LP) {
+                        _lotesLp.push(_lpCodsArr.slice(_li, _li + LOTE_LP));
+                    }
+
+                    if (_lotesLp.length) {
+                        // Coluna ATIVO também entra nesta consulta dedicada — é a ÚNICA
+                        // forma de saber se um código da lista personalizada está
+                        // marcado como inativo/descontinuado no ERP. A query PRINCIPAL
+                        // já exclui inativos via whereAtivo, então eles nunca aparecem
+                        // em r.rows/_itensBrutos; sem captar ATIVO aqui, um código
+                        // inativo mas com estoque > 0 passava batido como candidato
+                        // válido no Modo Automático — mesmo defeito que o resto desta
+                        // consulta já resolve para zerado/negativado/excluído do banco.
+                        // Se a coluna não existir neste banco (colAtivo === null), vem
+                        // sempre NULL e o cliente trata como "não dá pra verificar"
+                        // (nunca bloqueia por engano — ver _valorColunaIndicaInativo).
+                        const selAtivoLp = colAtivo
+                            ? "TRIM(CAST(p." + colAtivo + " AS VARCHAR(1)))"
+                            : "CAST(NULL AS VARCHAR(1))";
+
+                        const _todasLinhasLp = [];
+                        let _lotesComErro = 0;
+                        for (let _loteIdx = 0; _loteIdx < _lotesLp.length; _loteIdx++) {
+                            const _lote = _lotesLp[_loteIdx];
+                            const sqlLp = [
+                                "SELECT FIRST " + _lote.length,
+                                "  TRIM(CAST(p." + colCod  + " AS VARCHAR(30)))  AS CODIGO,",
+                                "  TRIM(CAST(p." + colDesc + " AS VARCHAR(120))) AS DESCRICAO,",
+                                "  CAST(p." + colEst + " AS DOUBLE PRECISION)   AS ESTOQUE,",
+                                "  "  + selPrc     + " AS PRECO,",
+                                "  "  + selAtivoLp + " AS ATIVO",
+                                "FROM " + nomTabela + " p",
+                                "WHERE TRIM(CAST(p." + colCod + " AS VARCHAR(30))) IN (" + _lote.map(() => "?").join(",") + ")"
+                            ].join("\n");
+                            const _rLote = await query(db, sqlLp, _lote, LP_QUERY_TIMEOUT_MS);
+                            if (_rLote.e) {
+                                _lotesComErro++;
+                                logErro("ERRO consulta lista personalizada, lote " + (_loteIdx + 1) + "/" + _lotesLp.length +
+                                        " (n\u00e3o-fatal, segue com os demais lotes): " + String(_rLote.e.message || _rLote.e));
+                            } else {
+                                for (const _rowLote of _rLote.rows) _todasLinhasLp.push(_rowLote);
+                            }
+                        }
+                        // Só trata como falha TOTAL (bloco de reconciliação abaixo
+                        // inteiro pulado) se TODOS os lotes falharam — um lote com
+                        // erro não pode apagar o resultado, já real e utilizável, dos
+                        // demais lotes que funcionaram.
+                        rLp = {
+                            e: (_lotesComErro === _lotesLp.length) ? new Error(_lotesComErro + " de " + _lotesLp.length + " lote(s) falharam") : null,
+                            rows: _todasLinhasLp
+                        };
+                        // Diagnóstico: sem isto, uma falha de reconciliação (código
+                        // que deveria bater mas não bateu) só aparecia pro usuário
+                        // como "não existe mais no banco" — indistinguível de uma
+                        // consulta que genuinely não achou nada. Este log mostra
+                        // quantas variantes foram buscadas, em quantos lotes, e
+                        // quantas linhas voltaram no total.
+                        logTs("Lista personalizada: " + _lpCodsArr.length + " forma(s) de c\u00f3digo buscada(s) em " +
+                              _lotesLp.length + " lote(s) de at\u00e9 " + LOTE_LP + ", " + _todasLinhasLp.length + " linha(s) encontrada(s)" +
+                              (_lotesComErro ? " \u2014 " + _lotesComErro + " lote(s) falharam" : "") + ".");
                     }
                 }
 
                 db.detach();
 
-                // _lpEstoquesReais: {codigo: {estoque, descricao, preco}} — SEMPRE
+                // _lpEstoquesReais: {codigo: {estoque, descricao, preco, ativo}} — SEMPRE
                 // indexado pelo código EXATAMENTE como está na lista personalizada (é
                 // essa a chave que o cliente usa pra consultar). Reconcilia o
                 // resultado da consulta acima (que pode ter vindo sem zeros à
@@ -1095,10 +1199,19 @@ async function carregarItens() {
                         const est  = Number(row.ESTOQUE != null ? row.ESTOQUE : NaN);
                         const prc  = Number(row.PRECO   != null ? row.PRECO   : NaN);
                         const desc = String(row.DESCRICAO || "").trim();
+                        // ativo: null quando este banco não tem coluna ATIVO/ATIVADO/
+                        // SITUACAO/STATUS detectável (colAtivo === null) — "não dá pra
+                        // verificar" nunca deve virar "inativo" nem "confirmadamente
+                        // ativo". Só um valor explicitamente na blacklist vira false —
+                        // mesma regra do whereAtivo da query principal (ver
+                        // ATIVO_VALORES_INATIVOS/_valorColunaIndicaInativo, topo do
+                        // arquivo), agora também aplicada aos códigos da lista
+                        // personalizada, que usam esta consulta separada sem esse filtro.
                         const registro = {
                             estoque:   Number.isFinite(est) ? Math.round(est * 1000) / 1000 : null,
                             preco:     Number.isFinite(prc) ? Math.round(prc * 100)  / 100  : null,
-                            descricao: desc || null
+                            descricao: desc || null,
+                            ativo:     colAtivo ? !_valorColunaIndicaInativo(row.ATIVO) : null
                         };
                         _porCodigoExato.set(codDB, registro);
                         const norm = _normalizarCodigoNumerico(codDB);
@@ -1121,6 +1234,27 @@ async function carregarItens() {
                         // existe no banco — fica de fora de _lpEstoquesReais, e o
                         // cliente trata isso como "código não existe mais" (correto).
                         if (registro) _lpEstoquesReais[cod] = registro;
+                    }
+                }
+                // Diagnóstico (fora do "if (!rLp.e)" de propósito — roda mesmo quando
+                // a consulta falhou, pra deixar óbvio que TODOS os códigos ficaram
+                // sem reconciliar por causa do erro acima, e não um por um por engano
+                // de normalização): lista, pelo código exatamente como está salvo na
+                // lista personalizada, quem não bateu em NENHUMA das 3 formas tentadas
+                // (exata / preenchida a 5 dígitos / sem zeros à esquerda). Isso é o
+                // que decide se um código aparece como "não existe mais no banco" no
+                // alerta consolidado — ver _verificarAlertasListaPersonalizada no
+                // cliente.
+                if (_listaPersonalizada.length) {
+                    const _lpNaoReconciliados = _listaPersonalizada
+                        .map(lp => lp.codigo)
+                        .filter(cod => !(cod in _lpEstoquesReais));
+                    if (_lpNaoReconciliados.length) {
+                        logTs(
+                            "Lista personalizada: " + _lpNaoReconciliados.length + " de " + _listaPersonalizada.length +
+                            " c\u00f3digo(s) N\u00c3O reconciliados com o banco (v\u00e3o aparecer como \"n\u00e3o existe mais\"): " +
+                            _lpNaoReconciliados.slice(0, 20).join(", ") + (_lpNaoReconciliados.length > 20 ? "..." : "")
+                        );
                     }
                 }
 
@@ -1246,7 +1380,7 @@ async function carregarItens() {
         }
     });
 
-    // ── Teto de segurança: Firebird.attach() nunca trava o servidor pra sempre ──
+    // ── Teto de segurança: carregarItens() nunca trava o servidor pra sempre ───
     // achado #B da revisão 2026-08-06: o try/catch acima só protege contra uma
     // exceção SÍNCRONA de attach() — se o host estiver inacessível de um jeito
     // que nem erro nem callback disparam (blackhole de rede, firewall que
@@ -1255,16 +1389,24 @@ async function carregarItens() {
     // carregamento futuro (poll, botão "Atualizar", SSE) era silenciosamente
     // ignorado sem nenhum log de erro — o único jeito de recuperar era
     // reiniciar o processo manualmente. Promise.race garante uma resposta
-    // (sucesso ou timeout) em no máximo CONEXAO_TIMEOUT_MS. Se o attach()
-    // "atrasado" eventualmente responder depois do timeout já ter liberado o
-    // lock, ele ainda roda até o fim (best-effort: os dados chegam mais tarde
-    // em vez de se perderem) — só não é mais o resultado que esta chamada
-    // específica devolve a quem esperou por ela.
+    // (sucesso ou timeout) em no máximo CONEXAO_TIMEOUT_MS.
+    //
+    // IMPORTANTE (corrigido 2026-08-29, achado num caso real): este teto NÃO
+    // cobre só o attach() — cobre TODO o callback dele, ou seja, attach() +
+    // detecção de tabela + a query principal + a consulta da lista
+    // personalizada, tudo junto. Por isso a mensagem abaixo fala em "carregar
+    // dados", não em "conectar": um banco lento (não inacessível) pode
+    // estourar este teto mesmo com o attach() tendo funcionado perfeitamente.
+    // Se o carregamento "atrasado" eventualmente terminar depois do timeout já
+    // ter liberado o lock, ele ainda roda até o fim (best-effort: os dados
+    // chegam mais tarde em vez de se perderem) — só não é mais o resultado que
+    // esta chamada específica devolve a quem esperou por ela.
     const timeoutConexao = new Promise(resolve => {
         setTimeout(() => {
             if (!_loadLock) return; // já resolveu pela via normal — nada a fazer aqui
-            _erroConexao = "Timeout ao conectar no Firebird (" +
-                Math.round(CONEXAO_TIMEOUT_MS / 1000) + "s) — host/porta inacessível ou muito lento.";
+            _erroConexao = "Timeout ao carregar dados do Firebird (" +
+                Math.round(CONEXAO_TIMEOUT_MS / 1000) + "s) — conexão, detecção de tabela e consulta " +
+                "principal juntas demoraram mais que isso; host/porta inacessível OU banco/rede muito lento.";
             _carregando = _loadLock = false;
             logErro("ERRO: " + _erroConexao);
             setImmediate(function() { autoDetectarHost().catch(function() {}); });
@@ -2067,7 +2209,7 @@ html.perf-baixa .spin-svg{animation:sp 1.6s linear infinite!important}
       <span><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:middle;margin-right:6px"><path d="M8 5v4M8 11.2h.01"/><path d="M7.16 2.68 1.4 12.5A1.4 1.4 0 0 0 2.6 14.6h10.8a1.4 1.4 0 0 0 1.2-2.1L8.84 2.68a1.4 1.4 0 0 0-2.42-.01"/></svg>C&oacute;digos da lista personalizada esgotados</span>
       <button class="auto-close" onclick="_lpaResolverTodos('depois')" title="Fechar (deixa todos para depois — pergunto de novo nesta sess&atilde;o at&eacute; voc&ecirc; decidir, ou na pr&oacute;xima vez que abrir o sistema)" aria-label="Fechar"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
     </div>
-    <div class="auto-desc" id="lpAlertaCount">Os c&oacute;digos abaixo est&atilde;o na sua lista personalizada, mas cada um deles zerou, ficou negativado, foi exclu&iacute;do do banco ou atingiu o valor de parada configurado (o motivo espec&iacute;fico est&aacute; em cada linha). Escolha, para cada um, se deseja exclu&iacute;-lo da lista ou deixar para decidir depois (volta a perguntar sobre ele a cada nova sess&atilde;o, at&eacute; voc&ecirc; decidir) — ou resolva todos de uma vez no rodap&eacute;.</div>
+    <div class="auto-desc" id="lpAlertaCount">Os c&oacute;digos abaixo est&atilde;o na sua lista personalizada, mas cada um deles zerou, ficou negativado, foi exclu&iacute;do do banco, ficou INATIVO no sistema ou atingiu o valor de parada configurado (o motivo espec&iacute;fico est&aacute; em cada linha). Escolha, para cada um, se deseja exclu&iacute;-lo da lista ou deixar para decidir depois (volta a perguntar sobre ele a cada nova sess&atilde;o, at&eacute; voc&ecirc; decidir) — ou resolva todos de uma vez no rodap&eacute;.</div>
     <div class="lpa-lista" id="lpAlertaLista"></div>
     <div class="lpa-rodape">
       <button class="btn btn-s btn-sm" onclick="_lpaResolverTodos('depois')">Deixar todos para depois</button>
@@ -3924,11 +4066,21 @@ function _verificarAlertasListaPersonalizada() {
 
         // Motivo REAL e específico — a consulta dedicada no servidor (rLp,
         // sem o filtro "estoque >= 0" da query principal) permite diferenciar
-        // de verdade estes 4 casos, em vez de um "chegou a zero" genérico
+        // de verdade estes 5 casos, em vez de um "chegou a zero" genérico
         // pra qualquer situação:
         var motivo = null;
         if (!temReal) {
             motivo = 'o c\u00f3digo n\u00e3o existe mais no banco (foi exclu\u00eddo ou renomeado no ERP)';
+        } else if (lpReal.ativo === false) {
+            // lpReal.ativo só é boolean quando o banco tem coluna ATIVO/ATIVADO/
+            // SITUACAO/STATUS detectável (ver servidor, carregarItens() →
+            // _lpEstoquesReais); null (coluna inexistente nesse banco) nunca cai
+            // aqui — "não dá pra verificar" não pode virar alerta de "inativo".
+            // Checado ANTES do estoque de propósito: um item pode ter estoque
+            // positivo e ainda assim estar descontinuado/inativo no ERP — nesse
+            // caso o motivo administrativo é mais relevante que o número de
+            // estoque.
+            motivo = 'o item est\u00e1 INATIVO no sistema (verifique o cadastro no ERP)';
         } else if (estoqueReal < 0) {
             motivo = 'o estoque est\u00e1 NEGATIVADO (valor atual no banco: ' + estoqueReal + ' unid. \u2014 verifique o cadastro no ERP)';
         } else if (estoqueReal === 0) {
@@ -4251,12 +4403,35 @@ function salvarListaPersonalizada() {
             if (st) { st.textContent = msg; st.className = 'auto-status er'; }
             return;
         }
-        _lpDados = parsed;
+        // Usa a lista JÁ deduplicada/sanitizada que o SERVIDOR devolveu (ver
+        // handlePostListaPersonalizada) em vez do "parsed" local — garante
+        // que _lpDados (e a contagem mostrada na tela) reflita exatamente o
+        // que foi gravado em disco, mesmo que o texto colado pelo usuário
+        // tivesse código repetido (o parser já deduplica antes de enviar,
+        // ver _parseListaPersonalizadaDetalhada, mas o servidor é quem tem a
+        // palavra final). Fallback pro "parsed" local só por segurança,
+        // caso a resposta não traga "itens" por algum motivo.
+        var itensSalvos = Array.isArray(r.itens) ? r.itens : parsed;
+        // duplicatasRemovidas e cortadosPorLimite vêm SEPARADOS do servidor
+        // (ver handlePostListaPersonalizada) de propósito — inferir só pela
+        // diferença de tamanho (parsed.length - itensSalvos.length) misturaria
+        // dois motivos bem diferentes (código repetido vs lista maior que o
+        // limite de 1000) numa mensagem que poderia atribuir o motivo errado.
+        var duplicatasRemovidas = Number(r.duplicatasRemovidas) || 0;
+        var cortadosPorLimite   = Number(r.cortadosPorLimite)   || 0;
+        _lpDados = itensSalvos;
         _atualizarResumoLp();
         fecharListaPersonalizadaModal();
+        var _sufixoSalvarLp = '';
+        if (duplicatasRemovidas > 0) {
+            _sufixoSalvarLp += ' (' + duplicatasRemovidas + ' duplicata' + (duplicatasRemovidas === 1 ? '' : 's') + ' removida' + (duplicatasRemovidas === 1 ? '' : 's') + ')';
+        }
+        if (cortadosPorLimite > 0) {
+            _sufixoSalvarLp += ' \u2014 ' + cortadosPorLimite + ' c\u00f3digo(s) ignorado(s) por exceder o limite de 1000';
+        }
         toast(
-            parsed.length
-                ? '\u2713 Lista personalizada salva: ' + parsed.length + ' c\u00f3digo' + (parsed.length === 1 ? '' : 's')
+            itensSalvos.length
+                ? '\u2713 Lista personalizada salva: ' + itensSalvos.length + ' c\u00f3digo' + (itensSalvos.length === 1 ? '' : 's') + _sufixoSalvarLp
                 : '\u2713 Lista personalizada esvaziada.',
             2500
         );
@@ -4272,7 +4447,18 @@ function salvarListaPersonalizada() {
         // Desabilita "Iniciar" durante a sincronização — mesmo motivo do
         // toggleListaPersonalizada(): evita começar o Modo Automático com
         // dados de estoque potencialmente em transição.
-        if (parsed.length) {
+        //
+        // FIX (2026-08-29, caso real: banco/rede lento o bastante pra
+        // carregarItens() levar bem mais que os 6s que este teto costumava
+        // dar): _sincronizarEstoqueTempoReal agora informa via "sucesso" se
+        // os dados aplicados são realmente confirmados frescos ou se o teto
+        // de espera venceu ANTES do carregamento em background terminar. Sem
+        // essa distinção, um código recém-salvo era acusado de "não existe
+        // mais no banco" com base em _lpEstoquesReais ainda desatualizado —
+        // falso, e só se corrigia sozinho no próximo poll/reinício. Agora,
+        // se não deu tempo de confirmar, NÃO roda o alerta com dado
+        // possivelmente velho — avisa e tenta de novo uma vez, mais adiante.
+        if (itensSalvos.length) {
             var _btnIniciarSalvar    = document.getElementById('autoIniciarBtn');
             var _statusIniciarSalvar = document.getElementById('autoStatus');
             if (_btnIniciarSalvar) _btnIniciarSalvar.disabled = true;
@@ -4280,12 +4466,24 @@ function salvarListaPersonalizada() {
                 _statusIniciarSalvar.textContent = 'Sincronizando estoque com o banco ap\u00f3s salvar a lista...';
                 _statusIniciarSalvar.className   = 'auto-status';
             }
-            _sincronizarEstoqueTempoReal(function() {
+            _sincronizarEstoqueTempoReal(function(sucesso) {
                 if (_btnIniciarSalvar) _btnIniciarSalvar.disabled = false;
                 if (_statusIniciarSalvar && _statusIniciarSalvar.textContent.indexOf('Sincronizando estoque com o banco ap\u00f3s salvar') === 0) {
                     _statusIniciarSalvar.textContent = '';
                 }
-                _verificarAlertasListaPersonalizada();
+                if (sucesso) {
+                    _verificarAlertasListaPersonalizada();
+                } else {
+                    toast(
+                        'Banco/rede lento \u2014 ainda sincronizando o estoque dos c\u00f3digos rec\u00e9m-salvos. ' +
+                        'Os alertas da lista personalizada v\u00e3o ser checados de novo em instantes.',
+                        6000
+                    );
+                    // Uma única nova tentativa, mais adiante — cobre o caso comum
+                    // (carregamento em background estava a poucos segundos de
+                    // terminar); não fica repetindo indefinidamente.
+                    setTimeout(_verificarAlertasListaPersonalizada, 8000);
+                }
             });
         }
     });
@@ -4337,6 +4535,13 @@ function _parseListaPersonalizadaDetalhada(raw) {
     var normalizado = raw.split(CR + NL).join(NL).split(CR).join(NL);
     var linhas = normalizado.split(NL);
 
+    // A lista personalizada nunca deve ter código duplicado — checado aqui
+    // (1ª ocorrência da linha vence, as repetidas seguintes são ignoradas) E
+    // de novo no servidor em _sanitizarListaPersonalizada (ver
+    // handlePostListaPersonalizada), que é quem tem a palavra final sobre o
+    // que fica gravado em lista-personalizada.json.
+    var _vistosCod = {};
+
     for (var i = 0; i < linhas.length; i++) {
         var linha = _trim(linhas[i]);
         if (!linha) continue;
@@ -4354,6 +4559,8 @@ function _parseListaPersonalizadaDetalhada(raw) {
         var codigo     = _trim(codigoRaw);
         var estoqueTxt = _trim(estoqueRaw);
         if (!codigo) continue;
+        if (Object.prototype.hasOwnProperty.call(_vistosCod, codigo)) continue;
+        _vistosCod[codigo] = true;
 
         var estoqueParada = null;
         if (estoqueTxt) {
@@ -4437,7 +4644,18 @@ document.addEventListener('click', function(e) {
 // força um SELECT fresco (/api/atualizar) e só libera o processamento depois
 // que os dados voltarem — nunca deixa o algoritmo decidir sobre números
 // potencialmente velhos.
-var SYNC_ESTOQUE_TIMEOUT_MS   = 6000; // teto de espera — rede lenta/Firebird ocupado nunca trava a UI pra sempre
+// FIX (2026-08-29, achado num caso real: Firebird remoto/lento, ciclo
+// completo de carregarItens() perto de 16-20s): 6s era curto demais — o
+// caso de uso mais sensível a isso não é nem o Modo Automático (que
+// tolera number ligeiramente atrasado), e sim salvarListaPersonalizada():
+// um código RECÉM-salvo podia ser acusado de "não existe mais no banco"
+// só porque o teto de 6s venceu antes de carregarItens() terminar de
+// recalcular _lpEstoquesReais — informação falsa, que se corrigia sozinha
+// no próximo poll ou reinício (daí o relato "funciona ao reabrir pelo
+// .bat"). Subido para 30s, com folga real sobre o tempo observado; ver
+// também o parâmetro "sucesso" de onPronto() logo abaixo, que cobre o caso
+// de o banco ser mais lento ainda que isso.
+var SYNC_ESTOQUE_TIMEOUT_MS   = 30000; // teto de espera — rede lenta/Firebird ocupado nunca trava a UI pra sempre
 var SYNC_ESTOQUE_POLL_MS      = 400;
 var SYNC_ESTOQUE_MAX_TENTATIVAS = Math.ceil(SYNC_ESTOQUE_TIMEOUT_MS / SYNC_ESTOQUE_POLL_MS);
 
@@ -4451,19 +4669,29 @@ function _aplicarDadosItensFrescos(dados) {
     });
 }
 
+// onPronto(sucesso): sucesso=true SÓ quando o servidor confirmou que não há
+// carregamento em andamento (dados.carregando === false) — ou seja, os dados
+// aplicados são de verdade os mais recentes. sucesso=false quando o teto de
+// tentativas venceu com o servidor AINDA carregando (ou a rede falhou): os
+// dados aplicados podem ser de ANTES do carregamento em curso terminar —
+// quem chama precisa saber disso pra não tratar como definitivo (ver
+// salvarListaPersonalizada(), que evita rodar o alerta de "código não
+// existe" com base num sucesso=false).
 function _aguardarCargaFrescaConcluir(onPronto, tentativa) {
     apiFetch('/api/itens').then(function(dados) {
-        if (!dados) { onPronto(); return; } // falha de rede — segue com o que já tinha em _itens
+        if (!dados) { onPronto(false); return; } // falha de rede — não deu pra confirmar nada fresco
         if (dados.carregando && tentativa < SYNC_ESTOQUE_MAX_TENTATIVAS) {
             setTimeout(function() { _aguardarCargaFrescaConcluir(onPronto, tentativa + 1); }, SYNC_ESTOQUE_POLL_MS);
             return;
         }
-        // Dados frescos direto do Firebird (ou o teto de espera foi atingido —
-        // segue com o resultado mais recente que conseguiu obter; nunca trava
-        // a UI indefinidamente esperando uma rede ou banco muito lento).
+        // Aplica o resultado mais recente que conseguiu obter de qualquer
+        // forma (nunca trava a UI indefinidamente esperando uma rede ou
+        // banco muito lento) — mas só é "sucesso" de verdade quando o
+        // servidor confirmou !carregando; se o teto venceu primeiro,
+        // dados.carregando ainda pode ser true (ver comentário acima).
         _aplicarDadosItensFrescos(dados);
-        onPronto();
-    }).catch(function() { onPronto(); });
+        onPronto(!dados.carregando);
+    }).catch(function() { onPronto(false); });
 }
 
 function _sincronizarEstoqueTempoReal(onPronto) {
@@ -4478,7 +4706,7 @@ function _sincronizarEstoqueTempoReal(onPronto) {
         // mesmo jeito — só assim garante dados realmente frescos antes de
         // liberar onPronto().
         _aguardarCargaFrescaConcluir(onPronto, 0);
-    }).catch(function() { onPronto(); }); // falha de rede de verdade — segue com o que já tinha
+    }).catch(function() { onPronto(false); }); // falha de rede de verdade — segue com o que já tinha, mas avisa que não é garantidamente fresco
 }
 
 function iniciarModoAuto(faixaExtraOverride, tentativaExtensaoOverride) {
@@ -4582,12 +4810,31 @@ function _iniciarModoAutoAposSync(faixaExtraOverride, tentativaExtensaoOverride)
             if (_itPad5 !== null && !(_itPad5 in _mapaCodsPad5)) _mapaCodsPad5[_itPad5] = _itens[_mi];
         }
         var _naoAchados = [];
+        // Códigos que EXISTEM no banco mas estão marcados INATIVO no ERP: nunca
+        // viram candidato do Modo Automático, mesmo com preço/estoque válidos —
+        // mesma regra do catálogo geral (whereAtivo na query principal), agora
+        // também aplicada aqui à lista personalizada, que usa uma consulta
+        // própria sem esse filtro (rLp) só para poder diferenciar os motivos no
+        // alerta consolidado (ver _valorColunaIndicaInativo no servidor e
+        // _verificarAlertasListaPersonalizada no cliente — é lá que o usuário
+        // decide "excluir da lista" ou "deixar para depois"; aqui a única
+        // responsabilidade é jamais sugerir o código numa combinação).
+        var _inativos = [];
         for (var _li = 0; _li < _lpDados.length; _li++) {
             var _lpItem = _lpDados[_li];
             var _itemLp = null;
 
             var _lpReal = Object.prototype.hasOwnProperty.call(_lpEstoquesReais, _lpItem.codigo)
                 ? _lpEstoquesReais[_lpItem.codigo] : null;
+
+            // ativo === false é sinal definitivo (nunca null/undefined — coluna
+            // ausente no banco não bloqueia nada, ver comentário acima) — sai
+            // ANTES de considerar preço/estoque, e antes do fallback via _itens.
+            if (_lpReal && _lpReal.ativo === false) {
+                if (_inativos.indexOf(_lpItem.codigo) === -1) _inativos.push(_lpItem.codigo);
+                continue;
+            }
+
             if (_lpReal && typeof _lpReal.preco === 'number' && !isNaN(_lpReal.preco) && _lpReal.preco > 0 &&
                 typeof _lpReal.estoque === 'number' && !isNaN(_lpReal.estoque)) {
                 _itemLp = {
@@ -4601,6 +4848,9 @@ function _iniciarModoAutoAposSync(faixaExtraOverride, tentativaExtensaoOverride)
             // Fallback: _lpEstoquesReais não veio (consulta dedicada falhou nesse
             // ciclo) ou não tinha preço válido — tenta _itens como antes (código
             // sempre 5 dígitos: tenta a forma preenchida antes da sem-zeros).
+            // _itens nunca contém item inativo (filtro ATIVO já aplicado na query
+            // principal do servidor), então este fallback é seguro sem checar
+            // .ativo de novo.
             if (!_itemLp) {
                 _itemLp = _mapaCods[_lpItem.codigo];
                 if (!_itemLp) {
@@ -4623,14 +4873,28 @@ function _iniciarModoAutoAposSync(faixaExtraOverride, tentativaExtensaoOverride)
             }
         }
         if (!poolPersonalizado.length) {
-            statusEl.textContent = 'Nenhum c\u00f3digo da lista personalizada foi encontrado no banco (ou sem pre\u00e7o v\u00e1lido).';
+            statusEl.textContent = (_inativos.length && !_naoAchados.length)
+                ? 'Todos os c\u00f3digos da lista personalizada est\u00e3o INATIVOS no sistema.'
+                : 'Nenhum c\u00f3digo da lista personalizada foi encontrado no banco (ou sem pre\u00e7o v\u00e1lido).';
             statusEl.className   = 'auto-status er';
             btn.disabled = false;
             return;
         }
+        // Um único toast() para os dois avisos — a função reutiliza o mesmo
+        // elemento e zera o conteúdo a cada chamada (ver toast(), acima), então
+        // duas chamadas seguidas fariam a segunda apagar a primeira antes do
+        // usuário conseguir ler.
+        var _avisosPool = [];
         if (_naoAchados.length > 0) {
-            toast(_naoAchados.length + ' c\u00f3digo(s) n\u00e3o encontrado(s): ' +
-                  _naoAchados.slice(0, 5).join(', ') + (_naoAchados.length > 5 ? '...' : ''), 5000);
+            _avisosPool.push(_naoAchados.length + ' c\u00f3digo(s) n\u00e3o encontrado(s): ' +
+                _naoAchados.slice(0, 5).join(', ') + (_naoAchados.length > 5 ? '...' : ''));
+        }
+        if (_inativos.length > 0) {
+            _avisosPool.push(_inativos.length + ' c\u00f3digo(s) INATIVO(S) no sistema (ignorado(s) na busca): ' +
+                _inativos.slice(0, 5).join(', ') + (_inativos.length > 5 ? '...' : ''));
+        }
+        if (_avisosPool.length) {
+            toast(_avisosPool.join(' \u2014 '), _avisosPool.length > 1 ? 7000 : 5000);
         }
     }
 
@@ -5809,10 +6073,26 @@ async function handlePostListaPersonalizada(req, res, json, erro) {
     try { parsed = JSON.parse(body); } catch (_) { erro("JSON inválido.", 400); return; }
     if (!parsed || !Array.isArray(parsed.itens)) { erro("Campo 'itens' (array) obrigatório.", 400); return; }
 
-    _listaPersonalizada = _sanitizarListaPersonalizada(parsed.itens);
+    const resultadoSanitizado = _sanitizarListaPersonalizada(parsed.itens);
+    _listaPersonalizada = resultadoSanitizado.itens;
     salvarListaPersonalizadaDisco();
-    logTs("Lista personalizada salva: " + _listaPersonalizada.length + " c\u00f3digo(s).");
-    json({ ok: true, total: _listaPersonalizada.length });
+    logTs("Lista personalizada salva: " + _listaPersonalizada.length + " c\u00f3digo(s)." +
+          (resultadoSanitizado.duplicatas ? " (" + resultadoSanitizado.duplicatas + " duplicata(s) removida(s))" : "") +
+          (resultadoSanitizado.cortados   ? " (" + resultadoSanitizado.cortados   + " ignorado(s) por exceder o limite de " + resultadoSanitizado.limite + ")" : ""));
+    // Devolve a lista JÁ sanitizada (sem duplicatas, capada em MAX_ITENS_LP)
+    // para o cliente atualizar _lpDados com o que REALMENTE foi persistido —
+    // sem isto, se o texto colado pelo usuário tivesse duplicatas, a UI
+    // continuava mostrando a contagem/lista de ANTES da deduplicação até o
+    // próximo F5, uma divergência silenciosa entre tela e disco. duplicatasRemovidas
+    // e cortadosPorLimite vão separados (motivos diferentes) pra UI nunca
+    // atribuir ao motivo errado — ver salvarListaPersonalizada() no cliente.
+    json({
+        ok: true,
+        total: _listaPersonalizada.length,
+        itens: _listaPersonalizada,
+        duplicatasRemovidas: resultadoSanitizado.duplicatas,
+        cortadosPorLimite:   resultadoSanitizado.cortados
+    });
 
     // FIX (2026-07-27): _lpEstoquesReais só é (re)calculado dentro de
     // carregarItens() — sem isto, um código RECÉM-adicionado ficava fora
