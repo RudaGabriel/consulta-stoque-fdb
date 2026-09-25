@@ -2137,7 +2137,7 @@ html.perf-baixa .spin-svg{animation:sp 1.6s linear infinite!important}
       <div class="cl" style="margin-bottom:4px">Lista de entrada</div>
       <textarea class="auto-ta" id="autoInput" placeholder="Cole aqui a lista..."></textarea>
     </div>
-    <div style="display:flex;align-items:center;flex-wrap:nowrap;gap:8px;/*overflow-x:auto*/">
+    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;/*overflow-x:auto*/">
       <label class="tgl-wrap" id="lpToggleWrap" title="Restringe a busca apenas aos c&oacute;digos configurados, permitindo repeti-los" style="width:fit-content;flex-shrink:0">
         <input type="checkbox" id="chkListaPersonalizada" onchange="toggleListaPersonalizada()">
         <span class="tgl"></span>
