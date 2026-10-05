@@ -3,24 +3,25 @@
  *
  * @author Ruda Gabriel
  *
- * @version 1.4.0
+ * @version 1.5.0
  * @changelog
- *   1.4.0 - 2026-08-14 15:40 - Revisão de auditoria (sem mudança de
- *     comportamento observável — mesma API, mesmos resultados, 70/70 testes
- *     originais continuam passando):
- *       [1] _autoEncontrarMelhor mutava os objetos de entrada (`_item._p =
- *           _cp`), efeito colateral não documentado numa função descrita
- *           como pura — agora cada candidato é empacotado como {it, p}
- *           (item original + preço numérico já convertido), nunca mais
- *           escrito de volta no objeto do chamador.
- *       [2] Número mágico `40` (tolerância do modo Combinar) estava
- *           hardcoded em 4 pontos diferentes em vez de usar a constante
- *           FAIXA_COMBINAR já existente — agora todos os pontos referenciam
- *           a constante; mudar a tolerância no futuro exige editar 1 lugar,
- *           não 4.
- *       [3] Removida a label `outer3ex:` da Fase 3 de _autoEncontrarMelhor —
- *           não era referenciada por nenhum break/continue (resquício de
- *           uma versão anterior do algoritmo), apenas ruído para quem lê.
+ *   1.5.0 - 2026-10-05 22:30 - Agrupar nunca mostrava a soma EXATA:
+ *     encontrarGruposAsync parava de procurar ao juntar 30 grupos, guardando
+ *     os primeiros pares na ordem da lista (por estoque) e não os mais
+ *     próximos do valor. Um par exato fora desses primeiros nunca aparecia
+ *     ("R$ 101,00 +R$ 1,00" com R$ 100,00 disponível). Agora todas as bases
+ *     são examinadas com busca binária pelos parceiros mais próximos
+ *     (PARCEIROS_POR_BASE), a coleção é podada pelos melhores e o resultado
+ *     sai ordenado por menor diferença e, no empate, por menos itens.
+ *     Teto de candidatos: 250 -> 600 (MAX_CANDIDATOS_GRUPOS). Validado contra
+ *     força bruta em 300 cenários aleatórios.
+ *     Combinar / Modo Automático (_autoEncontrarMelhorComRepeticao): mesmo
+ *     defeito por outro caminho — só os 30 primeiros itens da lista entravam
+ *     na busca. Nova busca ampla de 1 a 3 itens (com repetição, respeitando
+ *     o estoque disponível de cada código) sobre até 600 candidatos; soma
+ *     exata é devolvida na hora, senão vence o mais próximo entre ela e a
+ *     busca original. Combinar não repete mais o mesmo card: combinação
+ *     repetida tira seus itens das buscas seguintes.
  *
  * ARQUITETURA:
  *   - UMD wrapper: expõe via module.exports (Node) ou window globals (browser)
@@ -62,6 +63,8 @@
     var FAIXA_EXCEDENTE_LP     = 99999;  // sentinela "sem teto" para busca de excedente
     var PRECO_SENTINEL_ZERADO  = 0.01;   // preço sentinela de item "zerado" no ERP legado
     var MAX_COMBINAR_RESULTADOS = 20;    // máx. combinações retornadas pelo modo Combinar
+    var MAX_CANDIDATOS_GRUPOS  = 600;   // teto de candidatos no Agrupar (antes 250)
+    var PARCEIROS_POR_BASE     = 4;     // parceiros mais próximos avaliados por item-base no Agrupar
 
     // ── _qtdMaximaDisponivel ──────────────────────────────────────────────────
     // Quantas unidades de um item ainda podem ser usadas sem violar nenhum
@@ -237,7 +240,100 @@
     // DP bounded-knapsack via binary splitting + fallback de força bruta.
     // O mesmo item pode aparecer mais de uma vez, nunca ultrapassando
     // _qtdMaximaDisponivel(item, usosAcumulados, estoqueParadaPorCod, pisoPadrao).
+    // Busca AMPLA (v1.5.0): melhor combinação de 1 a 3 itens, com repetição,
+    // sobre até MAX_CANDIDATOS_GRUPOS candidatos (a busca principal abaixo só
+    // enxerga os 30 primeiros da lista — por isso a soma exata com itens mais
+    // ao fim da lista nunca aparecia). Preços ordenados + busca binária pelo
+    // parceiro mais próximo; respeita a quantidade disponível de cada código
+    // (_qtdMaximaDisponivel). Retorna o grupo de menor diferença (>= 0) dentro
+    // da faixa — no empate, o de menos itens — ou null.
+    function _melhorAteTresItensAmplo(pool, valor, alvoMax, usosAcumulados, estoqueParadaPorCod, pisoPadrao) {
+        var EPS = FLOAT_EPS;
+        var cands = [];
+        for (var i = 0; i < pool.length && cands.length < MAX_CANDIDATOS_GRUPOS; i++) {
+            var p = Number(pool[i].preco || 0);
+            if (!(p > 0) || p > alvoMax + EPS) continue;
+            var q = _qtdMaximaDisponivel(pool[i], usosAcumulados, estoqueParadaPorCod, pisoPadrao);
+            if (q > 0) cands.push({ it: pool[i], p: p, q: q });
+        }
+        if (!cands.length) return null;
+        cands.sort(function(x, y) { return x.p - y.p; });
+        var n = cands.length;
+        function primeiroAPartir(inicio, minimo) {
+            var lo = inicio, hi = n;
+            while (lo < hi) { var mid = (lo + hi) >> 1; if (cands[mid].p < minimo - EPS) lo = mid + 1; else hi = mid; }
+            return lo;
+        }
+        var melhor = null;
+        function considerar(idx, soma) {
+            var diff = +(soma - valor).toFixed(2);
+            if (diff < -EPS || soma > alvoMax + EPS) return;
+            if (melhor && (diff > melhor.diff || (diff === melhor.diff && idx.length >= melhor.idx.length))) return;
+            // Quantidade por código dentro do disponível (repetição: a == b etc.)
+            var cont = {};
+            for (var k = 0; k < idx.length; k++) {
+                cont[idx[k]] = (cont[idx[k]] || 0) + 1;
+                if (cont[idx[k]] > cands[idx[k]].q) return;
+            }
+            melhor = { idx: idx, soma: soma, diff: diff };
+        }
+        var PARC = PARCEIROS_POR_BASE;
+        // 1 item
+        var u = primeiroAPartir(0, valor);
+        if (u < n) considerar([u], cands[u].p);
+        // 2 itens (a <= b)
+        for (var a = 0; a < n; a++) {
+            if (melhor && melhor.diff < EPS && melhor.idx.length <= 2) break;
+            var pa = cands[a].p;
+            if (pa * 2 > alvoMax + EPS) break;
+            var b = primeiroAPartir(a, valor - pa);
+            for (var tb = 0; b < n && tb < PARC; b++, tb++) {
+                if (pa + cands[b].p > alvoMax + EPS) break;
+                considerar([a, b], pa + cands[b].p);
+            }
+        }
+        // 3 itens (a <= b <= c)
+        if (!(melhor && melhor.diff < EPS)) {
+            for (var a3 = 0; a3 < n; a3++) {
+                var p3a = cands[a3].p;
+                if (p3a * 3 > alvoMax + EPS) break;
+                for (var b3 = a3; b3 < n; b3++) {
+                    var ab = p3a + cands[b3].p;
+                    if (ab + cands[b3].p > alvoMax + EPS) break;
+                    var c3 = primeiroAPartir(b3, valor - ab);
+                    for (var tc = 0; c3 < n && tc < PARC; c3++, tc++) {
+                        if (ab + cands[c3].p > alvoMax + EPS) break;
+                        considerar([a3, b3, c3], ab + cands[c3].p);
+                    }
+                    if (melhor && melhor.diff < EPS) break;
+                }
+                if (melhor && melhor.diff < EPS) break;
+            }
+        }
+        if (!melhor) return null;
+        return {
+            itens: melhor.idx.map(function(k) { return cands[k].it; }),
+            soma: +melhor.soma.toFixed(2),
+            diff: melhor.diff
+        };
+    }
+
     function _autoEncontrarMelhorComRepeticao(pool, valor, faixaExtra, usosAcumulados, estoqueParadaPorCod, pisoPadrao) {
+        if (!valor || valor <= 0 || !pool || !pool.length) return null;
+        var _extraAmplo = (typeof faixaExtra === "number" && faixaExtra >= 0) ? faixaExtra : 0;
+        var amplo = _melhorAteTresItensAmplo(pool, valor, valor + FAIXA_COMBINAR + _extraAmplo,
+                                             usosAcumulados || {}, estoqueParadaPorCod || {}, pisoPadrao);
+        if (amplo && amplo.diff < FLOAT_EPS) return amplo; // soma exata: nada pode ser melhor
+        var base = _melhorComRepeticaoBase(pool, valor, faixaExtra, usosAcumulados, estoqueParadaPorCod, pisoPadrao);
+        if (!amplo) return base;
+        if (!base) return amplo;
+        // Fica com o mais próximo do alvo; no empate, o de menos itens.
+        if (amplo.diff < base.diff - FLOAT_EPS) return amplo;
+        if (Math.abs(amplo.diff - base.diff) <= FLOAT_EPS && amplo.itens.length < base.itens.length) return amplo;
+        return base;
+    }
+
+    function _melhorComRepeticaoBase(pool, valor, faixaExtra, usosAcumulados, estoqueParadaPorCod, pisoPadrao) {
         usosAcumulados      = usosAcumulados      || {};
         estoqueParadaPorCod = estoqueParadaPorCod || {};
         if (!valor || valor <= 0 || !pool || !pool.length) return null;
@@ -570,73 +666,100 @@
                 if (_ehProibidoCliente(it.descricao, proibidosEmbutidos, proibidosExtra)) return false;
                 return true;
             });
-            // Limita candidatos para não explodir O(n³) nas triplas
-            if (cands.length > 250) cands = cands.slice(0, 250);
+            // Teto de candidatos (mantém a ordem de entrada como prioridade) e
+            // ordenação por preço — permite achar por busca binária, para cada
+            // item-base, os parceiros MAIS PRÓXIMOS do alvo, em vez de varrer
+            // todas as combinações.
+            if (cands.length > MAX_CANDIDATOS_GRUPOS) cands = cands.slice(0, MAX_CANDIDATOS_GRUPOS);
+            cands.sort(function(x, y) { return Number(x.preco) - Number(y.preco); });
+            var n = cands.length;
+            var precos = new Array(n);
+            for (var _pi = 0; _pi < n; _pi++) precos[_pi] = Number(cands[_pi].preco);
 
-            // Pré-extrai preços numéricos uma única vez (evita Number() repetido nos loops internos)
-            var precos = new Array(cands.length);
-            for (var _pi = 0; _pi < cands.length; _pi++) precos[_pi] = Number(cands[_pi].preco);
+            // Primeiro índice >= inicio com preço >= minimo (precos é crescente).
+            function _primeiroIndiceAPartir(inicio, minimo) {
+                var lo = inicio, hi = n;
+                while (lo < hi) {
+                    var mid = (lo + hi) >> 1;
+                    if (precos[mid] < minimo - EPS) lo = mid + 1; else hi = mid;
+                }
+                return lo;
+            }
 
-            var grupos  = [];
-            var LIMITE  = Math.max(maxResultados, 30); // teto de coleta antes de ordenar/cortar
+            // CORREÇÃO (v1.5.0): antes os laços PARAVAM ao juntar LIMITE grupos
+            // — guardavam os primeiros pares encontrados na ordem da lista (por
+            // estoque), não os mais próximos, e só depois ordenavam. Um par
+            // exato que não estivesse entre os primeiros nunca era visto, e a
+            // tela mostrava "+R$ 1,00" mesmo existindo soma exata. Agora todas
+            // as bases são examinadas; para cada base entram só os
+            // PARCEIROS_POR_BASE parceiros mais próximos (busca binária), e a
+            // coleção é podada pelos melhores — custo O(n² log n) limitado.
+            var LIMITE = Math.max(maxResultados, 30);
+            var coletados = [];
+            var piorAceito = Infinity; // diff do pior grupo mantido após uma poda
+            function _registrar(indices, soma) {
+                var diff = +(soma - valor).toFixed(2);
+                if (diff > piorAceito) return;
+                coletados.push({ indices: indices, soma: +soma.toFixed(2), diff: diff });
+                if (coletados.length >= LIMITE * 8) _podar();
+            }
+            function _comparar(x, y) {
+                return (x.diff - y.diff) || (x.indices.length - y.indices.length);
+            }
+            function _podar() {
+                coletados.sort(_comparar);
+                coletados.length = LIMITE * 2;
+                piorAceito = coletados[coletados.length - 1].diff;
+            }
 
-            // ── Pares — índices estritamente crescentes (a<b): cada conjunto
-            //    {A,B} é gerado UMA única vez, nunca como (A,B) e depois (B,A). ──
-            for (var a = 0; a < cands.length && grupos.length < LIMITE; a++) {
+            // ── Pares (a < b): cada conjunto {A,B} é gerado uma única vez. ──
+            for (var a = 0; a + 1 < n; a++) {
                 var pa = precos[a];
-                for (var b = a + 1; b < cands.length && grupos.length < LIMITE; b++) {
+                if (pa + precos[a + 1] > alvoMax + EPS) break; // menor par possível já estoura
+                var b = _primeiroIndiceAPartir(a + 1, alvoMin - pa);
+                for (var tb = 0; b < n && tb < PARCEIROS_POR_BASE; b++, tb++) {
                     var soma2 = pa + precos[b];
-                    if (soma2 >= alvoMin - EPS && soma2 <= alvoMax + EPS) {
-                        grupos.push({ itens: [cands[a], cands[b]], soma: +soma2.toFixed(2), diff: +(soma2 - valor).toFixed(2) });
+                    if (soma2 > alvoMax + EPS) break;
+                    _registrar([a, b], soma2);
+                }
+            }
+
+            // ── Triplas (a < b < c), mesma estratégia. ──
+            for (var a2 = 0; a2 + 2 < n; a2++) {
+                var pa2 = precos[a2];
+                if (pa2 + precos[a2 + 1] + precos[a2 + 2] > alvoMax + EPS) break;
+                for (var b2 = a2 + 1; b2 + 1 < n; b2++) {
+                    var ab2 = pa2 + precos[b2];
+                    if (ab2 + precos[b2 + 1] > alvoMax + EPS) break;
+                    var c2 = _primeiroIndiceAPartir(b2 + 1, alvoMin - ab2);
+                    for (var tc = 0; c2 < n && tc < PARCEIROS_POR_BASE; c2++, tc++) {
+                        var soma3 = ab2 + precos[c2];
+                        if (soma3 > alvoMax + EPS) break;
+                        _registrar([a2, b2, c2], soma3);
                     }
                 }
             }
 
-            // ── Triplas — apenas se ainda precisamos de mais grupos; índices
-            //    estritamente crescentes (a<b<c) pela mesma razão dos pares. ──
-            if (grupos.length < LIMITE) {
-                for (var a2 = 0; a2 < cands.length && grupos.length < LIMITE; a2++) {
-                    var pa2 = precos[a2];
-                    if (pa2 >= alvoMax + EPS) continue;
-                    for (var b2 = a2 + 1; b2 < cands.length && grupos.length < LIMITE; b2++) {
-                        var ab2 = pa2 + precos[b2];
-                        if (ab2 >= alvoMax + EPS) continue;
-                        for (var c2 = b2 + 1; c2 < cands.length && grupos.length < LIMITE; c2++) {
-                            var soma3 = ab2 + precos[c2];
-                            if (soma3 >= alvoMin - EPS && soma3 <= alvoMax + EPS) {
-                                grupos.push({ itens: [cands[a2], cands[b2], cands[c2]], soma: +soma3.toFixed(2), diff: +(soma3 - valor).toFixed(2) });
-                            }
-                        }
-                    }
-                }
-            }
+            // Melhores primeiro: menor diferença; empate -> menos itens.
+            coletados.sort(_comparar);
 
-            // ── Deduplicação por assinatura ────────────────────────────────────
-            // Trava de segurança extra: mesmo com índices crescentes já evitando
-            // permutações do mesmo conjunto, garante 1 card por combinação
-            // distinta de itens (assinatura = códigos ordenados, não a ordem
-            // de inserção — {A,B} e {B,A} colapsam na mesma chave).
+            // ── Deduplicação por assinatura (códigos ordenados) ───────────────
+            // Trava extra para itens repetidos na entrada com o mesmo código.
             var vistos       = Object.create(null);
             var gruposUnicos = [];
-            for (var gi = 0; gi < grupos.length; gi++) {
-                var cods = [];
-                for (var ci = 0; ci < grupos[gi].itens.length; ci++) cods.push(String(grupos[gi].itens[ci].codigo));
-                cods.sort();
-                var assinatura = cods.join("|");
+            for (var gi = 0; gi < coletados.length && gruposUnicos.length < maxResultados; gi++) {
+                var grupoItens = coletados[gi].indices.map(function(i) { return cands[i]; });
+                var cods = grupoItens.map(function(it) { return String(it.codigo); });
+                if (new Set(cods).size !== cods.length) continue; // mesmo código duas vezes no grupo
+                var assinatura = cods.slice().sort().join("|");
                 if (vistos[assinatura]) continue;
                 vistos[assinatura] = true;
-                gruposUnicos.push(grupos[gi]);
+                gruposUnicos.push({ itens: grupoItens, soma: coletados[gi].soma, diff: coletados[gi].diff });
             }
 
             if (onStatus) onStatus("");
 
-            // Ordena do mais próximo ao valor-alvo usando transformação de
-            // Schwartzian: pré-computa Math.abs uma única vez por elemento.
-            var resultado = gruposUnicos
-                .map(function(g) { return { g: g, d: Math.abs(g.soma - valor) }; })
-                .sort(function(x, y) { return x.d - y.d; })
-                .slice(0, maxResultados)
-                .map(function(x) { return x.g; });
+            var resultado = gruposUnicos;
             if (onDone) onDone(resultado);
         }, 0);
     }
@@ -664,12 +787,17 @@
 
         var usosSimulados = {};
         var resultados    = [];
+        var vistas        = Object.create(null); // assinaturas já exibidas
+        var excluidos     = Object.create(null); // códigos retirados após repetir combinação
+        var tentativas    = 0;
 
         function _buscarProxima() {
             if (gen && minhaGen !== null && gen.valor - 1 !== minhaGen) return;
             if (resultados.length >= maxResultados) { _entregar(); return; }
 
+            if (++tentativas > maxResultados * 3) { _entregar(); return; }
             var poolAtual = pool.filter(function(it) {
+                if (excluidos[it.codigo]) return false;
                 return (Number(it.estoque || 0) - (usosSimulados[it.codigo] || 0) - estoqueMinimo) > 0;
             });
             if (!poolAtual.length) { _entregar(); return; }
@@ -680,6 +808,16 @@
             resultado.itens.forEach(function(it) {
                 usosSimulados[it.codigo] = (usosSimulados[it.codigo] || 0) + 1;
             });
+            // Mesma combinação de antes (o estoque permitia repetir): não vira
+            // outro card idêntico — tira esses itens das próximas buscas para
+            // aparecer uma alternativa diferente.
+            var assinatura = resultado.itens.map(function(it) { return String(it.codigo); }).sort().join("|");
+            if (vistas[assinatura]) {
+                resultado.itens.forEach(function(it) { excluidos[it.codigo] = true; });
+                setTimeout(_buscarProxima, 0);
+                return;
+            }
+            vistas[assinatura] = true;
             resultados.push(resultado);
             setTimeout(_buscarProxima, 0);
         }

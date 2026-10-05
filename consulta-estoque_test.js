@@ -5,14 +5,14 @@
  *
  * @author Ruda Gabriel
  *
- * @version 2.6.0
+ * @version 2.7.0
  * @changelog
- *   2.6.0 - 2026-10-05 21:45 - Ajuste ao padrão de fábrica do servidor
- *     (consulta-estoque.js 5.35.0): o teste de proibidos não depende mais de
- *     uma marca embutida — usa um termo configurado via _refazerProibidos(),
- *     como viria do config.json; novo teste garante a lista embutida vazia.
- *     Suíte cobre engine + servidor sem banco, sem porta e sem gravar
- *     arquivos (seguro para o .bat rodar a cada inicialização).
+ *   2.7.0 - 2026-10-05 22:30 - Regressões do Agrupar e do Combinar
+ *     (estoque-engine.js 1.5.0): a soma exata (par ou tripla) precisa vir
+ *     primeiro mesmo quando dezenas de combinações "+R$1,00" aparecem antes
+ *     na lista; resultados em ordem crescente de diferença; o Combinar não
+ *     pode repetir o mesmo card. Suíte cobre engine + servidor sem
+ *     banco, sem porta e sem gravar arquivos.
  *
  * EXECUÇÃO:
  *   node --test consulta-estoque_test.js
@@ -327,6 +327,32 @@ describe("encontrarGruposAsync", () => {
 
 // ── 12. encontrarCombinacoesComRepeticaoAsync ─────────────────────────────────
 describe("encontrarCombinacoesComRepeticaoAsync", () => {
+    test("soma EXATA aparece primeiro mesmo com o par exato no fim da lista", (_, done) => {
+        // Bug real: a busca só enxergava os 30 primeiros itens da lista.
+        const itens = [];
+        for (let i = 0; i < 40; i++) itens.push(item("A" + i, 50.5, 100 - i));
+        itens.push(item("X", 60, 5), item("Y", 40, 5));
+        encontrarCombinacoesComRepeticaoAsync(itens, 100, function(combos) {
+            try {
+                assert.equal(combos[0].diff, 0);
+                assert.deepEqual(combos[0].itens.map(i => i.codigo).sort(), ["X", "Y"]);
+                done();
+            } catch (e) { done(e); }
+        }, {});
+    });
+
+    test("não repete o mesmo card (combinação idêntica)", (_, done) => {
+        const itens = [];
+        for (let i = 0; i < 40; i++) itens.push(item("A" + i, 50.5, 100 - i));
+        encontrarCombinacoesComRepeticaoAsync(itens, 100, function(combos) {
+            try {
+                const assin = combos.map(c => c.itens.map(i => i.codigo).sort().join("|"));
+                assert.equal(new Set(assin).size, assin.length, "há cards repetidos");
+                done();
+            } catch (e) { done(e); }
+        }, {});
+    });
+
     test("encontra combinações com repetição", (_, done) => {
         const pool = [item("A",50,10), item("B",33,10)];
         encontrarCombinacoesComRepeticaoAsync(pool, 100, function(combos) {
@@ -490,6 +516,36 @@ describe("regressão — Agrupar não duplica combinações (pares/triplas)", ()
                 done();
             } catch (e) { done(e); }
         }, null, null, { maxResultados: 50 });
+    });
+
+    test("soma EXATA aparece primeiro mesmo com dezenas de pares +R$1 antes dela na lista", (_, done) => {
+        // Bug real: 40 itens de R$50,50 (mais estoque, vêm primeiro) formam 780
+        // pares de R$101,00; o par exato R$60+R$40 está no fim da lista. A busca
+        // antiga parava nos 30 primeiros pares e mostrava "+R$1,00".
+        const itens = [];
+        for (let i = 0; i < 40; i++) itens.push(item("A" + i, 50.5, 100 - i));
+        itens.push(item("X", 60, 5), item("Y", 40, 5));
+        encontrarGruposAsync(itens, 100, function(grupos) {
+            try {
+                assert.equal(grupos[0].diff, 0);
+                assert.deepEqual(grupos[0].itens.map(i => i.codigo).sort(), ["X", "Y"]);
+                grupos.forEach((g, i) => { if (i) assert.ok(grupos[i - 1].diff <= g.diff, "fora de ordem"); });
+                done();
+            } catch (e) { done(e); }
+        }, null, null, {});
+    });
+
+    test("tripla exata é encontrada mesmo havendo muitos pares acima do alvo", (_, done) => {
+        const itens = [];
+        for (let i = 0; i < 40; i++) itens.push(item("B" + i, 50.5, 100 - i));
+        itens.push(item("T1", 30, 5), item("T2", 30, 5), item("T3", 40, 5));
+        encontrarGruposAsync(itens, 100, function(grupos) {
+            try {
+                assert.equal(grupos[0].diff, 0);
+                assert.deepEqual(grupos[0].itens.map(i => i.codigo).sort(), ["T1", "T2", "T3"]);
+                done();
+            } catch (e) { done(e); }
+        }, null, null, {});
     });
 
     test("nenhum grupo tem mais de 3 itens (fase de subset-sum/DP removida — só pares e triplas)", (_, done) => {
