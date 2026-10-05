@@ -3,46 +3,42 @@
 /**
  * consulta-estoque.js
  *
- * @version 5.32.0
+ * @version 5.33.0
  * @changelog
- *   5.32.0 - 2026-08-29 - Dois pedidos: (1) lista personalizada nunca pode
- *     ter código duplicado; (2) código recém-adicionado + salvo aparecia
- *     como "não existe mais no banco" (falso — sumia sozinho ao reiniciar
- *     pelo .bat, sintoma de dado desatualizado, não de código ausente).
- *
- *     [1] LISTA PERSONALIZADA — DUPLICATA NUNCA MAIS ENTRA
- *         _sanitizarListaPersonalizada() (servidor) agora deduplica por
- *         código, 1ª ocorrência vence — é o ÚNICO ponto de gravação
- *         (POST /api/lista-personalizada), então a garantia vale sempre,
- *         não importa a origem. Também retorna quantos foram removidos por
- *         duplicata vs quantos por exceder o limite de 1000 — motivos
- *         diferentes, nunca misturados numa mensagem só (testado: 1200
- *         códigos únicos sem duplicata nenhuma não deve acusar
- *         "duplicata", e sim "limite excedido"). _parseListaPersonalizadaDetalhada()
- *         (cliente) também deduplica ao ler o texto colado, mesma regra —
- *         defesa em dobro, não só no servidor.
- *
- *     [2] FALSO "NÃO EXISTE MAIS NO BANCO" LOGO APÓS SALVAR — CORRIGIDO
- *         Causa: salvarListaPersonalizada() espera _sincronizarEstoqueTempoReal
- *         recalcular _lpEstoquesReais antes de checar alertas, mas o teto de
- *         espera (SYNC_ESTOQUE_TIMEOUT_MS) era 6s — curto demais no mesmo
- *         ambiente lento já identificado na v5.31.0 (carregarItens() levando
- *         15-20s+). Ao vencer o teto, o código antigo aplicava os dados
- *         (possivelmente ainda os de ANTES do save) e rodava o alerta do
- *         mesmo jeito — um código recém-salvo, ainda fora de
- *         _lpEstoquesReais, virava "não existe mais no banco" (falso).
- *         Corrigido em duas frentes: SYNC_ESTOQUE_TIMEOUT_MS 6s -> 30s
- *         (folga real sobre o ambiente observado); e _aguardarCargaFrescaConcluir
- *         agora informa onPronto(sucesso) — sucesso=true só quando o
- *         servidor confirmou !carregando de verdade. salvarListaPersonalizada()
- *         só roda o alerta quando sucesso=true; se não (banco ainda mais
- *         lento que o esperado), avisa que ainda está sincronizando e tenta
- *         de novo uma vez, 8s depois — nunca mais afirma "não existe" com
- *         base em dado sabidamente desatualizado.
- *
- *     70/70 testes originais passando sem alteração (estoque-engine.js não
- *     foi tocado nesta versão); dedup testado isoladamente em 3 cenários
- *     (só duplicata, só limite, os dois juntos).
+ *   5.33.0 - 2026-10-05 17:30 - Revisão de auditoria (correções de corretude,
+ *     resiliência e testabilidade — sem mudança de layout/fluxo da interface):
+ *     [1] carregarItens(): token de geração por carga. Uma carga que estoura
+ *         CONEXAO_TIMEOUT_MS e termina depois NÃO libera mais o lock nem
+ *         sobrescreve o estado de uma carga mais nova (antes: duas cargas em
+ *         paralelo e lock liberado no meio da segunda). Carga atrasada só
+ *         aplica dados se nenhuma mais nova estiver rodando/já aplicada.
+ *     [2] Pedidos de recarga feitos durante uma carga (salvar lista
+ *         personalizada, salvar config, scan de rede) eram descartados — agora
+ *         ficam pendentes e rodam assim que a carga atual termina.
+ *     [3] Falso "código não existe mais no banco": falha (total ou parcial)
+ *         da consulta da lista personalizada, da query principal ou da
+ *         conexão zerava _lpEstoquesReais e o cliente oferecia "Excluir
+ *         todos". Agora o mapa anterior é preservado e /api/itens informa
+ *         lpConfiavel=false; o cliente não acusa "não existe" sem confirmação.
+ *     [4] Filtro ATIVO usava CAST(... AS VARCHAR(1)) — coluna SITUACAO/STATUS
+ *         com texto ("ATIVO"/"INATIVO") gerava "string right truncation" e
+ *         derrubava a carga inteira. DESCRICAO usa SUBSTRING (mesmo motivo).
+ *     [5] Persistência atômica (arquivo temporário + rename) e serializada de
+ *         usados/lista/config; JSON corrompido é preservado em
+ *         *.corrompido-<timestamp> em vez de ser silenciosamente sobrescrito;
+ *         gravações pendentes são descarregadas no SIGINT/SIGTERM.
+ *     [6] config.json: a correção de "zero à esquerda" só é aplicada se o JSON
+ *         original for inválido (antes corrompia strings como senhas).
+ *     [7] Scan de rede: no máximo um por vez e com intervalo mínimo.
+ *     [8] /api/status usa a config viva; /api/config não devolve mais a senha
+ *         padrão em "defaults"; faixas de porta unificadas.
+ *     [9] /api/itens serializa a lista uma única vez por mudança de estado.
+ *     [10] Cliente: fingerprint inclui ultimaAtualiz (estoque mudava sem
+ *          re-render), respostas fora de ordem descartadas, rajadas de SSE
+ *          agrupadas, mensagem correta quando já há carga em andamento.
+ *     [11] Testabilidade: o servidor só sobe quando executado diretamente
+ *          (require.main === module); helpers puros exportados e cobertos
+ *          por testes (consulta-estoque_test.js).
  *
  * Servidor de relatório de estoque disponível (Firebird + Node.js).
  * NÃO depende de gerar-relatorio-html.js nem servidor-relatorio.js.
@@ -57,15 +53,22 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // DEPENDÊNCIAS
 // ─────────────────────────────────────────────────────────────────────────────
+// Executado direto (node consulta-estoque.js) → sobe o servidor. Importado via
+// require() (testes) → só expõe os helpers puros, sem abrir porta, sem
+// conectar no banco e sem encerrar o processo por falta do node-firebird.
+const EXECUCAO_DIRETA = require.main === module;
+
 let Firebird = null;
 try {
     Firebird = require("node-firebird");
 } catch (e) {
-    process.stderr.write(
-        "[ERRO FATAL] Módulo 'node-firebird' não instalado.\n" +
-        "Execute no terminal: npm install node-firebird\n"
-    );
-    process.exit(1);
+    if (EXECUCAO_DIRETA) {
+        process.stderr.write(
+            "[ERRO FATAL] Módulo 'node-firebird' não instalado.\n" +
+            "Execute no terminal: npm install node-firebird\n"
+        );
+        process.exit(1);
+    }
 }
 
 const fs   = require("fs");
@@ -174,7 +177,12 @@ function identificadorSqlValido(nome) {
 // redirecionar/monitorar erros separadamente do log normal, ex:
 // `node consulta-estoque.js 2>erros.log`). Retrocompatível: chamadas
 // existentes sem o 2º argumento continuam indo para stdout como sempre.
+// Importado como módulo (testes), o log fica mudo para não poluir a saída —
+// CONSULTA_ESTOQUE_LOG=1 reativa quando for preciso depurar um teste.
+const _LOG_SILENCIOSO = !EXECUCAO_DIRETA && process.env.CONSULTA_ESTOQUE_LOG !== "1";
+
 function logTs(msg, nivel) {
+    if (_LOG_SILENCIOSO) return;
     const d = new Date();
     const linha = "[" + p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds()) + "] " +
         String(msg) + "\n";
@@ -201,14 +209,138 @@ function escH(s) {
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
+// ── I/O de JSON persistido (config, usados, lista personalizada) ────────────
+// Parse tolerante: tenta o JSON como está e só aplica a correção legada de
+// "número com zero à esquerda" (ex.: "fbPort": 03050, inválido em JSON) se o
+// original falhar. Aplicar a regex sempre corrompia valores de TEXTO válidos
+// (ex.: senha "abc:0123" virava "abc: 123").
+function _parseJsonTolerante(raw) {
+    const semBom = String(raw).replace(/^﻿/, "");
+    try {
+        return JSON.parse(semBom);
+    } catch (errOriginal) {
+        try {
+            return JSON.parse(semBom.replace(/:\s*0+(\d)/g, ": $1"));
+        } catch (_) {
+            throw errOriginal; // reporta o erro do JSON original, não o da tentativa de correção
+        }
+    }
+}
+
+// Lê um JSON persistido. Retorna undefined se o arquivo não existe. Se existe
+// mas está corrompido, preserva uma cópia (*.corrompido-<timestamp>) ANTES de
+// devolver undefined — sem isso a próxima gravação sobrescreveria o arquivo e
+// o dado original (ex.: todos os "usados") se perderia sem rastro.
+function _lerJsonPersistido(caminho, rotulo) {
+    let raw;
+    try {
+        raw = fs.readFileSync(caminho, "utf8");
+    } catch (e) {
+        if (e.code !== "ENOENT") logErro("ERRO ao ler " + rotulo + " (" + caminho + "): " + e.message);
+        return undefined;
+    }
+    try {
+        return _parseJsonTolerante(raw);
+    } catch (e) {
+        const copia = caminho + ".corrompido-" + Date.now();
+        try { fs.copyFileSync(caminho, copia); } catch (_) { /* melhor esforço */ }
+        logErro("ERRO: " + rotulo + " corrompido (" + e.message + ") — cópia preservada em " + copia +
+                "; seguindo com valores vazios/padrão.");
+        return undefined;
+    }
+}
+
+// Gravação atômica síncrona: escreve num temporário e renomeia por cima, de
+// modo que uma queda no meio nunca deixa o arquivo final pela metade. Se o
+// rename falhar (Windows: arquivo travado por antivírus/indexador), cai para a
+// gravação direta — pior que atômico, mas melhor que perder a alteração.
+function _gravarJsonAtomicoSync(caminho, dados) {
+    const conteudo = JSON.stringify(dados, null, 2);
+    const tmp = caminho + ".tmp-sync";
+    fs.writeFileSync(tmp, conteudo, "utf8");
+    try {
+        fs.renameSync(tmp, caminho);
+    } catch (_) {
+        fs.writeFileSync(caminho, conteudo, "utf8");
+        try { fs.unlinkSync(tmp); } catch (__) { /* melhor esforço */ }
+    }
+}
+
+// Gravador assíncrono com debounce e serializado: nunca há duas gravações do
+// mesmo arquivo ao mesmo tempo (antes, dois fs.writeFile concorrentes podiam
+// intercalar bytes). descarregarSync() garante a última alteração no
+// encerramento do processo (antes, um Ctrl+C dentro da janela de debounce
+// perdia a marcação de "usado" recém-feita).
+function _criarGravadorJson(caminho, rotulo, obterDados, debounceMs) {
+    let timer    = null;
+    let gravando = false;
+    let pendente = false;
+
+    function concluir(e) {
+        gravando = false;
+        if (e) logErro("AVISO " + rotulo + ": falha ao gravar " + caminho + ": " + e.message);
+        if (pendente) { pendente = false; gravarAgora(); }
+    }
+
+    function gravarAgora() {
+        timer = null;
+        if (gravando) { pendente = true; return; }
+        let conteudo;
+        try {
+            conteudo = JSON.stringify(obterDados(), null, 2);
+        } catch (e) {
+            logErro("AVISO " + rotulo + ": falha ao serializar: " + e.message);
+            return;
+        }
+        gravando = true;
+        const tmp = caminho + ".tmp";
+        fs.writeFile(tmp, conteudo, "utf8", errEscrita => {
+            if (errEscrita) { concluir(errEscrita); return; }
+            fs.rename(tmp, caminho, errRename => {
+                if (!errRename) { concluir(null); return; }
+                fs.writeFile(caminho, conteudo, "utf8", errDireto => {
+                    fs.unlink(tmp, () => {});
+                    concluir(errDireto);
+                });
+            });
+        });
+    }
+
+    return {
+        agendar() {
+            clearTimeout(timer);
+            timer = setTimeout(gravarAgora, debounceMs);
+        },
+        descarregarSync() {
+            if (!timer && !gravando && !pendente) return;
+            clearTimeout(timer);
+            timer = null;
+            pendente = false;
+            try {
+                _gravarJsonAtomicoSync(caminho, obterDados());
+            } catch (e) {
+                logErro("ERRO " + rotulo + ": falha na gravação final: " + e.message);
+            }
+        }
+    };
+}
+
+// Lê config.json para MERGE na gravação (preserva campos de outros módulos).
+// Antes, um config.json com zero à esquerda (aceito no boot, mas não aqui)
+// virava {} e a gravação apagava todos os outros campos do arquivo.
+function _lerConfigParaMerge() {
+    const atual = _lerJsonPersistido(CONFIG_PATH, "config.json");
+    return (atual && typeof atual === "object" && !Array.isArray(atual)) ? atual : {};
+}
+
 let cfg = {};
-try {
-    const raw = fs.readFileSync(CONFIG_PATH, "utf8")
-        .replace(/^\uFEFF/, "")             // Remove BOM
-        .replace(/:\s*0+(\d)/g, ": $1");   // Corrige zeros à esquerda em números
-    cfg = JSON.parse(raw);
-} catch (e) {
-    logTs("AVISO: config.json inválido ou ausente — usando padrões.");
+{
+    const lido = _lerJsonPersistido(CONFIG_PATH, "config.json");
+    if (lido && typeof lido === "object" && !Array.isArray(lido)) {
+        cfg = lido;
+    } else {
+        logTs("AVISO: config.json inválido ou ausente — usando padrões.");
+    }
 }
 
 const APP_NAME  = (cfg.appName && String(cfg.appName).trim())
@@ -253,9 +385,18 @@ const _PROIBIDOS_RE = (() => {
     }
 })();
 
+// Faixas de porta — fonte única, usada no boot E na validação de POST /api/config
+// (antes o boot aceitava 1025–65534 e a API 1024–65534; a porta do Firebird
+// ainda exigia >= 1024 na API, recusando portas válidas configuradas no banco).
+const PORTA_HTTP_MIN = 1024;
+const PORTA_MAX      = 65535;
+function _portaValida(p, minimo) {
+    return Number.isInteger(p) && p >= minimo && p <= PORTA_MAX;
+}
+
 const PORTA = (() => {
     const p = parseInt(cfg.portaEstoque || cfg.portaConsulta || "0", 10);
-    return (p > 1024 && p < 65535) ? p : 7888;
+    return _portaValida(p, PORTA_HTTP_MIN) ? p : 7888;
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -407,8 +548,28 @@ async function _escanearSubnet(portaFirebird) {
     return null;
 }
 
-// Chamado no startup (e opcionalmente ao falhar uma conexão): tenta descobrir
-// o host Firebird na rede e atualiza _cfgVivo + config.json automaticamente.
+// Scan de rede: no máximo UM por vez e com intervalo mínimo entre scans. Antes,
+// cada falha de conexão (e o boot sem config.json) disparava um scan de 254
+// hosts — dois ou mais podiam rodar em paralelo e brigar pelo fbHost.
+const SCAN_INTERVALO_MIN_MS = 5 * 60 * 1000;
+let _scanEmAndamento = false;
+let _ultimoScanMs    = 0;
+
+function _agendarScanRede() {
+    if (_scanEmAndamento) return;
+    const agora = Date.now();
+    if (_ultimoScanMs && agora - _ultimoScanMs < SCAN_INTERVALO_MIN_MS) return;
+    _scanEmAndamento = true;
+    _ultimoScanMs    = agora;
+    setImmediate(() => {
+        autoDetectarHost()
+            .catch(e => logErro("ERRO no scan de rede: " + String((e && e.message) || e)))
+            .finally(() => { _scanEmAndamento = false; });
+    });
+}
+
+// Tenta descobrir o host Firebird na rede e atualiza _cfgVivo + config.json.
+// Use _agendarScanRede() em vez de chamar direto (controle de concorrência).
 async function autoDetectarHost() {
     const PORTA_FB = _cfgVivo ? _cfgVivo.fbPort : 3050;
     const hostEncontrado = await _escanearSubnet(PORTA_FB);
@@ -424,19 +585,13 @@ async function autoDetectarHost() {
     if (_cfgVivo) _cfgVivo.fbHost = hostEncontrado;
     // Persiste no config.json para não precisar escanear no próximo startup
     try {
-        let cfgAtual = {};
-        try { cfgAtual = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8").replace(/^\uFEFF/, "")); } catch (_) {}
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(Object.assign({}, cfgAtual, { fbHost: hostEncontrado }), null, 2), "utf8");
+        _gravarJsonAtomicoSync(CONFIG_PATH, Object.assign(_lerConfigParaMerge(), { fbHost: hostEncontrado }));
         logTs("config.json atualizado com fbHost=" + hostEncontrado);
     } catch (e) {
-        logTs("AVISO: falha ao salvar config.json após scan: " + e.message);
+        logErro("AVISO: falha ao salvar config.json ap\u00f3s scan: " + e.message);
     }
-    // Recarrega com o novo host descoberto
-    if (!_loadLock && !_carregando) {
-        setImmediate(function() {
-            carregarItens().catch(function(e) { logErro("ERRO reload pós-scan: " + (e.message || e)); });
-        });
-    }
+    // Recarrega com o novo host (fica pendente se já houver carga em andamento)
+    _solicitarRecarga("scan de rede");
 }
 
 const { host: FDB_HOST, dbPath: FDB_PATH } = detectarFdb();
@@ -462,6 +617,20 @@ let _ultimaAtualiz  = null;
 let _camposLog      = "";
 let _loadLock       = false;            // Previne carregamentos simultâneos
 let _htmlCache      = null;             // Cache do HTML estático — gerado apenas 1 vez
+// ── Controle de concorrência das cargas (ver carregarItens) ──────────────────
+let _cargaGen        = 0;      // geração da carga mais recente INICIADA
+let _genAplicada     = 0;      // geração da última carga cujos dados foram aplicados
+let _recargaPendente = false;  // pedido de recarga recebido durante uma carga
+// ── Confiabilidade de _lpEstoquesReais ───────────────────────────────────────
+// true somente quando a última carga aplicada consultou TODOS os códigos da
+// lista personalizada ATUAL com sucesso. Quando false, um código ausente do
+// mapa significa "não deu pra confirmar", nunca "não existe mais no banco".
+let _lpConfiavel = false;
+let _lpVersao    = 0;          // incrementa a cada gravação da lista personalizada
+// Cache do array "itens" de /api/itens já serializado — invalidado sempre que
+// a fila muda (reordenarFila). Evita refazer map()+stringify de até 20k itens
+// a cada requisição (cada marcação via SSE faz TODAS as abas buscarem a lista).
+let _itensJsonCache = null;
 // ── ESTOQUE ENGINE (embutido) ─────────────────────────────────────────────
 // Antes era lido de estoque-engine.js em runtime via fs.readFileSync — se esse
 // arquivo não fosse copiado junto pro servidor, TODO o Agrupar e o Combinar
@@ -487,7 +656,7 @@ let _catalogoCompleto = [];            // TODOS os itens válidos do banco (sem 
 let _cfgVivo = {
     fbHost:         FDB_HOST,
     fbPath:         FDB_PATH,
-    fbPort:         (() => { const p = parseInt(cfg.fbPort  || String(DEFAULTS.fbPort), 10); return (p > 0 && p < 65535) ? p : DEFAULTS.fbPort; })(),
+    fbPort:         (() => { const p = parseInt(cfg.fbPort  || String(DEFAULTS.fbPort), 10); return _portaValida(p, 1) ? p : DEFAULTS.fbPort; })(),
     fbUser:         (cfg.fbUser     && String(cfg.fbUser).trim())     ? String(cfg.fbUser).trim()     : DEFAULTS.fbUser,
     fbPassword:     (cfg.fbPassword && String(cfg.fbPassword).trim()) ? String(cfg.fbPassword).trim() : DEFAULTS.fbPassword,
     portaEstoque:   PORTA,
@@ -544,27 +713,25 @@ function _refazerProibidos(extras) {
 // PERSISTÊNCIA DOS USADOS
 // ─────────────────────────────────────────────────────────────────────────────
 function carregarUsados() {
-    try {
-        const raw = fs.readFileSync(USADOS_PATH, "utf8").replace(/^\uFEFF/, "");
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr)) {
-            arr.forEach(c => { if (c != null && c !== "") _usados[String(c)] = true; });
-            _usadosCount = Object.keys(_usados).length;
-            logTs("Usados carregados: " + _usadosCount + " item(s).");
-        }
-    } catch (_) { /* arquivo não existe ainda, OK */ }
+    const arr = _lerJsonPersistido(USADOS_PATH, "usados-estoque.json");
+    if (arr === undefined) return; // ausente (1º uso) ou corrompido (já logado e preservado)
+    if (!Array.isArray(arr)) {
+        logErro("AVISO: usados-estoque.json n\u00e3o cont\u00e9m uma lista \u2014 ignorado.");
+        return;
+    }
+    arr.forEach(c => {
+        const cod = String(c == null ? "" : c).trim().slice(0, 50);
+        if (cod) _usados[cod] = true;
+    });
+    _usadosCount = Object.keys(_usados).length;
+    logTs("Usados carregados: " + _usadosCount + " item(s).");
 }
 
-let _salvarTimer = null;
-function salvarUsados() {
-    clearTimeout(_salvarTimer);
-    _salvarTimer = setTimeout(() => {
-        const arr = Object.keys(_usados);
-        fs.writeFile(USADOS_PATH, JSON.stringify(arr, null, 2), "utf8", function(e) {
-            if (e) logTs("AVISO salvarUsados: " + e.message);
-        });
-    }, 600);
-}
+const DEBOUNCE_GRAVACAO_MS = 600;
+const _gravadorUsados = _criarGravadorJson(
+    USADOS_PATH, "salvarUsados", () => Object.keys(_usados), DEBOUNCE_GRAVACAO_MS
+);
+function salvarUsados() { _gravadorUsados.agendar(); }
 
 carregarUsados();
 
@@ -617,27 +784,19 @@ function _sanitizarListaPersonalizada(arr) {
 }
 
 function carregarListaPersonalizada() {
-    try {
-        const raw = fs.readFileSync(LISTA_PERSONALIZADA_PATH, "utf8").replace(/^\uFEFF/, "");
-        const arr = JSON.parse(raw);
-        const resultado = _sanitizarListaPersonalizada(arr);
-        _listaPersonalizada = resultado.itens;
-        logTs("Lista personalizada carregada: " + _listaPersonalizada.length + " c\u00f3digo(s)." +
-              (resultado.duplicatas ? " (" + resultado.duplicatas + " duplicata(s) ignorada(s) no arquivo)" : "") +
-              (resultado.cortados   ? " (" + resultado.cortados   + " ignorado(s) por exceder o limite de " + resultado.limite + ")" : ""));
-    } catch (_) { /* arquivo não existe ainda, OK */ }
+    const arr = _lerJsonPersistido(LISTA_PERSONALIZADA_PATH, "lista-personalizada.json");
+    if (arr === undefined) return; // ausente (1º uso) ou corrompido (já logado e preservado)
+    const resultado = _sanitizarListaPersonalizada(arr);
+    _listaPersonalizada = resultado.itens;
+    logTs("Lista personalizada carregada: " + _listaPersonalizada.length + " c\u00f3digo(s)." +
+          (resultado.duplicatas ? " (" + resultado.duplicatas + " duplicata(s) ignorada(s) no arquivo)" : "") +
+          (resultado.cortados   ? " (" + resultado.cortados   + " ignorado(s) por exceder o limite de " + resultado.limite + ")" : ""));
 }
 
-let _salvarListaTimer = null;
-function salvarListaPersonalizadaDisco() {
-    clearTimeout(_salvarListaTimer);
-    _salvarListaTimer = setTimeout(() => {
-        const dados = _listaPersonalizada;
-        fs.writeFile(LISTA_PERSONALIZADA_PATH, JSON.stringify(dados, null, 2), "utf8", function(e) {
-            if (e) logTs("AVISO salvarListaPersonalizadaDisco: " + e.message);
-        });
-    }, 600);
-}
+const _gravadorLista = _criarGravadorJson(
+    LISTA_PERSONALIZADA_PATH, "salvarListaPersonalizadaDisco", () => _listaPersonalizada, DEBOUNCE_GRAVACAO_MS
+);
+function salvarListaPersonalizadaDisco() { _gravadorLista.agendar(); }
 
 carregarListaPersonalizada();
 
@@ -758,16 +917,13 @@ async function detectarTabelaProduto(db) {
 
     logTs("Candidatas a tabela de produtos: " + (existentes.length ? existentes.join(", ") : "nenhuma"));
 
-    // Valida cada candidata: precisa ter coluna de estoque E de descrição
-    // SmallSoft Small Commerce usa QTD_ATUAL como campo principal de estoque
-    const colsEstoque = [
-        "QTD_ATUAL","QTDATUAL","QTD_ATU",                            // SmallSoft padrao
-        "QTATU","QTATUAL","QTDATUAL2","QTDISPONIVEL","QTESTATU","SALDOATU","SALDOATUAL","ESTOQUEATU",
-        "ESTOQUE","QT_ESTOQUE","QTESTOQUE","SALDO","QTDESTOQUE","QTD_ESTOQUE",
-        "QT","QUANTIDADE","QUANTIDADEATU","QTATU2","QTREAL","ESTOQUEREAL","ESTOQUEEFETIVO"
-    ];
-    const colsDesc    = ["DESCRICAO","NOME","DESCR"];
-    const colsCod     = ["CODIGO","CODPRODUTO","ID","COD"];
+    // Valida cada candidata: precisa ter coluna de estoque E de descrição.
+    // Mesmas listas usadas por _mapearColunas() — antes eram cópias separadas
+    // e divergentes (QTDATUAL2/QTATU2 só existiam aqui): a tabela era aceita na
+    // detecção e depois a carga falhava com "colunas essenciais não encontradas".
+    const colsEstoque = COLUNAS_CANDIDATAS.est;
+    const colsDesc    = COLUNAS_CANDIDATAS.desc;
+    const colsCod     = COLUNAS_CANDIDATAS.cod;
 
     for (const tabela of existentes) {
         const campos = await camposTabela(db, tabela);
@@ -885,536 +1041,444 @@ function reordenarFila() {
         (_usados[item.codigo] ? b : a).push(item);
     }
     _itensOrdenados = a.concat(b);
+    _itensJsonCache = null; // fila (ou flag "usado") mudou — /api/itens re-serializa
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CARREGAR ITENS DO BANCO
+// Dividido em etapas puras (testáveis sem banco) + um orquestrador:
+//   _mapearColunas → _montarSqlPrincipal / _montarSqlListaPersonalizada →
+//   _processarLinhasPrincipais / _reconciliarListaPersonalizada →
+//   _aplicarResultadoCarga.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Candidatos por papel, em ordem de prioridade (SmallSoft/SmallCommerce primeiro).
+const COLUNAS_CANDIDATAS = Object.freeze({
+    cod:   ["CODIGO", "CODPRODUTO", "ID", "COD"],
+    desc:  ["DESCRICAO", "DESCR", "NOME"],
+    est:   ["QTD_ATUAL", "QTDATUAL", "QTD_ATU",
+            "QTATU", "QTATUAL", "QTDISPONIVEL", "QTESTATU", "SALDOATU", "SALDOATUAL", "ESTOQUEATU",
+            "ESTOQUE", "QT_ESTOQUE", "QTESTOQUE", "SALDO", "QTDESTOQUE", "QTD_ESTOQUE",
+            "QT", "QUANTIDADE", "QUANTIDADEATU", "QTREAL", "ESTOQUEREAL", "ESTOQUEEFETIVO"],
+    bar:   ["CODBARRAS", "EAN", "BARRAS", "CODBARRA", "CODEAN", "BARCODE", "EAN13", "REFERENCIA"],
+    prc:   ["PRECO", "PRECO1", "PVENDA", "PRECOVENDA", "PRECO_VENDA", "VAL_VEND", "PRECOUNIT", "PRECOUNITARIO"],
+    ultV:  ["ULT_VENDA", "ULTVENDA", "ULTIMAVENDA", "ULTIMA_VENDA", "DTVENDA", "DT_VENDA", "ULTIMOSAIDA", "ULTIMA_SAIDA"],
+    ativo: ["ATIVO", "ATIVADO", "SITUACAO", "STATUS"]
+});
+
+const SQL_QUERY_PRINCIPAL_TIMEOUT_MS = 120000;
+const LOTE_LP = 400; // tamanho de cada IN(...) da consulta da lista personalizada
+
+function _mapearColunas(campos) {
+    const pick = candidatos => candidatos.find(c => campos.has(c)) || null;
+    const cols = {};
+    for (const papel of Object.keys(COLUNAS_CANDIDATAS)) cols[papel] = pick(COLUNAS_CANDIDATAS[papel]);
+    return cols;
+}
+
+// Expressões SQL compartilhadas pelas duas consultas. Os nomes de coluna vêm
+// de introspecção do schema e já passaram por identificadorSqlValido() — não
+// são entrada HTTP; identificadores não são parametrizáveis no Firebird.
+//
+// DESCRICAO usa SUBSTRING antes do CAST: CAST(col AS VARCHAR(120)) de um texto
+// MAIOR que 120 lança "string right truncation" no Firebird e derruba a carga
+// inteira; SUBSTRING corta sem erro (também funciona com BLOB SUB_TYPE TEXT).
+function _expressoesSql(cols) {
+    return {
+        cod:  "TRIM(CAST(p." + cols.cod + " AS VARCHAR(30)))",
+        desc: "TRIM(CAST(SUBSTRING(p." + cols.desc + " FROM 1 FOR 120) AS VARCHAR(120)))",
+        est:  "CAST(p." + cols.est + " AS DOUBLE PRECISION)",
+        bar:  cols.bar  ? "TRIM(CAST(p." + cols.bar + " AS VARCHAR(60)))" : "CAST('' AS VARCHAR(60))",
+        prc:  cols.prc  ? "CAST(p." + cols.prc + " AS DOUBLE PRECISION)" : "CAST(0.00 AS DOUBLE PRECISION)",
+        ultV: cols.ultV ? "CAST(p." + cols.ultV + " AS DATE)"            : "CAST(NULL AS DATE)",
+        // ATIVO em VARCHAR(255), não VARCHAR(1): colunas SITUACAO/STATUS com
+        // texto ("ATIVO", "INATIVO") estouravam o CAST e a query inteira
+        // falhava. A regra continua sendo igualdade EXATA com a blacklist
+        // (mesma de _valorColunaIndicaInativo) — "INATIVO" não vira "I".
+        ativo: cols.ativo ? "TRIM(CAST(p." + cols.ativo + " AS VARCHAR(255)))" : "CAST(NULL AS VARCHAR(255))"
+    };
+}
+
+function _montarSqlPrincipal(nomTabela, cols) {
+    const ex = _expressoesSql(cols);
+    // Filtro ATIVO por blacklist: exclui apenas marcadores explícitos de
+    // inativo, nunca perde item com ATIVO = 'T', 'A', '1', 'Y' etc.
+    const whereAtivo = cols.ativo
+        ? "AND (p." + cols.ativo + " IS NULL OR " + ex.ativo + " NOT IN (" +
+          ATIVO_VALORES_INATIVOS.map(v => "'" + v + "'").join(", ") + "))"
+        : "";
+    // Só estoque REAL (> 0): itens zerados nunca entram na lista de sugestões.
+    // Zerado/negativado/excluído da lista personalizada é detectado pela
+    // consulta dedicada (_montarSqlListaPersonalizada), que não tem esse filtro.
+    return [
+        "SELECT FIRST " + SQL_LIMIT_BRUTO,
+        "  " + ex.cod  + " AS CODIGO,",
+        "  " + ex.desc + " AS DESCRICAO,",
+        "  " + ex.bar  + " AS CODBARRAS,",
+        "  " + ex.est  + " AS ESTOQUE,",
+        "  " + ex.prc  + " AS PRECO,",
+        "  " + ex.ultV + " AS ULTIMAVENDA",
+        "FROM " + nomTabela + " p",
+        "WHERE " + ex.est + " > 0",
+        whereAtivo,
+        "ORDER BY " + ex.est + " DESC"
+    ].filter(Boolean).join("\n");
+}
+
+// Sem "FIRST n": um mesmo código duplicado no ERP fazia o FIRST cortar linhas
+// de OUTROS códigos do lote. O IN(...) já limita o resultado.
+function _montarSqlListaPersonalizada(nomTabela, cols, qtdParametros) {
+    const ex = _expressoesSql(cols);
+    return [
+        "SELECT",
+        "  " + ex.cod   + " AS CODIGO,",
+        "  " + ex.desc  + " AS DESCRICAO,",
+        "  " + ex.est   + " AS ESTOQUE,",
+        "  " + ex.prc   + " AS PRECO,",
+        "  " + ex.ativo + " AS ATIVO",
+        "FROM " + nomTabela + " p",
+        "WHERE " + ex.cod + " IN (" + new Array(qtdParametros).fill("?").join(",") + ")"
+    ].join("\n");
+}
+
+// Todas as formas de busca de cada código (exata, sem zeros à esquerda,
+// preenchida a 5 dígitos) — coluna numérica no banco perde zeros no CAST, e o
+// usuário pode digitar o código "encurtado". Nada é descartado aqui.
+function _formasBuscaCodigos(lista) {
+    const formas = new Set();
+    for (const lp of lista) {
+        const cod = lp && lp.codigo;
+        if (!cod) continue;
+        formas.add(cod);
+        const semZeros = _normalizarCodigoNumerico(cod);
+        if (semZeros !== null) formas.add(semZeros);
+        const pad5 = _codigoPadrao5Digitos(cod);
+        if (pad5 !== null) formas.add(pad5);
+    }
+    return Array.from(formas);
+}
+
+// Reconcilia as linhas da consulta dedicada com a lista personalizada,
+// indexando SEMPRE pelo código exatamente como está na lista (chave usada pelo
+// cliente). Ordem de tentativa: exata → preenchida a 5 dígitos → sem zeros.
+// Primeira ocorrência de cada código no banco vence.
+function _reconciliarListaPersonalizada(lista, rows, temColunaAtivo) {
+    const porCodigoExato = new Map();
+    const porNormalizado = new Map();
+    const porPadrao5     = new Map();
+    for (const row of rows) {
+        const codDB = String(row.CODIGO || "").trim();
+        if (!codDB || porCodigoExato.has(codDB)) continue;
+        const est  = Number(row.ESTOQUE != null ? row.ESTOQUE : NaN);
+        const prc  = Number(row.PRECO   != null ? row.PRECO   : NaN);
+        const desc = String(row.DESCRICAO || "").trim();
+        const registro = {
+            estoque:   Number.isFinite(est) ? Math.round(est * 1000) / 1000 : null,
+            preco:     Number.isFinite(prc) ? Math.round(prc * 100)  / 100  : null,
+            descricao: desc || null,
+            // null = banco sem coluna de status ("não dá pra verificar"), nunca "inativo"
+            ativo:     temColunaAtivo ? !_valorColunaIndicaInativo(row.ATIVO) : null
+        };
+        porCodigoExato.set(codDB, registro);
+        const norm = _normalizarCodigoNumerico(codDB);
+        if (norm !== null && !porNormalizado.has(norm)) porNormalizado.set(norm, registro);
+        const pad5 = _codigoPadrao5Digitos(codDB);
+        if (pad5 !== null && !porPadrao5.has(pad5)) porPadrao5.set(pad5, registro);
+    }
+    const mapa = Object.create(null);
+    for (const lp of lista) {
+        const cod = lp.codigo;
+        let registro = porCodigoExato.get(cod);
+        if (!registro) {
+            const pad5 = _codigoPadrao5Digitos(cod);
+            if (pad5 !== null) registro = porPadrao5.get(pad5);
+        }
+        if (!registro) {
+            const norm = _normalizarCodigoNumerico(cod);
+            if (norm !== null) registro = porNormalizado.get(norm);
+        }
+        if (registro) mapa[cod] = registro;
+    }
+    return mapa;
+}
+
+// Consulta dedicada da lista personalizada, em lotes. Falha de lote NUNCA
+// derruba a carga principal. Retorna { mapa, completo }:
+//   mapa     — null se NENHUM lote funcionou (nada utilizável);
+//   completo — true só se TODOS os lotes funcionaram (ausência = não existe).
+async function _consultarListaPersonalizada(db, nomTabela, cols, lista) {
+    if (!lista.length) return { mapa: Object.create(null), completo: true };
+    const formas = _formasBuscaCodigos(lista);
+    const linhas = [];
+    let lotes = 0;
+    let lotesComErro = 0;
+    for (let i = 0; i < formas.length; i += LOTE_LP) {
+        const lote = formas.slice(i, i + LOTE_LP);
+        lotes++;
+        const r = await query(db, _montarSqlListaPersonalizada(nomTabela, cols, lote.length), lote, LP_QUERY_TIMEOUT_MS);
+        if (r.e) {
+            lotesComErro++;
+            logErro("ERRO consulta lista personalizada, lote " + lotes + " (não-fatal): " + String(r.e.message || r.e));
+        } else {
+            for (const row of r.rows) linhas.push(row);
+        }
+    }
+    logTs("Lista personalizada: " + formas.length + " forma(s) de código em " + lotes + " lote(s), " +
+          linhas.length + " linha(s) encontrada(s)" + (lotesComErro ? " — " + lotesComErro + " lote(s) falharam" : "") + ".");
+    if (lotesComErro === lotes) return { mapa: null, completo: false };
+    const mapa = _reconciliarListaPersonalizada(lista, linhas, !!cols.ativo);
+    const naoReconciliados = lista.map(lp => lp.codigo).filter(cod => !(cod in mapa));
+    if (naoReconciliados.length) {
+        logTs("Lista personalizada: " + naoReconciliados.length + " de " + lista.length + " código(s) sem correspondência" +
+              (lotesComErro ? " (resultado PARCIAL — não serão acusados como inexistentes)" : "") + ": " +
+              naoReconciliados.slice(0, 20).join(", ") + (naoReconciliados.length > 20 ? "..." : ""));
+    }
+    return { mapa, completo: lotesComErro === 0 };
+}
+
+// Aplica filtros (descrição vazia, proibidos, estoque arredondado <= 0, código
+// vazio/duplicado) e separa acima/abaixo do estoque mínimo. Varre TODAS as
+// linhas para montar o catálogo completo (busca estendida); a lista enviada
+// ao cliente é cortada em maxItens. A query já ordena por estoque DESC, então
+// a concatenação acima+abaixo preserva a ordem.
+function _processarLinhasPrincipais(rows, estoqueMinimo, maxItens) {
+    const itensAcima  = [];
+    const itensAbaixo = [];
+    const codigosVistos = new Set();
+    for (const row of rows) {
+        const desc = String(row.DESCRICAO || "").trim();
+        const cod  = String(row.CODIGO || "").trim();
+        const est  = Number(row.ESTOQUE != null ? row.ESTOQUE : 0);
+        if (!desc || !cod || ehProibido(desc)) continue;
+        // Decide pelo valor JÁ ARREDONDADO (o que o cliente exibe): resíduo de
+        // ponto flutuante (ex.: 0,0004) é "> 0" no SQL mas viraria estoque 0 na tela.
+        if (!Number.isFinite(est)) continue;
+        const estArredondado = Math.round(est * 1000) / 1000;
+        if (estArredondado <= 0) continue;
+        if (codigosVistos.has(cod)) continue;
+        codigosVistos.add(cod);
+        const preco = Number(row.PRECO || 0);
+        const item = {
+            codigo:      cod,
+            descricao:   desc,
+            codbarras:   String(row.CODBARRAS || "").trim(),
+            estoque:     estArredondado,
+            preco:       Number.isFinite(preco) ? Math.round(preco * 100) / 100 : 0,
+            ultimaVenda: row.ULTIMAVENDA ? toISO(row.ULTIMAVENDA) : null
+        };
+        (estArredondado >= estoqueMinimo ? itensAcima : itensAbaixo).push(item);
+    }
+    const catalogo = itensAcima.concat(itensAbaixo);
+    const itens    = catalogo.slice(0, maxItens);
+    const nAcima   = Math.min(itensAcima.length, maxItens);
+    return { catalogo, itens, nAcima, nAbaixo: itens.length - nAcima };
+}
+
+function _conectarFirebird(conf) {
+    return new Promise(resolve => {
+        try {
+            Firebird.attach({
+                host:      conf.fbHost,
+                port:      conf.fbPort,
+                database:  conf.fbPath,
+                user:      conf.fbUser,
+                password:  conf.fbPassword,
+                role:      null,
+                pageSize:  4096,
+                charset:   "UTF8",
+                isolation: Firebird.ISOLATION_READ_COMMITTED
+            }, (err, db) => resolve(err ? { e: err, sincrono: false } : { db }));
+        } catch (e) {
+            // attach() lançou antes do callback (config rejeitada pelo driver)
+            resolve({ e, sincrono: true });
+        }
+    });
+}
+
+function _desconectar(db) {
+    try { db.detach(); } catch (e) { logErro("AVISO detach: " + String((e && e.message) || e)); }
+}
+
+function _mensagemErro(e) { return String((e && e.message) || e); }
+
+// Pede uma recarga: inicia agora se nada estiver carregando; senão marca como
+// pendente e ela roda automaticamente quando a carga atual terminar (antes o
+// pedido era descartado e a config/lista nova só valia no próximo "Atualizar").
+function _solicitarRecarga(motivo) {
+    if (_loadLock) {
+        _recargaPendente = true;
+        logTs("Recarga solicitada (" + motivo + ") durante uma carga — agendada para logo após.");
+        return "agendada";
+    }
+    carregarItens().catch(e => logErro("ERRO recarga (" + motivo + "): " + _mensagemErro(e)));
+    return "iniciada";
+}
+
+// Encerra a carga `gen`: só a carga ATUAL mexe no lock e no erro. Uma carga
+// obsoleta (outra já começou depois dela) não toca em nada.
+function _encerrarCarga(gen, erroMsg) {
+    if (gen !== _cargaGen || !_loadLock) return;
+    if (erroMsg) {
+        _erroConexao = erroMsg;
+        _lpConfiavel = false;
+        logErro("ERRO: " + erroMsg);
+    }
+    _carregando = _loadLock = false;
+    if (_recargaPendente) {
+        _recargaPendente = false;
+        // Síncrono de propósito: carregarItens() religa _carregando antes de
+        // qualquer requisição ser atendida, então nenhum cliente enxerga um
+        // "!carregando" com dados que ainda não refletem o pedido pendente.
+        carregarItens().catch(e => logErro("ERRO recarga pendente: " + _mensagemErro(e)));
+    }
+}
+
+// Carga atual sempre aplica. Carga atrasada (terminou depois do timeout) só
+// aplica se nenhuma carga mais nova estiver rodando nem já tiver aplicado —
+// melhor dado real atrasado do que só a mensagem de timeout.
+function _podeAplicarCarga(gen) {
+    if (gen === _cargaGen) return true;
+    return !_loadLock && gen > _genAplicada;
+}
+
+async function _executarCarga(gen) {
+    // Snapshot: /api/config pode alterar _cfgVivo no meio da carga.
+    const conf = Object.assign({}, _cfgVivo);
+    logTs("Conectando ao banco: " + conf.fbHost + ":" + conf.fbPath);
+
+    const con = await _conectarFirebird(conf);
+    if (con.e) {
+        _encerrarCarga(gen, (con.sincrono ? "Erro ao iniciar conexão: " : "Falha na conexão: ") + _mensagemErro(con.e));
+        if (!con.sincrono) _agendarScanRede();
+        return false;
+    }
+
+    const db = con.db;
+    let resultado = null;
+    let erroMsg   = null;
+    let nomTabela = "";
+    let cols      = null;
+    // Snapshot da lista personalizada: a reconciliação usa exatamente a lista
+    // consultada, mesmo que um POST a substitua no meio da carga.
+    const listaLp  = _listaPersonalizada;
+    const versaoLp = _lpVersao;
+    try {
+        logTs("Conectado! Detectando tabela de produtos no banco...");
+        const detectado = await detectarTabelaProduto(db);
+        if (!detectado) {
+            erroMsg = "Nenhuma tabela de produtos encontrada. Verifique o log acima para ver as tabelas disponíveis.";
+        } else {
+            nomTabela = detectado.nomTabela;
+            cols = _mapearColunas(detectado.campos);
+            const camposLog = [
+                "tabela=" + nomTabela,
+                "COD="    + (cols.cod   || "?"),
+                "DESC="   + (cols.desc  || "?"),
+                "EST="    + (cols.est   || "?"),
+                "BAR="    + (cols.bar   || "-"),
+                "PRECO="  + (cols.prc   || "-"),
+                "ULTV="   + (cols.ultV  || "-"),
+                "ATIVO="  + (cols.ativo || "-")
+            ].join(" | ");
+            if (gen === _cargaGen) _camposLog = camposLog;
+            logTs("Colunas: " + camposLog);
+            if (cols.ativo) logTs("Filtro ATIVO (blacklist " + ATIVO_VALORES_INATIVOS.join("/") + ") na coluna: " + cols.ativo);
+
+            if (!cols.cod || !cols.desc || !cols.est) {
+                erroMsg = "Colunas essenciais (CODIGO, DESCRICAO, ESTOQUE) não encontradas em " + nomTabela +
+                          ". Colunas disponíveis: " + [...detectado.campos].slice(0, 30).join(", ");
+            } else {
+                logTs("Executando consulta de estoque disponível...");
+                const r = await query(db, _montarSqlPrincipal(nomTabela, cols), [], SQL_QUERY_PRINCIPAL_TIMEOUT_MS);
+                if (r.e) {
+                    erroMsg = "Erro na consulta: " + _mensagemErro(r.e);
+                } else {
+                    const lp = await _consultarListaPersonalizada(db, nomTabela, cols, listaLp);
+                    logTs(r.rows.length + " linhas brutas. Filtrando...");
+                    resultado = {
+                        proc: _processarLinhasPrincipais(r.rows, conf.estoqueMinimo, conf.maxItens),
+                        lp
+                    };
+                }
+            }
+        }
+    } catch (e) {
+        erroMsg = "Erro inesperado: " + _mensagemErro(e);
+    } finally {
+        _desconectar(db);
+    }
+
+    if (erroMsg) {
+        _encerrarCarga(gen, erroMsg);
+        return false;
+    }
+    if (!_podeAplicarCarga(gen)) {
+        logTs("Carga #" + gen + " terminou após uma mais nova — resultado descartado.");
+        return false;
+    }
+    _aplicarResultadoCarga(gen, resultado, versaoLp, conf);
+    _encerrarCarga(gen, null);
+    emitirEventoSse("dados", { carregando: _carregando, total: _itensBrutos.length });
+    return true;
+}
+
+function _aplicarResultadoCarga(gen, resultado, versaoLp, conf) {
+    const { proc, lp } = resultado;
+    _genAplicada      = gen;
+    _erroConexao      = null;
+    _catalogoCompleto = proc.catalogo;
+    _itensBrutos      = proc.itens;
+    _itensAbaixoMin   = proc.nAbaixo;
+    _codigosSet       = new Set(proc.itens.map(i => i.codigo));
+    _ultimaAtualiz    = new Date();
+    // Nenhum lote da lista personalizada funcionou → mantém o mapa anterior
+    // (dado real, só mais velho) em vez de zerá-lo.
+    if (lp.mapa) _lpEstoquesReais = lp.mapa;
+    _lpConfiavel = lp.completo && versaoLp === _lpVersao;
+    reordenarFila();
+    logTs(
+        "OK: " + _itensBrutos.length + " itens carregados (estq≥" + conf.estoqueMinimo + ": " + proc.nAcima +
+        (proc.nAbaixo > 0 ? ", abaixo do mínimo: " + proc.nAbaixo : "") +
+        "). Usados na fila: " + _usadosCount + ". Catálogo completo: " + _catalogoCompleto.length + " itens (" +
+        Math.max(0, _catalogoCompleto.length - _itensBrutos.length) + " disponíveis para extensão)."
+    );
+}
+
+// Teto de segurança: nenhuma carga segura o lock por mais que
+// CONEXAO_TIMEOUT_MS (attach + detecção + query principal + lista
+// personalizada, tudo junto — um host em "blackhole" pode nunca chamar o
+// callback do driver). Sempre resolve (true/false), nunca rejeita.
 async function carregarItens() {
     if (_loadLock) {
         logTs("Carregamento já em andamento, ignorando solicitação duplicada.");
         return false;
     }
+    const gen = ++_cargaGen;
     _loadLock    = true;
     _carregando  = true;
     _erroConexao = null;
 
-    logTs("Conectando ao banco: " + _cfgVivo.fbHost + ":" + _cfgVivo.fbPath);
-
-    const tentativaConexao = new Promise(resolve => {
-        // Por que o try/catch aqui (e não só dentro do callback): se
-        // Firebird.attach() lançar uma excecao SINCRONA (antes de invocar o
-        // callback — ex: config malformada rejeitada pelo driver), o callback
-        // abaixo nunca executa e o lock nunca seria liberado, travando todo
-        // carregamento futuro até reiniciar o servidor manualmente. Esta
-        // camada garante que _loadLock/_carregando SEMPRE são liberados e a
-        // Promise SEMPRE resolve (nunca rejeita) — quem chama carregarItens()
-        // não precisa de .catch() pra garantir esse destravamento.
-        try {
-            Firebird.attach({
-                host:      _cfgVivo.fbHost,
-                port:      _cfgVivo.fbPort,
-                database:  _cfgVivo.fbPath,
-                user:      _cfgVivo.fbUser,
-                password:  _cfgVivo.fbPassword,
-                role:      null,
-                pageSize:  4096,
-                charset:   "UTF8",
-                isolation: Firebird.ISOLATION_READ_COMMITTED
-            }, async (err, db) => {
-
-            if (err) {
-                _erroConexao = "Falha na conexão: " + String(err.message || err);
-                _carregando = _loadLock = false;
-                logErro("ERRO: " + _erroConexao);
-                resolve(false);
-                // Agenda scan de rede em background: tenta descobrir um host
-                // Firebird diferente do atual sem travar o fluxo de resolução.
-                setImmediate(function() { autoDetectarHost().catch(function() {}); });
-                return;
+    let timer = null;
+    const timeout = new Promise(resolve => {
+        timer = setTimeout(() => {
+            if (gen === _cargaGen && _loadLock) {
+                _encerrarCarga(gen, "Timeout ao carregar dados do Firebird (" + Math.round(CONEXAO_TIMEOUT_MS / 1000) +
+                    "s) — conexão, detecção de tabela e consultas juntas demoraram mais que isso; " +
+                    "host/porta inacessível OU banco/rede muito lento.");
+                _agendarScanRede();
             }
-
-            logTs("Conectado! Detectando tabela de produtos no banco...");
-
-            try {
-                // Detecta automaticamente qual tabela contém os dados de produtos
-                const detectado = await detectarTabelaProduto(db);
-
-                if (!detectado) {
-                    _erroConexao = "Nenhuma tabela de produtos encontrada. " +
-                        "Verifique o log acima para ver as tabelas disponíveis.";
-                    db.detach();
-                    _carregando = _loadLock = false;
-                    resolve(false);
-                    return;
-                }
-
-                let { nomTabela, campos } = detectado;
-
-                // ── Mapear colunas com fallbacks ───────────────────────────
-                const pick = (...candidates) => candidates.find(c => campos.has(c)) || null;
-
-                const colCod   = pick("CODIGO",     "CODPRODUTO",  "ID",     "COD");
-                const colDesc  = pick("DESCRICAO", "DESCR", "NOME");
-                const colEst   = pick(
-                    "QTD_ATUAL","QTDATUAL","QTD_ATU",                // SmallSoft padrao
-                    "QTATU","QTATUAL","QTDISPONIVEL","QTESTATU","SALDOATU","SALDOATUAL","ESTOQUEATU",
-                    "ESTOQUE","QT_ESTOQUE","QTESTOQUE","SALDO","QTDESTOQUE","QTD_ESTOQUE",
-                    "QT","QUANTIDADE","QUANTIDADEATU","QTREAL","ESTOQUEREAL","ESTOQUEEFETIVO"
-                );
-                const colBar   = pick("CODBARRAS","EAN","BARRAS","CODBARRA","CODEAN","BARCODE","EAN13","REFERENCIA");
-                const colPrc   = pick("PRECO","PRECO1","PVENDA","PRECOVENDA","PRECO_VENDA","VAL_VEND","PRECOUNIT","PRECOUNITARIO");
-                const colUltV  = pick("ULT_VENDA","ULTVENDA","ULTIMAVENDA","ULTIMA_VENDA","DTVENDA","DT_VENDA","ULTIMOSAIDA","ULTIMA_SAIDA");
-                const colAtivo = pick("ATIVO",      "ATIVADO",     "SITUACAO",  "STATUS");
-
-                _camposLog = [
-                    "tabela=" + nomTabela,
-                    "COD="    + (colCod   || "?"),
-                    "DESC="   + (colDesc  || "?"),
-                    "EST="    + (colEst   || "?"),
-                    "BAR="    + (colBar   || "-"),
-                    "PRECO="  + (colPrc   || "-"),
-                    "ULTV="   + (colUltV  || "N/A — filtro de ano desativado"),
-                    "ATIVO="  + (colAtivo || "-")
-                ].join(" | ");
-                logTs("Colunas: " + _camposLog);
-
-                if (!colCod || !colDesc || !colEst) {
-                    const disponiveis = [...campos].slice(0, 30).join(", ");
-                    _erroConexao = "Colunas essenciais (CODIGO, DESCRICAO, ESTOQUE) não encontradas em " +
-                                   nomTabela + ". Colunas disponíveis: " + disponiveis;
-                    db.detach();
-                    _carregando = _loadLock = false;
-                    resolve(false);
-                    return;
-                }
-
-                // ── Montar SQL ─────────────────────────────────────────────
-                const selBar  = colBar
-                    ? "TRIM(CAST(p." + colBar + " AS VARCHAR(60)))"
-                    : "CAST('' AS VARCHAR(60))";
-
-                const selPrc  = colPrc
-                    ? "CAST(p." + colPrc + " AS DOUBLE PRECISION)"
-                    : "CAST(0.00 AS DOUBLE PRECISION)";
-
-                const selUltV = colUltV
-                    ? "CAST(p." + colUltV + " AS DATE)"
-                    : "CAST(NULL AS DATE)";
-
-                // // Filtro de ano REMOVIDO — exibe todos os itens independente de quando foram vendidos
-                const whereAno = "";
-
-                // Filtro ATIVO: exclui apenas valores explicitamente inativos/cancelados.
-                // Usando blacklist em vez de whitelist para não perder itens com
-                // ATIVO = 'T', 'A', '1', 'Y' ou outros valores válidos do banco.
-                let whereAtivo = "";
-                if (colAtivo) {
-                    // Gerado a partir de ATIVO_VALORES_INATIVOS (topo do arquivo) — mesmo
-                    // SQL de antes (N/I/X/F, ANDados), agora com uma única fonte de
-                    // verdade compartilhada com a reconciliação da lista personalizada.
-                    const condsAtivo = ATIVO_VALORES_INATIVOS
-                        .map(v => "CAST(p." + colAtivo + " AS VARCHAR(1)) <> '" + v + "'")
-                        .join(" AND ");
-                    whereAtivo = "AND (p." + colAtivo + " IS NULL OR (" + condsAtivo + "))";
-                    logTs("Filtro ATIVO (blacklist " + ATIVO_VALORES_INATIVOS.join("/") + ") aplicado na coluna: " + colAtivo);
-                }
-
-                // NOTA DE SEGURANÇA (achado #5 da revisão 2026-07-11): os nomes de
-                // coluna/tabela abaixo (colCod, colDesc, colEst, colAtivo, nomTabela)
-                // são interpolados direto na string SQL — o que pareceria SQL
-                // Injection à primeira vista. Não é: eles vêm de introspecção do
-                // schema do banco feita no boot (função pick(), acima), nunca de
-                // request HTTP/entrada do usuário — e identificadores de coluna/
-                // tabela não são parametrizáveis via "?" no Firebird de qualquer
-                // forma (só valores são). Os VALORES desta query (quando existem
-                // parâmetros de usuário) são corretamente parametrizados via
-                // "params" em tx.query() — ver função query() (Firebird, mais acima).
-                // Busca apenas itens com estoque REALMENTE disponível (> 0).
-                // Antes esta query usava ">= 0" e o JS classificava o que ficasse
-                // abaixo do estoqueMinimo como "complemento" para preencher a
-                // lista até maxItens — o efeito colateral era que itens ZERADOS
-                // entravam na lista quando sobrava espaço, violando a regra de
-                // nunca sugerir item sem estoque. Itens negativos já eram
-                // excluídos aqui e continuam sendo.
-                // Observação importante: isto NÃO afeta a detecção de zerado/
-                // negativado da lista personalizada — ela usa uma consulta
-                // dedicada (rLp, logo abaixo), propositalmente SEM filtro de
-                // estoque, exatamente para conseguir distinguir "chegou a zero"
-                // de "negativado" de "não existe mais no banco".
-                const sql = [
-                    "SELECT FIRST " + SQL_LIMIT_BRUTO,
-                    "  TRIM(CAST(p." + colCod  + " AS VARCHAR(30)))  AS CODIGO,",
-                    "  TRIM(CAST(p." + colDesc + " AS VARCHAR(120))) AS DESCRICAO,",
-                    "  "  + selBar  + " AS CODBARRAS,",
-                    "  CAST(p." + colEst + " AS DOUBLE PRECISION)   AS ESTOQUE,",
-                    "  "  + selPrc  + " AS PRECO,",
-                    "  "  + selUltV + " AS ULTIMAVENDA",
-                    "FROM " + nomTabela + " p",
-                    "WHERE CAST(p." + colEst + " AS DOUBLE PRECISION) > 0",
-                    whereAno,
-                    whereAtivo,
-                    "ORDER BY CAST(p." + colEst + " AS DOUBLE PRECISION) DESC"
-                ].join("\n");
-
-                logTs("Executando consulta de estoque disponivel...");
-                const r = await query(db, sql, [], 120000);
-
-                // Consulta DEDICADA aos códigos da lista personalizada, SEM o filtro
-                // "estoque >= 0" da query principal — só assim dá pra diferenciar
-                // "chegou a zero" de "está negativado" (o ERP pode permitir estoque
-                // negativo em alguns fluxos, ex.: venda antes da entrada no sistema)
-                // de "não existe mais no banco" (produto excluído/renomeado). A query
-                // principal, como já filtra >=0, NUNCA vê uma linha com estoque
-                // negativo — pra ela, "negativo" e "excluído" são indistinguíveis
-                // (nenhum dos dois aparece em r.rows). Roda na mesma conexão, antes
-                // do detach; falha aqui NUNCA derruba o carregamento principal —
-                // best-effort, o alerta cai pro fallback "não encontrado" se essa
-                // consulta falhar.
-                //
-                // FIX (2026-07-22): quando a coluna de código é NUMÉRICA no banco
-                // (INTEGER/BIGINT), CAST(...AS VARCHAR) perde zeros à esquerda — um
-                // código cadastrado como "04567" na lista personalizada vira "4567"
-                // ao vir do banco, e a comparação de string exata nunca batia,
-                // fazendo um item que EXISTE e tem estoque aparecer como "excluído
-                // do banco". Agora a consulta busca as DUAS formas (com e sem
-                // zeros à esquerda) e o resultado é reconciliado de volta pro
-                // código exatamente como foi digitado na lista personalizada — ver
-                // _normalizarCodigoNumerico() e o bloco de reconciliação abaixo.
-                let rLp = { e: null, rows: [] };
-                if (!r.e && _listaPersonalizada.length) {
-                    const _lpCodsTodosUnicos = Array.from(new Set(_listaPersonalizada.map(lp => lp.codigo).filter(Boolean)));
-
-                    // Todas as formas de busca (original + sem zeros à esquerda +
-                    // preenchida a 5 dígitos) de TODOS os códigos — sem cortar nada
-                    // aqui. ACHADO (2026-08-29, caso real): um teto fixo de 500
-                    // códigos/1000 formas cortava código silenciosamente em listas
-                    // grandes (ex.: 563 códigos únicos → 63 nunca eram buscados e
-                    // apareciam como "não existe mais no banco" mesmo existindo).
-                    // _sanitizarListaPersonalizada já garante um teto superior
-                    // (MAX_ITENS_LP = 1000 códigos), então o que evita a consulta
-                    // ficar gigante agora é rodar em VÁRIOS lotes menores (abaixo),
-                    // nunca descartar código antes de tentar buscá-lo.
-                    const _lpCodsBusca = new Set();
-                    _lpCodsTodosUnicos.forEach(cod => {
-                        _lpCodsBusca.add(cod);
-                        const semZeros = _normalizarCodigoNumerico(cod);
-                        if (semZeros !== null && semZeros !== cod) _lpCodsBusca.add(semZeros);
-                        const padded5 = _codigoPadrao5Digitos(cod);
-                        if (padded5 !== null && padded5 !== cod) _lpCodsBusca.add(padded5);
-                    });
-                    const _lpCodsArr = Array.from(_lpCodsBusca);
-
-                    // LOTE_LP: tamanho de cada IN(...) — bem abaixo do limite prático
-                    // de parâmetros de uma lista IN no Firebird, com folga generosa.
-                    // Com o teto de 1000 códigos (_sanitizarListaPersonalizada) e até
-                    // 3 formas por código, o pior caso são ~3000 formas ≈ 8 lotes.
-                    const LOTE_LP = 400;
-                    const _lotesLp = [];
-                    for (let _li = 0; _li < _lpCodsArr.length; _li += LOTE_LP) {
-                        _lotesLp.push(_lpCodsArr.slice(_li, _li + LOTE_LP));
-                    }
-
-                    if (_lotesLp.length) {
-                        // Coluna ATIVO também entra nesta consulta dedicada — é a ÚNICA
-                        // forma de saber se um código da lista personalizada está
-                        // marcado como inativo/descontinuado no ERP. A query PRINCIPAL
-                        // já exclui inativos via whereAtivo, então eles nunca aparecem
-                        // em r.rows/_itensBrutos; sem captar ATIVO aqui, um código
-                        // inativo mas com estoque > 0 passava batido como candidato
-                        // válido no Modo Automático — mesmo defeito que o resto desta
-                        // consulta já resolve para zerado/negativado/excluído do banco.
-                        // Se a coluna não existir neste banco (colAtivo === null), vem
-                        // sempre NULL e o cliente trata como "não dá pra verificar"
-                        // (nunca bloqueia por engano — ver _valorColunaIndicaInativo).
-                        const selAtivoLp = colAtivo
-                            ? "TRIM(CAST(p." + colAtivo + " AS VARCHAR(1)))"
-                            : "CAST(NULL AS VARCHAR(1))";
-
-                        const _todasLinhasLp = [];
-                        let _lotesComErro = 0;
-                        for (let _loteIdx = 0; _loteIdx < _lotesLp.length; _loteIdx++) {
-                            const _lote = _lotesLp[_loteIdx];
-                            const sqlLp = [
-                                "SELECT FIRST " + _lote.length,
-                                "  TRIM(CAST(p." + colCod  + " AS VARCHAR(30)))  AS CODIGO,",
-                                "  TRIM(CAST(p." + colDesc + " AS VARCHAR(120))) AS DESCRICAO,",
-                                "  CAST(p." + colEst + " AS DOUBLE PRECISION)   AS ESTOQUE,",
-                                "  "  + selPrc     + " AS PRECO,",
-                                "  "  + selAtivoLp + " AS ATIVO",
-                                "FROM " + nomTabela + " p",
-                                "WHERE TRIM(CAST(p." + colCod + " AS VARCHAR(30))) IN (" + _lote.map(() => "?").join(",") + ")"
-                            ].join("\n");
-                            const _rLote = await query(db, sqlLp, _lote, LP_QUERY_TIMEOUT_MS);
-                            if (_rLote.e) {
-                                _lotesComErro++;
-                                logErro("ERRO consulta lista personalizada, lote " + (_loteIdx + 1) + "/" + _lotesLp.length +
-                                        " (n\u00e3o-fatal, segue com os demais lotes): " + String(_rLote.e.message || _rLote.e));
-                            } else {
-                                for (const _rowLote of _rLote.rows) _todasLinhasLp.push(_rowLote);
-                            }
-                        }
-                        // Só trata como falha TOTAL (bloco de reconciliação abaixo
-                        // inteiro pulado) se TODOS os lotes falharam — um lote com
-                        // erro não pode apagar o resultado, já real e utilizável, dos
-                        // demais lotes que funcionaram.
-                        rLp = {
-                            e: (_lotesComErro === _lotesLp.length) ? new Error(_lotesComErro + " de " + _lotesLp.length + " lote(s) falharam") : null,
-                            rows: _todasLinhasLp
-                        };
-                        // Diagnóstico: sem isto, uma falha de reconciliação (código
-                        // que deveria bater mas não bateu) só aparecia pro usuário
-                        // como "não existe mais no banco" — indistinguível de uma
-                        // consulta que genuinely não achou nada. Este log mostra
-                        // quantas variantes foram buscadas, em quantos lotes, e
-                        // quantas linhas voltaram no total.
-                        logTs("Lista personalizada: " + _lpCodsArr.length + " forma(s) de c\u00f3digo buscada(s) em " +
-                              _lotesLp.length + " lote(s) de at\u00e9 " + LOTE_LP + ", " + _todasLinhasLp.length + " linha(s) encontrada(s)" +
-                              (_lotesComErro ? " \u2014 " + _lotesComErro + " lote(s) falharam" : "") + ".");
-                    }
-                }
-
-                db.detach();
-
-                // _lpEstoquesReais: {codigo: {estoque, descricao, preco, ativo}} — SEMPRE
-                // indexado pelo código EXATAMENTE como está na lista personalizada (é
-                // essa a chave que o cliente usa pra consultar). Reconcilia o
-                // resultado da consulta acima (que pode ter vindo sem zeros à
-                // esquerda, ver FIX 2026-07-22) casando primeiro por igualdade exata
-                // e, se não achar, por forma numérica normalizada. O campo "preco"
-                // (adicionado em 2026-07-22) permite ao Modo Automático montar o pool
-                // de busca da lista personalizada DIRETO daqui, sem depender de
-                // _itens (que é filtrado por proibidos/maxItens/estoqueMinimo) — a
-                // lista personalizada é escolha manual do usuário e não pode ficar
-                // invisível pro próprio Modo Automático por causa de filtros
-                // pensados pra sugestões automáticas.
-                _lpEstoquesReais = Object.create(null);
-                if (!rLp.e) {
-                    const _porCodigoExato  = new Map();
-                    const _porNormalizado  = new Map(); // chave: sem zeros à esquerda
-                    const _porPadrao5      = new Map(); // chave: preenchido com 5 dígitos
-                    for (const row of rLp.rows) {
-                        const codDB = String(row.CODIGO || "").trim();
-                        if (!codDB || _porCodigoExato.has(codDB)) continue; // primeira ocorrência vence
-                        const est  = Number(row.ESTOQUE != null ? row.ESTOQUE : NaN);
-                        const prc  = Number(row.PRECO   != null ? row.PRECO   : NaN);
-                        const desc = String(row.DESCRICAO || "").trim();
-                        // ativo: null quando este banco não tem coluna ATIVO/ATIVADO/
-                        // SITUACAO/STATUS detectável (colAtivo === null) — "não dá pra
-                        // verificar" nunca deve virar "inativo" nem "confirmadamente
-                        // ativo". Só um valor explicitamente na blacklist vira false —
-                        // mesma regra do whereAtivo da query principal (ver
-                        // ATIVO_VALORES_INATIVOS/_valorColunaIndicaInativo, topo do
-                        // arquivo), agora também aplicada aos códigos da lista
-                        // personalizada, que usam esta consulta separada sem esse filtro.
-                        const registro = {
-                            estoque:   Number.isFinite(est) ? Math.round(est * 1000) / 1000 : null,
-                            preco:     Number.isFinite(prc) ? Math.round(prc * 100)  / 100  : null,
-                            descricao: desc || null,
-                            ativo:     colAtivo ? !_valorColunaIndicaInativo(row.ATIVO) : null
-                        };
-                        _porCodigoExato.set(codDB, registro);
-                        const norm = _normalizarCodigoNumerico(codDB);
-                        if (norm !== null && !_porNormalizado.has(norm)) _porNormalizado.set(norm, registro);
-                        const pad5 = _codigoPadrao5Digitos(codDB);
-                        if (pad5 !== null && !_porPadrao5.has(pad5)) _porPadrao5.set(pad5, registro);
-                    }
-                    for (const lp of _listaPersonalizada) {
-                        const cod = lp.codigo;
-                        let registro = _porCodigoExato.get(cod);
-                        if (!registro) {
-                            const pad5 = _codigoPadrao5Digitos(cod);
-                            if (pad5 !== null) registro = _porPadrao5.get(pad5);
-                        }
-                        if (!registro) {
-                            const norm = _normalizarCodigoNumerico(cod);
-                            if (norm !== null) registro = _porNormalizado.get(norm);
-                        }
-                        // Se não achou de nenhuma forma: o código realmente não
-                        // existe no banco — fica de fora de _lpEstoquesReais, e o
-                        // cliente trata isso como "código não existe mais" (correto).
-                        if (registro) _lpEstoquesReais[cod] = registro;
-                    }
-                }
-                // Diagnóstico (fora do "if (!rLp.e)" de propósito — roda mesmo quando
-                // a consulta falhou, pra deixar óbvio que TODOS os códigos ficaram
-                // sem reconciliar por causa do erro acima, e não um por um por engano
-                // de normalização): lista, pelo código exatamente como está salvo na
-                // lista personalizada, quem não bateu em NENHUMA das 3 formas tentadas
-                // (exata / preenchida a 5 dígitos / sem zeros à esquerda). Isso é o
-                // que decide se um código aparece como "não existe mais no banco" no
-                // alerta consolidado — ver _verificarAlertasListaPersonalizada no
-                // cliente.
-                if (_listaPersonalizada.length) {
-                    const _lpNaoReconciliados = _listaPersonalizada
-                        .map(lp => lp.codigo)
-                        .filter(cod => !(cod in _lpEstoquesReais));
-                    if (_lpNaoReconciliados.length) {
-                        logTs(
-                            "Lista personalizada: " + _lpNaoReconciliados.length + " de " + _listaPersonalizada.length +
-                            " c\u00f3digo(s) N\u00c3O reconciliados com o banco (v\u00e3o aparecer como \"n\u00e3o existe mais\"): " +
-                            _lpNaoReconciliados.slice(0, 20).join(", ") + (_lpNaoReconciliados.length > 20 ? "..." : "")
-                        );
-                    }
-                }
-
-                if (r.e) {
-                    _erroConexao = "Erro na consulta: " + String(r.e.message || r.e);
-                    _carregando = _loadLock = false;
-                    logErro("ERRO query: " + _erroConexao);
-                    resolve(false);
-                    return;
-                }
-
-                logTs(r.rows.length + " linhas brutas. Filtrando proibidos (3 fases)...");
-
-                // Prioridade: est >= estoqueMinimo (itensAcima).
-                // Complementa com est < estoqueMinimo (itensAbaixo) quando necessário
-                // para completar a lista enviada ao cliente. Note que itensAbaixo
-                // contém apenas 0 < est < estoqueMinimo: itens ZERADOS não chegam
-                // até aqui (barrados no SQL e na guarda de arredondamento acima),
-                // então "completar a lista" nunca mais recorre a item sem estoque.
-                //
-                // IMPORTANTE: o loop varre TODAS as linhas retornadas pela query (sem
-                // parar em maxItens) para construir o catálogo COMPLETO (_catalogoCompleto),
-                // usado depois pela busca estendida do Modo Automático (ver
-                // /api/buscar-mais-itens). A lista normal enviada ao cliente continua
-                // limitada a maxItens, via slice() mais abaixo — isso não muda.
-                const _estMin     = _cfgVivo.estoqueMinimo;
-                const itensAcima  = [];   // est >= _estMin
-                const itensAbaixo = [];   // est <  _estMin
-                const codigosVistos = new Set();
-
-                for (const row of r.rows) {
-                    const desc = String(row.DESCRICAO || "").trim();
-                    const cod  = String(row.CODIGO || "").trim();
-                    const est  = Number(row.ESTOQUE != null ? row.ESTOQUE : 0);
-
-                    if (!desc) continue;
-                    if (ehProibido(desc)) continue;
-
-                    // Guarda pelo valor JÁ ARREDONDADO, que é o que o cliente
-                    // exibe e usa nos cálculos. O filtro "> 0" do SQL sozinho
-                    // deixaria passar resíduo de ponto flutuante (ESTOQUE é
-                    // DOUBLE PRECISION): um saldo de 0,0004, por exemplo, é
-                    // "> 0" para o banco, mas vira 0 ao ser arredondado para 3
-                    // casas — e apareceria na tela como um item de estoque 0,
-                    // exatamente o sintoma que a regra quer impedir. Arredondar
-                    // ANTES de decidir elimina a divergência entre o que foi
-                    // filtrado e o que é mostrado.
-                    if (!Number.isFinite(est)) continue;
-                    const estArredondado = Math.round(est * 1000) / 1000;
-                    if (estArredondado <= 0) continue;
-                    if (!cod) continue;
-                    if (codigosVistos.has(cod)) continue;
-                    codigosVistos.add(cod);
-
-                    const preco = Number(row.PRECO || 0);
-                    const item = {
-                        codigo:      cod,
-                        descricao:   desc,
-                        codbarras:   String(row.CODBARRAS || "").trim(),
-                        estoque:     estArredondado,
-                        preco:       Math.round(preco  * 100)  / 100,
-                        ultimaVenda: row.ULTIMAVENDA ? toISO(row.ULTIMAVENDA) : null
-                    };
-
-                    if (est >= _estMin) {
-                        itensAcima.push(item);
-                    } else {
-                        itensAbaixo.push(item);
-                    }
-                }
-
-                // Combina: acima do mínimo primeiro, depois os de complemento.
-                // Como a query já ordena por ESTOQUE DESC, todo item de itensAcima
-                // naturalmente vem antes de qualquer item de itensAbaixo — a
-                // concatenação preserva essa ordem sem precisar reordenar.
-                const _nAcima  = Math.min(itensAcima.length, _cfgVivo.maxItens);
-                _catalogoCompleto = itensAcima.concat(itensAbaixo);
-                const itens        = _catalogoCompleto.slice(0, _cfgVivo.maxItens);
-                const _nAbaixo = itens.length - _nAcima;
-                _itensAbaixoMin = _nAbaixo;
-                const _nF1     = itens.length;
-
-                _itensBrutos   = itens;
-                _codigosSet    = new Set(itens.map(i => i.codigo)); // lookup O(1) em marcar-usado
-                _ultimaAtualiz = new Date();
-                reordenarFila();
-                // _lpEstoquesReais já foi calculado acima (consulta dedicada rLp,
-                // antes do db.detach()) — não depende do filtro de proibidos nem do
-                // filtro "estoque >= 0" da query principal, então detecta zerado,
-                // negativado e excluído do ERP corretamente. Ver comentário acima.
-                _carregando = _loadLock = false;
-
-                logTs(
-                    "OK: " + _itensBrutos.length + " itens carregados " +
-                    "(estq\u2265" + _estMin + ": " + _nAcima +
-                    (_nAbaixo > 0 ? ", abaixo do m\u00ednimo: " + _nAbaixo : "") +
-                    "). Usados na fila: " + _usadosCount + ". " +
-                    "Cat\u00e1logo completo: " + _catalogoCompleto.length + " itens (" +
-                    Math.max(0, _catalogoCompleto.length - _itensBrutos.length) + " dispon\u00edveis para extens\u00e3o)."
-                );
-                if (!colUltV) {
-                    logTs("AVISO: ULTIMAVENDA não encontrada — itens NÃO foram filtrados por ano de venda.");
-                }
-                resolve(true);
-                // Notifica todos os clientes SSE que o catálogo foi atualizado
-                emitirEventoSse("dados", { carregando: false, total: _itensBrutos.length });
-
-            } catch (e) {
-                _erroConexao = "Erro inesperado: " + String(e.message || e);
-                try { db.detach(); } catch (_) {}
-                _carregando = _loadLock = false;
-                logErro("ERRO inesperado: " + _erroConexao);
-                resolve(false);
-            }
-            });
-        } catch (e) {
-            // Firebird.attach() lançou antes de chamar o callback (config
-            // inválida rejeitada pelo driver, etc.) — libera o lock mesmo assim.
-            _erroConexao = "Erro ao iniciar conexão: " + String(e.message || e);
-            _carregando = _loadLock = false;
-            logErro("ERRO: " + _erroConexao);
-            resolve(false);
-        }
-    });
-
-    // ── Teto de segurança: carregarItens() nunca trava o servidor pra sempre ───
-    // achado #B da revisão 2026-08-06: o try/catch acima só protege contra uma
-    // exceção SÍNCRONA de attach() — se o host estiver inacessível de um jeito
-    // que nem erro nem callback disparam (blackhole de rede, firewall que
-    // descarta pacotes em silêncio), o driver pode nunca chamar o callback.
-    // Nesse cenário _loadLock ficava travado em "true" para sempre, e todo
-    // carregamento futuro (poll, botão "Atualizar", SSE) era silenciosamente
-    // ignorado sem nenhum log de erro — o único jeito de recuperar era
-    // reiniciar o processo manualmente. Promise.race garante uma resposta
-    // (sucesso ou timeout) em no máximo CONEXAO_TIMEOUT_MS.
-    //
-    // IMPORTANTE (corrigido 2026-08-29, achado num caso real): este teto NÃO
-    // cobre só o attach() — cobre TODO o callback dele, ou seja, attach() +
-    // detecção de tabela + a query principal + a consulta da lista
-    // personalizada, tudo junto. Por isso a mensagem abaixo fala em "carregar
-    // dados", não em "conectar": um banco lento (não inacessível) pode
-    // estourar este teto mesmo com o attach() tendo funcionado perfeitamente.
-    // Se o carregamento "atrasado" eventualmente terminar depois do timeout já
-    // ter liberado o lock, ele ainda roda até o fim (best-effort: os dados
-    // chegam mais tarde em vez de se perderem) — só não é mais o resultado que
-    // esta chamada específica devolve a quem esperou por ela.
-    const timeoutConexao = new Promise(resolve => {
-        setTimeout(() => {
-            if (!_loadLock) return; // já resolveu pela via normal — nada a fazer aqui
-            _erroConexao = "Timeout ao carregar dados do Firebird (" +
-                Math.round(CONEXAO_TIMEOUT_MS / 1000) + "s) — conexão, detecção de tabela e consulta " +
-                "principal juntas demoraram mais que isso; host/porta inacessível OU banco/rede muito lento.";
-            _carregando = _loadLock = false;
-            logErro("ERRO: " + _erroConexao);
-            setImmediate(function() { autoDetectarHost().catch(function() {}); });
             resolve(false);
         }, CONEXAO_TIMEOUT_MS);
     });
-
-    return Promise.race([tentativaConexao, timeoutConexao]);
+    const execucao = _executarCarga(gen).catch(e => {
+        _encerrarCarga(gen, "Erro inesperado: " + _mensagemErro(e));
+        return false;
+    });
+    try {
+        return await Promise.race([execucao, timeout]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1442,7 +1506,7 @@ function gerarHTML() {
         estoqueMinimo:      _cfgVivo.estoqueMinimo,
         proibidosEmbutidos: PROIBIDOS_EMBUTIDOS,
         proibidosExtra:     _cfgVivo.proibidosExtra || []
-    }).replace(/<\//g, "<\\/");
+    }).replace(/</g, "\\u003c"); // cobre "</script" e "<!--" (só ocorre dentro de strings JSON)
 
     // achado #E da revisão 2026-08-06: mesma proteção de serverCfg (acima),
     // agora também aplicada ao código do engine embutido. _ENGINE_SRC é
@@ -2252,6 +2316,8 @@ var _S = ${serverCfg};
 
 // ── Estado do cliente ────────────────────────────────────────────────────────
 var _itens   = [];   // Todos os itens recebidos do servidor
+var _lpConfiavel = false; // espelha lpConfiavel do servidor (ver _verificarAlertasListaPersonalizada)
+var _carregarSeq = 0;     // descarta respostas de /api/itens que chegam fora de ordem
 var _lpEstoquesReais = Object.create(null); // {codigo: {estoque, descricao}} — dados REAIS dos códigos
                             // da lista personalizada, vindo do servidor sem o corte de
                             // maxItens/estoqueMinimo/proibidos (ver /api/itens → lpEstoquesReais).
@@ -2608,9 +2674,11 @@ function apiFetch(url, opts) {
 
 // ── Carregar itens do servidor ─────────────────────────────────────────────
 function carregarItens() {
+    var seq = ++_carregarSeq;
     _ldg = true;
     renderTabela();
     apiFetch("/api/itens").then(function(dados) {
+        if (seq !== _carregarSeq) return; // resposta obsoleta: uma chamada mais nova já assumiu
         _ldg = false;
         if (!dados) {
             _erroCli = "Sem resposta do servidor local.";
@@ -2647,7 +2715,10 @@ function carregarItens() {
                 if (dados.itens[_fi].usado) usadosCount++;
             }
         }
-        var fp = (dados.total || 0) + '|' + usadosCount + '|' + _limiteItens;
+        // ultimaAtualiz entra no fingerprint: após "Atualizar", o estoque de um
+        // item pode mudar sem alterar total/usados — sem ela a tabela seguia
+        // exibindo os números antigos.
+        var fp = (dados.ultimaAtualiz || '') + '|' + (dados.total || 0) + '|' + usadosCount + '|' + _limiteItens;
         if (fp === _dadosFingerprint && _itens.length > 0) {
             return; // dados idênticos — nada a re-renderizar (a checagem da lista
                      // personalizada acima já rodou com os dados mais recentes)
@@ -3233,7 +3304,7 @@ function atualizarBanco() {
     toast("Recarregando dados do banco...", 3500);
     apiFetch("/api/atualizar", { method: "POST" }).then(function(r) {
         if (!r || !r.ok) {
-            toast("Falha ao solicitar atualizacao.", 2500);
+            toast((r && r.erro) ? r.erro : "Falha ao solicitar atualiza\u00e7\u00e3o.", 2500);
             if (btn) btn.disabled = false;
             return;
         }
@@ -4070,6 +4141,10 @@ function _verificarAlertasListaPersonalizada() {
         // pra qualquer situação:
         var motivo = null;
         if (!temReal) {
+            // Sem confirmação do servidor (consulta falhou/parcial ou lista
+            // mudou depois da última carga), ausência NÃO prova inexistência —
+            // acusar aqui levava o usuário a "Excluir todos" códigos válidos.
+            if (!_lpConfiavel) continue;
             motivo = 'o c\u00f3digo n\u00e3o existe mais no banco (foi exclu\u00eddo ou renomeado no ERP)';
         } else if (lpReal.ativo === false) {
             // lpReal.ativo só é boolean quando o banco tem coluna ATIVO/ATIVADO/
@@ -4661,6 +4736,7 @@ var SYNC_ESTOQUE_MAX_TENTATIVAS = Math.ceil(SYNC_ESTOQUE_TIMEOUT_MS / SYNC_ESTOQ
 
 function _aplicarDadosItensFrescos(dados) {
     _lpEstoquesReais = dados.lpEstoquesReais || _lpEstoquesReais;
+    _lpConfiavel     = dados.lpConfiavel !== false; // servidor antigo (sem o campo) = comportamento anterior
     _itens = (Array.isArray(dados.itens) ? dados.itens : []).slice(0, _limiteItens).map(function(it) {
         it._descUp = it.descricao ? it.descricao.toUpperCase()         : '';
         it._codUp  = it.codigo    ? String(it.codigo).toUpperCase()    : '';
@@ -5797,9 +5873,10 @@ document.addEventListener("DOMContentLoaded", function() {
                     clearTimeout(_pollT);
                     _pollT = setTimeout(carregarItens, POLL_INTERVALO_MS);
                 } else {
-                    // Dados mudaram — recarrega imediatamente sem poll periódico
+                    // Dados mudaram — agrupa rajadas (ex.: "Usar" num grupo marca
+                    // N itens = N eventos) numa única busca de /api/itens.
                     clearTimeout(_pollT);
-                    carregarItens();
+                    _pollT = setTimeout(carregarItens, 150);
                 }
             } catch (_) {}
         });
@@ -5828,7 +5905,11 @@ document.addEventListener("DOMContentLoaded", function() {
 }
 
 // Aquece o cache do HTML logo após o startup (antes da 1ª requisição)
-setImmediate(function() { try { gerarHTML(); } catch (_) {} });
+if (EXECUCAO_DIRETA) {
+    setImmediate(function() {
+        try { gerarHTML(); } catch (e) { logErro("ERRO ao gerar HTML no boot: " + _mensagemErro(e)); }
+    });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPER: ler body da requisição HTTP com limite de tamanho
@@ -5970,15 +6051,7 @@ async function handleBuscarMaisItens(req, res, json, erro) {
 
     const inicio = Math.min(offsetPedido, _catalogoCompleto.length);
     const fim    = Math.min(inicio + LIMITE_SESSAO_BUSCA, _catalogoCompleto.length);
-    const lote   = _catalogoCompleto.slice(inicio, fim).map(item => ({
-        codigo:      item.codigo,
-        descricao:   item.descricao,
-        codbarras:   item.codbarras,
-        estoque:     item.estoque,
-        preco:       item.preco,
-        ultimaVenda: item.ultimaVenda,
-        usado:       !!_usados[item.codigo]
-    }));
+    const lote   = _catalogoCompleto.slice(inicio, fim).map(_itemParaCliente);
     logTs("Busca estendida: sess\u00e3o serviu " + lote.length + " item(ns) (\u00edndices " +
           inicio + "\u2013" + (fim - 1) + " de " + _catalogoCompleto.length + ", offset pedido=" + offsetPedido + ").");
     json({
@@ -5990,8 +6063,8 @@ async function handleBuscarMaisItens(req, res, json, erro) {
     });
 }
 
-async function handleGetItens(req, res, json, erro) {
-    const itens = _itensOrdenados.map(item => ({
+function _itemParaCliente(item) {
+    return {
         codigo:      item.codigo,
         descricao:   item.descricao,
         codbarras:   item.codbarras,
@@ -5999,21 +6072,29 @@ async function handleGetItens(req, res, json, erro) {
         preco:       item.preco,
         ultimaVenda: item.ultimaVenda,
         usado:       !!_usados[item.codigo]
-    }));
-    json({
-        ok:             true,
-        carregando:     _carregando,
-        erro:           _erroConexao,
-        total:          _itensBrutos.length,
-        totalUsados:    _usadosCount,
-        itensAbaixoMin: _itensAbaixoMin,
-        estoqueMinimo:  _cfgVivo.estoqueMinimo,
-        ultimaAtualiz:  _ultimaAtualiz ? _ultimaAtualiz.toISOString() : null,
-        camposLog:      _camposLog,
-        anoAtual:       ANO_ATUAL,
+    };
+}
+
+async function handleGetItens(req, res, json, erro) {
+    if (_itensJsonCache === null) _itensJsonCache = JSON.stringify(_itensOrdenados.map(_itemParaCliente));
+    const meta = JSON.stringify({
+        ok:              true,
+        carregando:      _carregando,
+        erro:            _erroConexao,
+        total:           _itensBrutos.length,
+        totalUsados:     _usadosCount,
+        itensAbaixoMin:  _itensAbaixoMin,
+        estoqueMinimo:   _cfgVivo.estoqueMinimo,
+        ultimaAtualiz:   _ultimaAtualiz ? _ultimaAtualiz.toISOString() : null,
+        camposLog:       _camposLog,
+        anoAtual:        ANO_ATUAL,
         lpEstoquesReais: _lpEstoquesReais,
-        itens
+        // false = códigos ausentes de lpEstoquesReais NÃO foram confirmados
+        // como inexistentes (consulta falhou/parcial ou lista mudou depois).
+        lpConfiavel:     _lpConfiavel
     });
+    // Anexa o array já serializado (cacheado) ao objeto de metadados.
+    json(meta.slice(0, -1) + ',"itens":' + _itensJsonCache + "}");
 }
 
 async function handleMarcarUsado(req, res, json, erro) {
@@ -6075,6 +6156,9 @@ async function handlePostListaPersonalizada(req, res, json, erro) {
 
     const resultadoSanitizado = _sanitizarListaPersonalizada(parsed.itens);
     _listaPersonalizada = resultadoSanitizado.itens;
+    // A lista mudou: o mapa atual não cobre (ainda) os códigos novos.
+    _lpVersao++;
+    _lpConfiavel = false;
     salvarListaPersonalizadaDisco();
     logTs("Lista personalizada salva: " + _listaPersonalizada.length + " c\u00f3digo(s)." +
           (resultadoSanitizado.duplicatas ? " (" + resultadoSanitizado.duplicatas + " duplicata(s) removida(s))" : "") +
@@ -6103,11 +6187,9 @@ async function handlePostListaPersonalizada(req, res, json, erro) {
     // acontecia, o que confundia (parecia ser passageiro sem motivo claro).
     // Dispara em background (não atrasa a resposta desta requisição, que já
     // foi enviada acima) — mesmo padrão do /api/atualizar.
-    if (!_loadLock && !_carregando) {
-        setImmediate(() => {
-            carregarItens().catch(e => logErro("ERRO refresh p\u00f3s-lista-personalizada: " + (e.message || e)));
-        });
-    }
+    // Se já houver carga em andamento ela usou a lista ANTERIOR — fica
+    // pendente e roda logo em seguida (antes o pedido era descartado).
+    _solicitarRecarga("lista personalizada salva");
 }
 
 async function handlePostAtualizar(req, res, json, erro) {
@@ -6115,11 +6197,11 @@ async function handlePostAtualizar(req, res, json, erro) {
         json({ ok: false, erro: "Já em carregamento. Aguarde." });
         return;
     }
-    json({ ok: true, mensagem: "Iniciando atualização..." });
-    // Executa em background (não bloqueia a resposta)
-    setImmediate(() => {
-        carregarItens().catch(e => logErro("ERRO /api/atualizar: " + (e.message || e)));
-    });
+    // Inicia ANTES de responder: carregarItens() liga _carregando de forma
+    // síncrona, então o poll seguinte do cliente nunca vê "!carregando" com os
+    // dados antigos (o que a sincronização do Modo Automático trataria como frescos).
+    carregarItens().catch(e => logErro("ERRO /api/atualizar: " + _mensagemErro(e)));
+    json({ ok: true, mensagem: "Iniciando atualiza\u00e7\u00e3o..." });
 }
 
 async function handleGetStatus(req, res, json, erro) {
@@ -6132,7 +6214,7 @@ async function handleGetStatus(req, res, json, erro) {
         ultimaAtualiz: _ultimaAtualiz ? _ultimaAtualiz.toISOString() : null,
         anoAtual:     ANO_ATUAL,
         porta:        PORTA,
-        banco:        FDB_HOST + ":" + FDB_PATH,
+        banco:        _cfgVivo.fbHost + ":" + _cfgVivo.fbPath, // config VIVA (antes: valor do boot)
         camposLog:    _camposLog
     });
 }
@@ -6156,7 +6238,8 @@ async function handleGetConfig(req, res, json, erro) {
         estoqueMinimo:      _cfgVivo.estoqueMinimo,
         maxItens:           _cfgVivo.maxItens,
         proibidosEmbutidos: PROIBIDOS_EMBUTIDOS,
-        defaults: DEFAULTS
+        // Mesma regra de senhaConfigurada: nenhuma senha sai pela API, nem a padrão.
+        defaults: Object.assign({}, DEFAULTS, { fbPassword: undefined })
     });
 }
 
@@ -6172,14 +6255,14 @@ async function _lerEValidarPayloadConfig(req, erro) {
     try { parsed = JSON.parse(body); } catch (_) { erro("JSON inválido.", 400); return null; }
     if (!parsed || typeof parsed !== "object") { erro("Payload inválido.", 400); return null; }
 
-    const novaPortaFb   = parseInt(parsed.fbPort       || "3050", 10);
+    const novaPortaFb   = parseInt(parsed.fbPort       || String(DEFAULTS.fbPort), 10);
     const novaPortaHttp = parseInt(parsed.portaEstoque || String(PORTA), 10);
     const novoEstMin    = parsed.estoqueMinimo != null ? parseFloat(parsed.estoqueMinimo) : _cfgVivo.estoqueMinimo;
     const novoMaxItens  = parsed.maxItens      != null ? parseInt(parsed.maxItens, 10)    : _cfgVivo.maxItens;
-    if (isNaN(novaPortaFb)   || novaPortaFb   < 1024 || novaPortaFb   > 65534) { erro("fbPort inválida (1024–65534).", 400); return null; }
-    if (isNaN(novaPortaHttp) || novaPortaHttp < 1024 || novaPortaHttp > 65534) { erro("portaEstoque inválida (1024–65534).", 400); return null; }
-    if (isNaN(novoEstMin)    || novoEstMin    < 0     || novoEstMin    > 9999)  { erro("estoqueMinimo inválido (0–9999).", 400); return null; }
-    if (isNaN(novoMaxItens)  || novoMaxItens  < 100   || novoMaxItens  > MAX_ITENS_TETO)  { erro("maxItens inválido (100–" + MAX_ITENS_TETO + ").", 400); return null; }
+    if (!_portaValida(novaPortaFb, 1))                { erro("fbPort inv\u00e1lida (1\u2013" + PORTA_MAX + ").", 400); return null; }
+    if (!_portaValida(novaPortaHttp, PORTA_HTTP_MIN)) { erro("portaEstoque inv\u00e1lida (" + PORTA_HTTP_MIN + "\u2013" + PORTA_MAX + ").", 400); return null; }
+    if (!Number.isFinite(novoEstMin) || novoEstMin < 0 || novoEstMin > 9999)  { erro("estoqueMinimo inválido (0–9999).", 400); return null; }
+    if (!Number.isInteger(novoMaxItens) || novoMaxItens < 100 || novoMaxItens > MAX_ITENS_TETO)  { erro("maxItens inválido (100–" + MAX_ITENS_TETO + ").", 400); return null; }
 
     let novosProibExtra = [];
     const rawProb = String(parsed.proibidosExtra || "").trim();
@@ -6222,13 +6305,7 @@ function _detectarMudancasConfig(novo) {
 // Persiste em config.json, preservando campos de outros módulos que não
 // passam por esta tela (merge sobre o arquivo existente, não substituição).
 function _persistirConfig(novo) {
-    let cfgAtual = {};
-    try {
-        const rawCfg = fs.readFileSync(CONFIG_PATH, "utf8").replace(/^\uFEFF/, "");
-        cfgAtual = JSON.parse(rawCfg);
-    } catch (_) { /* não existe ainda — começa do zero */ }
-
-    const cfgNovo = Object.assign({}, cfgAtual, {
+    const cfgNovo = Object.assign(_lerConfigParaMerge(), {
         appName:        novo.appName,
         fbHost:         novo.fbHost,
         fbPort:         novo.fbPort,
@@ -6241,7 +6318,7 @@ function _persistirConfig(novo) {
         proibidos:      novo.proibidosExtra
     });
 
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfgNovo, null, 2), "utf8"); // pode lançar — chamador trata
+    _gravarJsonAtomicoSync(CONFIG_PATH, cfgNovo); // pode lançar — chamador trata
 }
 
 async function handlePostConfig(req, res, json, erro) {
@@ -6274,33 +6351,17 @@ async function handlePostConfig(req, res, json, erro) {
     // Reconstrói regex de proibidos se a lista mudou
     if (mud.probMudou) _refazerProibidos(novo.proibidosExtra);
 
-    // Recarrega dados do banco se conexão, proibidos, estoque mínimo ou maxItens mudaram.
-    // achado de auditoria: a mensagem de resposta ("Dados recarregados do
-    // banco.") era adicionada sempre que precisaRecarregar era true, mesmo
-    // nos casos em que o recarregamento era pulado por já haver um em
-    // andamento (!_loadLock) — o usuário via "recarregado" quando, na
-    // prática, nada novo tinha sido dado ao carregarItens() em andamento (que
-    // já havia lido a config ANTERIOR ao conectar). recarregouAgora reflete
-    // com precisão qual dos dois casos realmente aconteceu.
+    // Recarrega dados do banco se conexão, proibidos, estoque mínimo ou maxItens
+    // mudaram. Com carga em andamento (que leu a config ANTERIOR), a recarga
+    // fica pendente e roda sozinha em seguida.
     const precisaRecarregar = mud.dbMudou || mud.probMudou || mud.estMinMudou || mud.maxItensMudou;
-    let recarregouAgora = false;
-    if (precisaRecarregar) {
-        if (!_loadLock) {
-            recarregouAgora = true;
-            logTs("Config alterado — recarregando itens em background...");
-            setImmediate(() => carregarItens().catch(e => logErro("ERRO reload pós-config: " + (e.message || e))));
-        } else {
-            logTs("Config alterado, mas já há um carregamento em andamento — as novas configurações " +
-                  "só valem a partir do PRÓXIMO carregamento (clique em 'Atualizar' se precisar agora).");
-        }
-    }
-
     const msgs = [];
-    if (recarregouAgora) {
-        msgs.push("Dados recarregados do banco.");
-    } else if (precisaRecarregar) {
-        msgs.push("Configurações salvas — um carregamento já estava em andamento; " +
-                   "clique em 'Atualizar' se quiser aplicar agora.");
+    if (precisaRecarregar) {
+        logTs("Config alterado \u2014 solicitando recarga dos itens...");
+        const situacao = _solicitarRecarga("config alterado");
+        msgs.push(situacao === "iniciada"
+            ? "Dados sendo recarregados do banco."
+            : "Configura\u00e7\u00f5es salvas \u2014 ser\u00e3o aplicadas automaticamente assim que o carregamento em andamento terminar.");
     }
     if (reiniciarNecessario) {
         msgs.push("Reinicie o servidor para aplicar: " +
@@ -6411,52 +6472,92 @@ const server = http.createServer(async (req, res) => {
     }
 });
 
-server.on("error", err => {
-    if (err.code === "EADDRINUSE") {
-        logErro("ERRO: Porta " + PORTA + " já está em uso.");
-        logTs("Adicione 'portaEstoque': XXXX no config.json para usar outra porta.");
-    } else {
-        logErro("ERRO no servidor: " + (err.message || err));
-    }
-    process.exit(1);
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// ENCERRAMENTO E ERROS GLOBAIS
+// ─────────────────────────────────────────────────────────────────────────────
+// Grava de forma síncrona o que ainda estiver no debounce antes de sair.
+function _encerrarProcesso(motivo, codigo) {
+    logTs("Encerrando servidor (" + motivo + ")...");
+    _gravadorUsados.descarregarSync();
+    _gravadorLista.descarregarSync();
+    process.exit(codigo);
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TRATAMENTO DE ERROS GLOBAIS
-// ─────────────────────────────────────────────────────────────────────────────
-process.on("uncaughtException",  e => logTs("[UNCAUGHT] " + String(e && (e.stack || e))));
-process.on("unhandledRejection", r => logTs("[REJECTION] " + String(r  && (r.stack  || r))));
-process.on("SIGINT",  () => { logTs("Encerrando servidor."); process.exit(0); });
-process.on("SIGTERM", () => { logTs("Encerrando servidor."); process.exit(0); });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// INICIAR
-// ─────────────────────────────────────────────────────────────────────────────
-server.listen(PORTA, "0.0.0.0", () => {
-    logTs("══════════════════════════════════════════════════");
-    logTs(APP_NAME + " — Consulta de Estoque Disponivel");
-    logTs("Acesse: http://localhost:" + PORTA);
-    logTs("Banco:  " + FDB_HOST + ":" + FDB_PATH);
-    logTs("Ano:    sem filtro de ano (todos os itens com estoque > 0)");
-    logTs("Limite: " + _cfgVivo.maxItens + " itens | Proibidos: " + PROIBIDOS.length + " termos");
-    logTs("══════════════════════════════════════════════════");
-
-    // Carregamento inicial
-    carregarItens().then(ok => {
-        if (ok) {
-            logTs("Pronto! " + _itensBrutos.length + " item(s) disponíveis na interface.");
+function iniciarServidor() {
+    server.on("error", err => {
+        if (err.code === "EADDRINUSE") {
+            logErro("ERRO: Porta " + PORTA + " j\u00e1 est\u00e1 em uso.");
+            logTs("Adicione 'portaEstoque': XXXX no config.json para usar outra porta.");
         } else {
-            logTs("AVISO: Dados não carregados. Causa: " + (_erroConexao || "desconhecida"));
-            logTs("A interface está disponível — use o botão 'Atualizar' após corrigir a conexão.");
-            // Se não há config.json com fbHost, escaneia a rede em background
-            // pra tentar descobrir automaticamente (scan é disparado também no
-            // callback de falha da conexão, mas apenas se err != null — aqui
-            // cobrimos o caso de config ausente mas FDB local não encontrado)
-            if (!cfg.fbHost) {
-                setImmediate(function() { autoDetectarHost().catch(function() {}); });
-            }
+            logErro("ERRO no servidor: " + _mensagemErro(err));
         }
-    }).catch(e => {
-        logErro("ERRO no carregamento inicial: " + String(e.message || e));
+        _encerrarProcesso("erro no servidor HTTP", 1);
     });
-});
+
+    // Mantém o processo vivo após erro inesperado (ferramenta de loja, sem
+    // supervisor), mas registra em stderr para não passar despercebido.
+    process.on("uncaughtException",  e => logErro("[UNCAUGHT] " + String(e && (e.stack || e))));
+    process.on("unhandledRejection", r => logErro("[REJECTION] " + String(r && (r.stack || r))));
+    process.on("SIGINT",  () => _encerrarProcesso("SIGINT", 0));
+    process.on("SIGTERM", () => _encerrarProcesso("SIGTERM", 0));
+
+    // 0.0.0.0 de propósito: outras máquinas da rede da loja acessam a interface.
+    server.listen(PORTA, "0.0.0.0", () => {
+        logTs("\u2550".repeat(50));
+        logTs(APP_NAME + " \u2014 Consulta de Estoque Dispon\u00edvel");
+        logTs("Acesse: http://localhost:" + PORTA);
+        logTs("Banco:  " + _cfgVivo.fbHost + ":" + _cfgVivo.fbPath);
+        logTs("Ano:    sem filtro de ano (todos os itens com estoque > 0)");
+        logTs("Limite: " + _cfgVivo.maxItens + " itens | Proibidos: " + _proibidosAtivos.length + " termos");
+        logTs("\u2550".repeat(50));
+
+        carregarItens().then(ok => {
+            if (ok) {
+                logTs("Pronto! " + _itensBrutos.length + " item(s) dispon\u00edveis na interface.");
+                return;
+            }
+            logTs("AVISO: Dados n\u00e3o carregados. Causa: " + (_erroConexao || "desconhecida"));
+            logTs("A interface est\u00e1 dispon\u00edvel \u2014 use o bot\u00e3o 'Atualizar' ap\u00f3s corrigir a conex\u00e3o.");
+            // Sem fbHost no config.json e sem FDB local: tenta descobrir na rede
+            // (_agendarScanRede ignora se a falha de conexão já disparou um).
+            if (!cfg.fbHost) _agendarScanRede();
+        });
+    });
+}
+
+if (EXECUCAO_DIRETA) iniciarServidor();
+
+// Helpers puros expostos para a suíte de testes (sem efeitos colaterais).
+module.exports = {
+    _parseJsonTolerante,
+    _sanitizarListaPersonalizada,
+    _normalizarCodigoNumerico,
+    _codigoPadrao5Digitos,
+    _valorColunaIndicaInativo,
+    _formasBuscaCodigos,
+    _reconciliarListaPersonalizada,
+    _processarLinhasPrincipais,
+    _mapearColunas,
+    _montarSqlPrincipal,
+    _montarSqlListaPersonalizada,
+    _portaValida,
+    identificadorSqlValido,
+    toISO,
+    escH,
+    ehProibido,
+    _ENGINE_SRC,
+    // Ganchos de teste (orquestração da carga com driver Firebird falso).
+    carregarItens,
+    _solicitarRecarga,
+    _definirListaPersonalizadaParaTestes(itens) {
+        _listaPersonalizada = _sanitizarListaPersonalizada(itens).itens;
+        _lpVersao++;
+        _lpConfiavel = false;
+    },
+    _estadoParaTestes() {
+        return {
+            itens: _itensBrutos, lpEstoquesReais: _lpEstoquesReais, lpConfiavel: _lpConfiavel,
+            erro: _erroConexao, carregando: _carregando, loadLock: _loadLock
+        };
+    }
+};
