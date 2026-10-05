@@ -32,7 +32,7 @@ Ele roda num PC da loja e é acessado pelo navegador, nessa máquina ou em qualq
 
 1. **Conecta no Firebird** do ERP. Ele encontra o banco sozinho: procura o `SMALL.FDB` local, lê o `.ini` do SmallSoft, usa o `config.json` ou, em último caso, varre a rede local pela porta 3050.
 2. **Detecta a tabela de produtos** e as colunas de código, descrição, estoque, código de barras, preço, última venda e situação (ativo/inativo), sem precisar configurar nomes de colunas.
-3. **Lista só os itens com estoque real (> 0)**, sem os inativos e sem as marcas ou termos **proibidos** (ex.: rações e itens que não devem ser sugeridos).
+3. **Lista só os itens com estoque real (> 0)**, sem os inativos e sem os termos **proibidos** que você configurar (marcas, categorias ou itens que não devem ser sugeridos).
 4. **Monta combinações de produtos** que somam um valor-alvo. Isso serve para fechar valores de cartão, crédito, PIX ou entregas com itens que realmente existem em estoque.
 5. **Controla os "usados":** um item marcado como usado vai para o fim da fila e não é sugerido de novo até a fila ser limpa. Esse estado fica gravado em disco e é compartilhado entre todos os PCs que acessam o sistema.
 6. **Atualiza todas as abas abertas em tempo real**, por Server-Sent Events (SSE), quando os dados mudam.
@@ -43,7 +43,7 @@ Ele roda num PC da loja e é acessado pelo navegador, nessa máquina ou em qualq
 
 | Recurso | Descrição |
 |---|---|
-| **Busca** | Por descrição, código ou código de barras (EAN). Aceita filtros de estoque: `>200`, `<10`, e combinados com texto, como `nexgard>10`. |
+| **Busca** | Por descrição, código ou código de barras (EAN). Aceita filtros de estoque: `>200`, `<10`, e combinados com texto, como `produto>10`. |
 | **Busca personalizada** | Vários termos de uma vez (um por linha ou separados por vírgula). Mostra quais termos não encontraram nenhum item. |
 | **Busca por valor (R$)** | Informe um valor para ativar o **Agrupar** ou o **Combinar**. |
 | **Agrupar** | Encontra **pares e trios de itens diferentes** cuja soma fica entre o valor e o valor + R$ 40, respeitando o estoque mínimo. |
@@ -54,7 +54,7 @@ Ele roda num PC da loja e é acessado pelo navegador, nessa máquina ou em qualq
 | **Itens exibidos** | Limite de linhas na tabela. A tabela é desenhada aos poucos, conforme a rolagem, para não travar com milhares de itens. |
 | **Atualizar** | Recarrega o estoque do banco na hora. |
 | **Limpar usados** | Devolve todos os itens usados para o início da fila. |
-| **Configurações (⚙)** | Host, porta, caminho do `.FDB`, usuário e senha do Firebird, porta HTTP, nome da aplicação, estoque mínimo, máximo de itens e proibidos extras. Quase tudo é aplicado sem reiniciar o servidor. |
+| **Configurações (⚙)** | Host, porta, caminho do `.FDB`, usuário e senha do Firebird, porta HTTP, nome da aplicação, estoque mínimo, máximo de itens e palavras proibidas. Quase tudo é aplicado sem reiniciar o servidor. |
 
 ---
 
@@ -63,9 +63,9 @@ Ele roda num PC da loja e é acessado pelo navegador, nessa máquina ou em qualq
 Processa uma **lista inteira de valores** de uma vez. Cole linhas no formato:
 
 ```
-Entregas: 139,00  CREDITO
-Gerencia: 177,00  CREDITO
-Rafael: 197,00  PIX  [NAO ENCONTRADO]
+Pedido 1: 139,00  CREDITO
+Pedido 2: 177,00  CREDITO
+Pedido 3: 197,00  PIX  [NAO ENCONTRADO]
 ```
 
 Para cada linha, o sistema:
@@ -107,7 +107,7 @@ Opções:
 - **Itens exibidos:** estoque **> 0** (arredondado em 3 casas), descrição preenchida, código único, sem proibidos e sem inativos.
 - **Inativos:** a coluna `ATIVO`/`ATIVADO`/`SITUACAO`/`STATUS` é comparada com `N`, `I`, `X` e `F`. Qualquer outro valor conta como ativo.
 - **Estoque mínimo:** os itens acima do mínimo vêm primeiro. Se faltar item para completar a lista, entram os que estão abaixo do mínimo, mas nunca os zerados.
-- **Proibidos:** existe uma lista embutida no código, que pode ser ampliada pelas Configurações ou pela chave `proibidos` do `config.json`. A comparação é por trecho da descrição, sem diferenciar maiúsculas e minúsculas.
+- **Proibidos:** no padrão de fábrica a lista vem **vazia**. Cadastre os termos da sua loja em **Configurações > Palavras Proibidas** (ou na chave `proibidos` do `config.json`). A comparação é por trecho da descrição, sem diferenciar maiúsculas e minúsculas.
 - **Proteções:** cada carga tem tempo máximo de 60 s. Duas cargas nunca rodam ao mesmo tempo. Pedidos feitos durante uma carga ficam na fila e rodam assim que ela termina.
 
 ---
@@ -152,7 +152,7 @@ O arquivo é **opcional**: sem ele, o sistema detecta o banco sozinho. Quase tod
 ```json
 {
   "appName": "Consulta Estoque",
-  "fbHost": "192.168.1.65",
+  "fbHost": "192.168.0.10",
   "fbPort": 3050,
   "fdbPath": "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB",
   "fbUser": "SYSDBA",
@@ -167,14 +167,18 @@ O arquivo é **opcional**: sem ele, o sistema detecta o banco sozinho. Quase tod
 | Campo | Padrão | Descrição |
 |---|---|---|
 | `appName` | `Consulta Estoque` | Nome exibido na interface (mudar exige reiniciar). |
-| `fbHost` | detectado | IP ou nome do servidor Firebird. |
+| `fbHost` | detectado (`127.0.0.1` se nada for encontrado) | IP ou nome do servidor Firebird. |
 | `fbPort` | `3050` | Porta do Firebird. |
 | `fdbPath` | detectado | Caminho do `.FDB` **no servidor do banco**. |
 | `fbUser` / `fbPassword` | `SYSDBA` / padrão de instalação | Credenciais do Firebird. Sem senha configurada, o log mostra um aviso de segurança. |
 | `portaEstoque` | `7888` | Porta HTTP da interface, de 1024 a 65535 (mudar exige reiniciar). |
 | `estoqueMinimo` | `5` | Itens abaixo desse valor só entram para completar a lista. |
 | `maxItens` | `2000` | Itens enviados à interface, de 100 a 20.000. |
-| `proibidos` | `[]` | Termos extras a excluir, somados aos embutidos. |
+| `proibidos` | `[]` | Termos a excluir das sugestões (a lista de fábrica é vazia). |
+
+### Padrão de fábrica
+
+O código não traz nenhum dado de loja: nome da aplicação genérico (`Consulta Estoque`), host `127.0.0.1` com detecção automática, lista de proibidos vazia e exemplos sem nomes reais. Tudo o que é específico de uma loja fica no `config.json`, nos arquivos gerados em uso e nunca no código. Para **voltar ao padrão de fábrica**, apague `config.json`, `usados-estoque.json` e `lista-personalizada.json` com o servidor parado.
 
 Arquivos com BOM ou com números escritos com zero à esquerda (ex.: `03050`) são aceitos. Ao salvar, os campos de outros módulos que existirem no arquivo são **preservados**.
 
