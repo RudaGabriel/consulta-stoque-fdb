@@ -5,16 +5,14 @@
  *
  * @author Ruda Gabriel
  *
- * @version 2.5.0
+ * @version 2.6.0
  * @changelog
- *   2.5.0 - 2026-10-05 19:00 - Cobertura do servidor (consulta-estoque.js
- *     5.34.0): helpers puros (config tolerante, sanitização/reconciliação da
- *     lista personalizada, SQL gerado, processamento de linhas, porta e
- *     origem local do encerramento), cópia embutida do engine idêntica ao
- *     arquivo e a orquestração de carregarItens() com um driver Firebird
- *     falso (lpConfiavel, mapa preservado em falha, recarga pendente).
- *     Roda sem banco, sem abrir porta e sem gravar arquivos — seguro para o
- *     .bat executar a cada inicialização.
+ *   2.6.0 - 2026-10-05 21:45 - Ajuste ao padrão de fábrica do servidor
+ *     (consulta-estoque.js 5.35.0): o teste de proibidos não depende mais de
+ *     uma marca embutida — usa um termo configurado via _refazerProibidos(),
+ *     como viria do config.json; novo teste garante a lista embutida vazia.
+ *     Suíte cobre engine + servidor sem banco, sem porta e sem gravar
+ *     arquivos (seguro para o .bat rodar a cada inicialização).
  *
  * EXECUÇÃO:
  *   node --test consulta-estoque_test.js
@@ -668,17 +666,23 @@ describe("servidor — helpers puros", () => {
         assert.ok(sql.includes("CAST(NULL AS VARCHAR(255)) AS ATIVO"));
     });
 
+    test("padrão de fábrica: nenhum termo proibido embutido", () => {
+        assert.equal(srv.ehProibido("RACAO QUALQUER MARCA"), false);
+    });
+
     test("_processarLinhasPrincipais: filtros, arredondamento, dedup e corte em maxItens", () => {
+        srv._refazerProibidos(["TERMO PROIBIDO"]); // como se viesse do config.json
         const rows = [
             { CODIGO: "1", DESCRICAO: "ITEM A", ESTOQUE: 10, PRECO: 1.005 },
             { CODIGO: "1", DESCRICAO: "ITEM A DUP", ESTOQUE: 9, PRECO: 1 },
-            { CODIGO: "2", DESCRICAO: "RACAO PEDIGREE", ESTOQUE: 8, PRECO: 1 },  // proibido embutido
+            { CODIGO: "2", DESCRICAO: "ITEM TERMO PROIBIDO", ESTOQUE: 8, PRECO: 1 }, // proibido (config)
             { CODIGO: "3", DESCRICAO: "ITEM C", ESTOQUE: 0.0004, PRECO: 1 },    // vira 0 arredondado
             { CODIGO: "4", DESCRICAO: "ITEM D", ESTOQUE: 2, PRECO: 1 },
             { CODIGO: "5", DESCRICAO: "", ESTOQUE: 7, PRECO: 1 },
             { CODIGO: "6", DESCRICAO: "ITEM F", ESTOQUE: 1, PRECO: 1 }
         ];
         const r = srv._processarLinhasPrincipais(rows, 5, 2);
+        srv._refazerProibidos([]); // restaura o padrão de fábrica
         assert.deepEqual(r.catalogo.map(i => i.codigo), ["1", "4", "6"]);
         assert.deepEqual(r.itens.map(i => i.codigo), ["1", "4"]);
         assert.equal(r.nAcima, 1);

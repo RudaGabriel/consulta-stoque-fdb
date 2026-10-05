@@ -5,19 +5,19 @@
  *
  * @author Ruda Gabriel
  *
- * @version 5.34.0
+ * @version 5.35.0
  * @changelog
- *   5.34.0 - 2026-10-05 19:00 - Encerramento sem perda de dados, integrado ao
- *     consulta-estoque.bat 5.30.0:
- *     [1] POST /api/encerrar: encerra o servidor de forma limpa (grava
- *         usados/lista pendentes antes de sair). Aceito SOMENTE de 127.0.0.1/::1
- *         e com o cabeçalho X-Requested-With (mesma proteção dos demais POST).
- *         O .bat usa esta rota na tecla 0 e ao substituir uma instância antiga;
- *         antes ele usava "taskkill /f", que mata o processo sem rodar nenhum
- *         handler e perdia a última marcação ainda no debounce de 600 ms.
- *     [2] SIGHUP (Windows: janela do console fechada no X) também grava os
- *         dados pendentes antes de sair.
- *     Mantém todas as correções da 5.33.0 (ver histórico do git).
+ *   5.35.0 - 2026-10-05 21:45 - Padrão de fábrica: removidos do código todos
+ *     os valores específicos de uma loja. Nada muda para quem já tem
+ *     config.json, exceto o item [2]:
+ *     [1] fbHost padrão: IP fixo de uma rede específica -> "127.0.0.1". Sem
+ *         config.json e sem FDB local, o scan de rede continua descobrindo
+ *         o servidor Firebird automaticamente.
+ *     [2] PROIBIDOS_EMBUTIDOS agora vem VAZIO. A lista de marcas/termos
+ *         proibidos é configuração de cada loja: cadastre-a em
+ *         Configurações > Palavras Proibidas (ou "proibidos" no config.json).
+ *     [3] Exemplos da interface sem nomes de pessoas nem marcas (Modo
+ *         Automático, busca, placeholders de IP).
  *
  * Servidor de relatório de estoque disponível (Firebird + Node.js).
  * NÃO depende de gerar-relatorio-html.js nem servidor-relatorio.js.
@@ -326,18 +326,11 @@ const APP_NAME  = (cfg.appName && String(cfg.appName).trim())
     ? String(cfg.appName).trim()
     : "Consulta Estoque";
 
-// Lista de proibidos embutida diretamente no script (não depende do config.json).
-// Se o config.json estiver presente e tiver proibidos, ele prevalece (merge).
-const PROIBIDOS_EMBUTIDOS = [
-    "FARO","BIOFRESH","OPTIMUM","CIBAU","ATACAMA","GOLDEN","PIPICAT","SYNTEC",
-    "MITZI","PETISCAO","ND CAES","ND GATOS","GRANPLUS","PEDIGREE","CHAMP",
-    "WHISKAS","PREMIER","GUABI","NATURAL CAES","NATURAL GATOS","PUTZ","GRANEL",
-    "ELANCO","VET LIFE","VETLIFE","KONIG","SAN REMO","SANREMO","FN CAE","FN CAO",
-    "FN GATO","FN VET","ORIGENS","FUNNY BUNNY","FUNNY BIRDY","SANOL","KELDOG",
-    "KDOG","MAGNUS","MAGNO","GENIAL","CANISTER","NATURAL SACHE","FN COOKIES",
-    "KITEKAT","MARS","ADIMAX","FARMINA", "PETISCO", "PETISSCOS", "TAXA DE ENTREGA", "COPO SIMPARIC",
-	"BALDE C/TAMPA", "CONJ.BALDE E TAMPA", "ARRANHADOR COM BOLINHA FN CAT", "TAXA ENTREGA"
-];
+// Proibidos embutidos: VAZIO no padrão de fábrica. Termos proibidos são
+// configuração de cada loja e ficam em config.json ("proibidos"), editáveis
+// em Configurações > Palavras Proibidas. Mantido como ponto de extensão para
+// distribuições que queiram embutir uma lista fixa.
+const PROIBIDOS_EMBUTIDOS = [];
 
 const PROIBIDOS = (() => {
     // Merge: embutidos + os do config.json (se houver), sem duplicatas
@@ -389,7 +382,7 @@ const PORTA = (() => {
 // mudança de default futura é feita em UM único lugar.
 // ─────────────────────────────────────────────────────────────────────────────
 const DEFAULTS = Object.freeze({
-    fbHost:        "192.168.1.65",
+    fbHost:        "127.0.0.1",
     fbPort:        3050,
     fdbPath:       "C:\\Program Files (x86)\\SmallSoft\\Small Commerce\\SMALL.FDB",
     fbUser:        "SYSDBA",
@@ -499,7 +492,7 @@ async function _escanearSubnet(portaFirebird) {
         for (const iface of ifaces[nome]) {
             if (!iface.internal && iface.family === "IPv4") {
                 const partes = iface.address.split(".");
-                base = partes.slice(0, 3).join("."); // ex: "192.168.1"
+                base = partes.slice(0, 3).join("."); // ex: "192.168.0"
                 break;
             }
         }
@@ -1971,7 +1964,7 @@ html.perf-baixa .spin-svg{animation:sp 1.6s linear infinite!important}
 <div class="ctrl">
   <div class="cg">
     <label class="cl cl-busca" for="txtBusca" title="Buscar (descri&ccedil;&atilde;o, c&oacute;digo, EAN, &gt;N, &lt;N)"><span class="cl-busca-txt">Buscar (descri&ccedil;&atilde;o, c&oacute;digo, EAN, &gt;N, &lt;N)</span><button type="button" class="lnk-toggle" id="btnBuscaMulti" onclick="toggleBuscaMulti()" title="Mudar para busca personalizada (v&aacute;rios c&oacute;digos, produtos e/ou c&oacute;digos de barra de uma vez, um por linha)" aria-label="Busca personalizada"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="4.5" x2="13" y2="4.5"/><line x1="3" y1="8" x2="13" y2="8"/><line x1="3" y1="11.5" x2="9" y2="11.5"/></svg></button></label>
-    <input type="text" id="txtBusca" placeholder="Nome, c&oacute;d, EAN, &gt;200, nexgard&gt;10..." title="Buscar por descri&ccedil;&atilde;o, c&oacute;digo ou EAN. Filtro de estoque: &gt;N (estoque m&iacute;nimo) ou &lt;N (estoque m&aacute;ximo), sozinhos ou combinados com o texto. Ex: nexgard&gt;10 mostra produtos com &quot;nexgard&quot; no nome e 10 ou mais em estoque; nexgard&lt;10 mostra os com 10 ou menos." oninput="filtrarDebounced()">
+    <input type="text" id="txtBusca" placeholder="Nome, c&oacute;d, EAN, &gt;200, produto&gt;10..." title="Buscar por descri&ccedil;&atilde;o, c&oacute;digo ou EAN. Filtro de estoque: &gt;N (estoque m&iacute;nimo) ou &lt;N (estoque m&aacute;ximo), sozinhos ou combinados com o texto. Ex: produto&gt;10 mostra produtos com &quot;produto&quot; no nome e 10 ou mais em estoque; produto&lt;10 mostra os com 10 ou menos." oninput="filtrarDebounced()">
     <textarea id="txtBuscaMulti" class="busca-multi-ta" style="display:none" title="Um c&oacute;digo, produto ou c&oacute;digo de barras por linha (ou separados por v&iacute;rgula)" placeholder="Um c&oacute;digo, produto ou c&oacute;digo de barras por linha (ou separados por v&iacute;rgula). Mistura os tipos livremente. Ex:&#10;08395&#10;7891234567890&#10;ARROZ" oninput="filtrarDebounced()"></textarea>
   </div>
 
@@ -2061,7 +2054,7 @@ html.perf-baixa .spin-svg{animation:sp 1.6s linear infinite!important}
         <div class="cfg-grid">
           <div class="cfg-field">
             <label class="cfg-lbl" for="cfgFbHost">Host / IP</label>
-            <input class="cfg-inp" id="cfgFbHost" type="text" placeholder="192.168.1.65" spellcheck="false" autocomplete="off">
+            <input class="cfg-inp" id="cfgFbHost" type="text" placeholder="127.0.0.1" spellcheck="false" autocomplete="off">
           </div>
           <div class="cfg-field">
             <label class="cfg-lbl" for="cfgFbPort">Porta Firebird</label>
@@ -2128,7 +2121,7 @@ html.perf-baixa .spin-svg{animation:sp 1.6s linear infinite!important}
         </div>
         <div class="cfg-grid-1">
           <div class="cfg-field">
-            <label class="cfg-lbl" for="cfgProib">Uma por linha &mdash; adicionadas &agrave;s j&aacute; embutidas</label>
+            <label class="cfg-lbl" for="cfgProib">Uma por linha &mdash; itens cuja descri&ccedil;&atilde;o contenha o termo n&atilde;o s&atilde;o sugeridos</label>
             <textarea class="cfg-inp cfg-ta" id="cfgProib" placeholder="PRODUTO EXEMPLO&#10;OUTRA MARCA&#10;ITEM ESPECIFICO"></textarea>
           </div>
         </div>
@@ -2169,7 +2162,7 @@ html.perf-baixa .spin-svg{animation:sp 1.6s linear infinite!important}
       Cole a lista no formato abaixo e clique em <strong>Iniciar</strong>.
       O sistema ir&aacute; buscar os c&oacute;digos automaticamente.<br>
       <span style="color:var(--acc);font-family:Consolas,monospace;font-size:11px">
-        Entregas:<br>139,00&nbsp;&nbsp;CREDITO<br>Gerencia:<br>177,00&nbsp;&nbsp;CREDITO<br>Rafael:<br>197,00&nbsp;&nbsp;PIX&nbsp;&nbsp;[NAO ENCONTRADO]
+        Pedido 1:<br>139,00&nbsp;&nbsp;CREDITO<br>Pedido 2:<br>177,00&nbsp;&nbsp;CREDITO<br>Pedido 3:<br>197,00&nbsp;&nbsp;PIX&nbsp;&nbsp;[NAO ENCONTRADO]
       </span>
       <span style="display:block;margin-top:4px;font-size:11px">
         O "[NAO ENCONTRADO]" &eacute; opcional &mdash; &uacute;til se voc&ecirc; est&aacute; colando de volta uma sa&iacute;da anterior;
@@ -3010,15 +3003,15 @@ function filtrar() {
     // Sintaxe aceita (busca simples):
     //     >10              -> qualquer item com estoque >= 10
     //     <10              -> qualquer item com estoque <= 10
-    //     nexgard>10       -> itens cuja descrição/código/barras contenha
-    //                         "nexgard" E tenham estoque >= 10
-    //     nexgard<10       -> o mesmo, com estoque <= 10
-    //     nexgard > 10     -> espaços ao redor do operador são tolerados
+    //     produto>10       -> itens cuja descrição/código/barras contenha
+    //                         "produto" E tenham estoque >= 10
+    //     produto<10       -> o mesmo, com estoque <= 10
+    //     produto > 10     -> espaços ao redor do operador são tolerados
     //
     // Antes as duas expressões eram ANCORADAS sozinhas (/^>(\\d+)$/), ou seja,
     // o filtro numérico só funcionava se fosse a ÚNICA coisa digitada:
-    // "nexgard>10" não casava com nada e caía na busca textual literal por
-    // "nexgard>10", que naturalmente não existe em nenhum produto — o
+    // "produto>10" não casava com nada e caía na busca textual literal por
+    // "produto>10", que naturalmente não existe em nenhum produto — o
     // resultado era sempre vazio, sem explicação visível. Agora um único
     // regex captura, em qualquer combinação: texto antes (opcional, grupo 1),
     // operador (grupo 2) e o número (grupo 3).
@@ -6551,6 +6544,7 @@ module.exports = {
     toISO,
     escH,
     ehProibido,
+    _refazerProibidos,
     _ENGINE_SRC,
     // Ganchos de teste (orquestração da carga com driver Firebird falso).
     carregarItens,
