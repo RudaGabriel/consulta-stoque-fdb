@@ -3,6 +3,8 @@
 /**
  * consulta-estoque_test.js
  *
+ * @author Ruda Gabriel
+ *
  * @version 2.5.0
  * @changelog
  *   2.5.0 - 2026-10-05 19:00 - Cobertura do servidor (consulta-estoque.js

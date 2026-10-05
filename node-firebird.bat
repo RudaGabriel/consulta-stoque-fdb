@@ -5,6 +5,7 @@ chcp 65001 >nul 2>&1
 
 :: =========================================================
 ::  node-firebird.bat                                  v1.1.1
+::  Autor: Ruda Gabriel
 ::  - Verifica / instala Node.js automaticamente
 ::  - Instala o modulo node-firebird via npm
 ::  - Pula instalacao se modulo ja estiver presente
