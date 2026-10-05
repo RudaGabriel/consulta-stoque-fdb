@@ -1,6 +1,7 @@
 @echo off
 REM ===========================================================================
 REM  consulta-estoque.bat
+REM  @author Ruda Gabriel
 REM  @version 5.30.0
 REM  @changelog
 REM    5.30.0 - 2026-10-05 19:00 - Revisao comparando a v5.29.3 com o

@@ -1,6 +1,8 @@
 /**
  * estoque-engine.js
  *
+ * @author Ruda Gabriel
+ *
  * @version 1.4.0
  * @changelog
  *   1.4.0 - 2026-08-14 15:40 - Revisão de auditoria (sem mudança de

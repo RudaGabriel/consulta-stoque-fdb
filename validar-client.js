@@ -1,6 +1,8 @@
 /**
  * validar-client.js — ferramenta de verificação (não faz parte do runtime)
  *
+ * @author Ruda Gabriel
+ *
  * @version 1.0.0
  * @changelog
  *   1.0.0 - 2026-08-08 - Primeira versão. Valida a sintaxe do JavaScript
