@@ -208,6 +208,8 @@ Ficam na mesma pasta do servidor:
 | `lista-personalizada.json` | A lista personalizada do Modo Automático. |
 | `*.corrompido-<data>` | Cópia de segurança, criada só se um dos arquivos acima estiver corrompido ao iniciar. |
 
+Todos eles estão no `.gitignore` e nunca vão para o repositório (o `config.json` contém a senha do Firebird).
+
 A gravação é **atômica**: o arquivo é escrito por inteiro antes de substituir o anterior, então uma queda de energia não deixa o arquivo pela metade.
 
 ---

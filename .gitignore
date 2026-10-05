@@ -1,0 +1,19 @@
+# Arquivos gerados em uso pelo servidor (dados e configuração de cada loja).
+# config.json guarda a senha do Firebird: nunca deve ir para o repositório.
+config.json
+usados-estoque.json
+lista-personalizada.json
+*.tmp
+*.tmp-sync
+*.corrompido-*
+
+# Dependências instaladas pelo .bat (npm install node-firebird)
+node_modules/
+package.json
+package-lock.json
+
+# Logs e lixo de sistema
+*.log
+Thumbs.db
+Desktop.ini
+.DS_Store
