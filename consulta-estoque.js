@@ -3,42 +3,19 @@
 /**
  * consulta-estoque.js
  *
- * @version 5.33.0
+ * @version 5.34.0
  * @changelog
- *   5.33.0 - 2026-10-05 17:30 - Revisão de auditoria (correções de corretude,
- *     resiliência e testabilidade — sem mudança de layout/fluxo da interface):
- *     [1] carregarItens(): token de geração por carga. Uma carga que estoura
- *         CONEXAO_TIMEOUT_MS e termina depois NÃO libera mais o lock nem
- *         sobrescreve o estado de uma carga mais nova (antes: duas cargas em
- *         paralelo e lock liberado no meio da segunda). Carga atrasada só
- *         aplica dados se nenhuma mais nova estiver rodando/já aplicada.
- *     [2] Pedidos de recarga feitos durante uma carga (salvar lista
- *         personalizada, salvar config, scan de rede) eram descartados — agora
- *         ficam pendentes e rodam assim que a carga atual termina.
- *     [3] Falso "código não existe mais no banco": falha (total ou parcial)
- *         da consulta da lista personalizada, da query principal ou da
- *         conexão zerava _lpEstoquesReais e o cliente oferecia "Excluir
- *         todos". Agora o mapa anterior é preservado e /api/itens informa
- *         lpConfiavel=false; o cliente não acusa "não existe" sem confirmação.
- *     [4] Filtro ATIVO usava CAST(... AS VARCHAR(1)) — coluna SITUACAO/STATUS
- *         com texto ("ATIVO"/"INATIVO") gerava "string right truncation" e
- *         derrubava a carga inteira. DESCRICAO usa SUBSTRING (mesmo motivo).
- *     [5] Persistência atômica (arquivo temporário + rename) e serializada de
- *         usados/lista/config; JSON corrompido é preservado em
- *         *.corrompido-<timestamp> em vez de ser silenciosamente sobrescrito;
- *         gravações pendentes são descarregadas no SIGINT/SIGTERM.
- *     [6] config.json: a correção de "zero à esquerda" só é aplicada se o JSON
- *         original for inválido (antes corrompia strings como senhas).
- *     [7] Scan de rede: no máximo um por vez e com intervalo mínimo.
- *     [8] /api/status usa a config viva; /api/config não devolve mais a senha
- *         padrão em "defaults"; faixas de porta unificadas.
- *     [9] /api/itens serializa a lista uma única vez por mudança de estado.
- *     [10] Cliente: fingerprint inclui ultimaAtualiz (estoque mudava sem
- *          re-render), respostas fora de ordem descartadas, rajadas de SSE
- *          agrupadas, mensagem correta quando já há carga em andamento.
- *     [11] Testabilidade: o servidor só sobe quando executado diretamente
- *          (require.main === module); helpers puros exportados e cobertos
- *          por testes (consulta-estoque_test.js).
+ *   5.34.0 - 2026-10-05 19:00 - Encerramento sem perda de dados, integrado ao
+ *     consulta-estoque.bat 5.30.0:
+ *     [1] POST /api/encerrar: encerra o servidor de forma limpa (grava
+ *         usados/lista pendentes antes de sair). Aceito SOMENTE de 127.0.0.1/::1
+ *         e com o cabeçalho X-Requested-With (mesma proteção dos demais POST).
+ *         O .bat usa esta rota na tecla 0 e ao substituir uma instância antiga;
+ *         antes ele usava "taskkill /f", que mata o processo sem rodar nenhum
+ *         handler e perdia a última marcação ainda no debounce de 600 ms.
+ *     [2] SIGHUP (Windows: janela do console fechada no X) também grava os
+ *         dados pendentes antes de sair.
+ *     Mantém todas as correções da 5.33.0 (ver histórico do git).
  *
  * Servidor de relatório de estoque disponível (Firebird + Node.js).
  * NÃO depende de gerar-relatorio-html.js nem servidor-relatorio.js.
@@ -215,7 +192,7 @@ function escH(s) {
 // original falhar. Aplicar a regex sempre corrompia valores de TEXTO válidos
 // (ex.: senha "abc:0123" virava "abc: 123").
 function _parseJsonTolerante(raw) {
-    const semBom = String(raw).replace(/^﻿/, "");
+    const semBom = String(raw).replace(/^\uFEFF/, "");
     try {
         return JSON.parse(semBom);
     } catch (errOriginal) {
@@ -6204,6 +6181,28 @@ async function handlePostAtualizar(req, res, json, erro) {
     json({ ok: true, mensagem: "Iniciando atualiza\u00e7\u00e3o..." });
 }
 
+// Só a própria máquina pode encerrar o servidor (o .bat roda nela). O endereço
+// vem do socket TCP — não de cabeçalho, que o cliente poderia forjar.
+function _requisicaoLocal(req) {
+    const ip = (req && req.socket && req.socket.remoteAddress) || "";
+    return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+}
+
+async function handlePostEncerrar(req, res, json, erro) {
+    if (!_requisicaoLocal(req)) {
+        logErro("AVISO: pedido de encerramento recusado (origem n\u00e3o local: " +
+                String(req.socket && req.socket.remoteAddress) + ").");
+        erro("Encerramento permitido apenas a partir desta m\u00e1quina.", 403);
+        return;
+    }
+    // Sai só depois de a resposta ser enviada; o timer cobre um "finish" que não chegue.
+    let saiu = false;
+    const sair = () => { if (!saiu) { saiu = true; _encerrarProcesso("pedido local de encerramento", 0); } };
+    res.once("finish", () => setImmediate(sair));
+    setTimeout(sair, 1000).unref();
+    json({ ok: true, mensagem: "Encerrando servidor." });
+}
+
 async function handleGetStatus(req, res, json, erro) {
     json({
         ok:           true,
@@ -6388,7 +6387,8 @@ const ROTAS = {
     "POST /api/atualizar":                handlePostAtualizar,
     "GET /api/status":                    handleGetStatus,
     "GET /api/config":                    handleGetConfig,
-    "POST /api/config":                   handlePostConfig
+    "POST /api/config":                   handlePostConfig,
+    "POST /api/encerrar":                 handlePostEncerrar
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6500,6 +6500,9 @@ function iniciarServidor() {
     process.on("unhandledRejection", r => logErro("[REJECTION] " + String(r && (r.stack || r))));
     process.on("SIGINT",  () => _encerrarProcesso("SIGINT", 0));
     process.on("SIGTERM", () => _encerrarProcesso("SIGTERM", 0));
+    // Windows: fechar a janela do console (botão X) chega ao Node como SIGHUP,
+    // com alguns segundos antes do encerramento forçado — tempo de gravar.
+    process.on("SIGHUP",  () => _encerrarProcesso("janela fechada (SIGHUP)", 0));
 
     // 0.0.0.0 de propósito: outras máquinas da rede da loja acessam a interface.
     server.listen(PORTA, "0.0.0.0", () => {
@@ -6541,6 +6544,7 @@ module.exports = {
     _montarSqlPrincipal,
     _montarSqlListaPersonalizada,
     _portaValida,
+    _requisicaoLocal,
     identificadorSqlValido,
     toISO,
     escH,

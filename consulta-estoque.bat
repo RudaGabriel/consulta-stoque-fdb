@@ -1,14 +1,31 @@
 @echo off
 REM ===========================================================================
 REM  consulta-estoque.bat
-REM  @version 5.29.3
+REM  @version 5.30.0
 REM  @changelog
-REM    5.29.3 - 2026-09-21 - Desativa o "Modo de Edicao Rapida" (QuickEdit) do
-REM      console ao iniciar o servidor. Nesse modo, um simples clique na janela
-REM      do cmd inicia uma selecao de texto que CONGELA a saida do Node (e o
-REM      servidor trava, ex.: requisicoes da interface ficam "sincronizando")
-REM      ate uma tecla ser pressionada. Sem o QuickEdit, clicar na janela nao
-REM      trava mais nada. O efeito vale so para esta janela.
+REM    5.30.0 - 2026-10-05 19:00 - Revisao comparando a v5.29.3 com o
+REM      consulta-estoque.js 5.34.0 e o node-firebird.bat:
+REM      [1] Porta lida do config.json (portaEstoque/portaConsulta, mesma regra
+REM          do servidor). Antes 7888 era fixo: com outra porta configurada, a
+REM          checagem de porta ocupada, o link e o navegador apontavam errado.
+REM      [2] Porta ocupada detectada tambem em Windows em portugues: o netstat
+REM          mostra "OUVINDO" e nao "LISTENING" - a checagem nunca disparava.
+REM      [3] Encerramento limpo: tecla 0 e "substituir servidor antigo" pedem
+REM          POST /api/encerrar (so aceito de 127.0.0.1) e esperam ate ~8s; so
+REM          entao usam taskkill /f. Antes o /f matava o Node sem gravar a
+REM          ultima marcacao de "usado" ainda pendente.
+REM      [4] Node.js minimo verificado (18+, exigido pelos testes). Instalador
+REM          atualizado para o Node 22.22.0 LTS (o 20.x saiu de suporte em
+REM          abril/2026).
+REM      [5] Do node-firebird.bat: PATH do sistema relido do registro apos
+REM          instalar o Node; npm tenta primeiro o cache local (--prefer-offline)
+REM          e so depois baixa da internet, com verificacao pos-instalacao.
+REM      [6] Arquivo de PID por porta (duas pastas/portas nao se atrapalham).
+REM      Mantido da v5.29.3: QuickEdit desativado, auto-elevacao para instalar
+REM      o Node, SHA256 do MSI, verificacoes de integridade com confirmacao,
+REM      monitoramento do servidor e tecla 0 para encerrar.
+REM
+REM  Mantenha este arquivo com quebras de linha CRLF ("call :rotina" falha com LF).
 REM ===========================================================================
 chcp 65001 > nul
 title Consulta Estoque
@@ -26,7 +43,6 @@ if /i "%~1"=="/instalar-node" goto :modo_instalador
 echo.
 echo  ================================================
 echo   Consulta de Estoque
-echo   Porta: 7888
 echo  ================================================
 echo.
 
@@ -46,6 +62,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Versao minima: 18 (node --test e APIs usadas pelos testes). Abaixo disso o
+REM servidor ate pode subir, mas as verificacoes falham - avisa a causa real.
+set "NODE_VER="
+for /f "delims=" %%v in ('node -v 2^>nul') do set "NODE_VER=%%v"
+set "NODE_MAJOR=0"
+for /f "tokens=1 delims=v." %%m in ("%NODE_VER%") do set /a "NODE_MAJOR=%%m" > nul 2>&1
+if %NODE_MAJOR% GTR 0 if %NODE_MAJOR% LSS 18 (
+    echo  [AVISO] Node.js %NODE_VER% e antigo demais ^(minimo recomendado: 18^).
+    echo          Atualize em https://nodejs.org para evitar falhas.
+    echo.
+)
+
 REM ---------------------------------------------------------------------------
 REM Verificar arquivos obrigatorios
 REM ---------------------------------------------------------------------------
@@ -58,10 +86,8 @@ if not exist "consulta-estoque.js" (
 )
 
 REM estoque-engine.js NAO e necessario para o servidor rodar: o conteudo dele
-REM esta embutido dentro de consulta-estoque.js (constante _ENGINE_SRC) e e
-REM injetado no HTML enviado ao navegador. O arquivo solto so e usado pela
-REM suite de testes, que faz require("./estoque-engine.js"). Por isso aqui ele
-REM e apenas um AVISO, e nao mais um erro que impedia o servidor de iniciar.
+REM esta embutido dentro de consulta-estoque.js (constante _ENGINE_SRC). O
+REM arquivo solto so e usado pela suite de testes.
 if not exist "estoque-engine.js" (
     echo  [AVISO] estoque-engine.js nao encontrado.
     echo  O servidor funciona normalmente sem ele ^(o motor vai embutido^),
@@ -76,43 +102,55 @@ if not exist "config.json" (
 )
 
 REM ---------------------------------------------------------------------------
-REM Verificar node-firebird
+REM Porta HTTP: mesma regra do servidor (portaEstoque ou portaConsulta no
+REM config.json, entre 1024 e 65535; senao 7888). Lida com o proprio Node para
+REM aceitar BOM e o legado de "zero a esquerda" do mesmo jeito que o servidor.
+REM ---------------------------------------------------------------------------
+set "PORTA=7888"
+for /f "usebackq delims=" %%P in (`node -e "let c={};try{let r=require('fs').readFileSync('config.json','utf8');if(r.charCodeAt(0)===65279)r=r.slice(1);try{c=JSON.parse(r)}catch(e){c=JSON.parse(r.replace(/:\s*0+(\d)/g,': $1'))}}catch(e){}const p=parseInt(c.portaEstoque||c.portaConsulta||'0',10);console.log(Number.isInteger(p)&&p>=1024&&p<=65535?p:7888)" 2^>nul`) do set "PORTA=%%P"
+echo  Porta: %PORTA%
+echo.
+
+REM ---------------------------------------------------------------------------
+REM Verificar node-firebird (cache local primeiro, como no node-firebird.bat)
 REM ---------------------------------------------------------------------------
 node -e "require('node-firebird')" > nul 2>&1
-if %errorlevel% neq 0 (
-    echo  [AVISO] Modulo node-firebird nao instalado.
-    echo  Instalando automaticamente...
-    echo.
-    npm install node-firebird
-    REM Mesmo motivo do bloco de verificacao: dentro de ( ) o %errorlevel% seria
-    REM expandido antes do npm rodar, e uma falha de instalacao passaria batido.
-    if errorlevel 1 (
-        echo.
-        echo  [ERRO] Falha ao instalar node-firebird.
-        echo  Tente manualmente: npm install node-firebird
-        echo.
-        pause
-        exit /b 1
-    )
-    echo.
-    echo  Modulo instalado com sucesso!
-    echo.
-)
+if not errorlevel 1 goto :firebird_ok
+
+echo  [AVISO] Modulo node-firebird nao instalado. Instalando automaticamente...
+echo.
+call npm install node-firebird --prefer-offline --no-audit --no-fund > nul 2>&1
+node -e "require('node-firebird')" > nul 2>&1
+if not errorlevel 1 goto :firebird_instalado
+
+echo  [INFO] Cache local indisponivel. Baixando da internet...
+call npm install node-firebird --no-audit --no-fund
+node -e "require('node-firebird')" > nul 2>&1
+if not errorlevel 1 goto :firebird_instalado
+
+echo.
+echo  [ERRO] Falha ao instalar node-firebird.
+echo  Possiveis causas: sem internet, proxy nao configurado ou sem permissao
+echo  de escrita nesta pasta. Tente manualmente: npm install node-firebird
+echo.
+pause
+exit /b 1
+
+:firebird_instalado
+echo.
+echo  Modulo node-firebird instalado com sucesso!
+echo.
+
+:firebird_ok
 
 REM ---------------------------------------------------------------------------
 REM Verificacao automatica de integridade (antes de subir o servidor)
 REM ---------------------------------------------------------------------------
-REM Por que isto existe: "node -c consulta-estoque.js" valida apenas o codigo do
-REM SERVIDOR. Todo o JavaScript da interface vive dentro de um template literal
-REM (a string do HTML), entao para o Node e apenas texto: um erro de sintaxe ali
-REM passa despercebido e so aparece como pagina quebrada no navegador. O
-REM validar-client.js extrai esses blocos <script> e roda o parser do Node sobre
-REM eles, fechando essa lacuna. Os testes cobrem o estoque-engine.js.
-REM
-REM Tudo aqui e OPCIONAL e nao impede o servidor de subir: se um arquivo de
-REM verificacao nao estiver presente, apenas pula. Se uma verificacao FALHAR,
-REM avisa e pede confirmacao, porque uma loja parada por causa de um teste
-REM quebrado seria pior que o proprio defeito.
+REM "node -c" valida so o codigo do SERVIDOR; validar-client.js valida o
+REM JavaScript da interface (que vive dentro de uma string do HTML); a suite de
+REM testes cobre o estoque-engine.js e as funcoes do servidor (sem conectar no
+REM banco e sem gravar nada). Tudo e OPCIONAL: arquivo ausente = pula; falha =
+REM avisa e pergunta, porque loja parada por teste quebrado e pior que o defeito.
 set "VERIFICACAO_FALHOU="
 
 node -c "consulta-estoque.js" > nul 2>&1
@@ -123,10 +161,8 @@ if errorlevel 1 (
 
 if exist "validar-client.js" (
     node "validar-client.js" > nul 2>&1
-    REM "if errorlevel 1" e avaliado em tempo de execucao. Usar %errorlevel%
-    REM aqui dentro NAO funcionaria: dentro de um bloco ( ) a variavel e
-    REM expandida quando o bloco inteiro e lido, antes do node rodar, entao o
-    REM teste compararia o valor ANTERIOR e a falha passaria despercebida.
+    REM "if errorlevel 1" e avaliado em tempo de execucao; %errorlevel% dentro
+    REM de ( ) seria expandido antes do node rodar e a falha passaria batido.
     if errorlevel 1 (
         echo  [ERRO] Erro de sintaxe no JavaScript da interface ^(client-side^).
         echo         Rode: node validar-client.js
@@ -138,7 +174,7 @@ if exist "consulta-estoque_test.js" (
     if exist "estoque-engine.js" (
         node --test "consulta-estoque_test.js" > nul 2>&1
         if errorlevel 1 (
-            echo  [AVISO] A suite de testes do estoque-engine.js falhou.
+            echo  [AVISO] A suite de testes ^(engine + servidor^) falhou.
             echo          Rode: node --test consulta-estoque_test.js
             set "VERIFICACAO_FALHOU=1"
         )
@@ -167,30 +203,30 @@ if defined VERIFICACAO_FALHOU (
 )
 
 REM ---------------------------------------------------------------------------
-REM Iniciar
+REM Porta ocupada? (ex.: servidor antigo esquecido rodando)
 REM ---------------------------------------------------------------------------
-REM Se a porta 7888 ja estiver ocupada (ex.: servidor antigo esquecido rodando),
-REM avisa antes de subir, em vez de deixar o Node falhar com "porta em uso".
+REM findstr com dois /c: = "OU": cobre Windows em ingles (LISTENING) e em
+REM portugues (OUVINDO). O ":" antes e o espaco depois evitam casar 17888/78880.
 set "PORTA_PID="
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr /r /c:":7888 .*LISTENING"') do set "PORTA_PID=%%p"
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr /r /c:":%PORTA% .*LISTENING" /c:":%PORTA% .*OUVINDO"') do set "PORTA_PID=%%p"
 if not defined PORTA_PID goto :iniciar_servidor
 
 tasklist /fi "PID eq %PORTA_PID%" /fo csv /nh 2>nul | find /i "node.exe" > nul
 if errorlevel 1 goto :porta_ocupada_outro
 
-echo  [AVISO] Ja existe um servidor Node em execucao na porta 7888 ^(PID %PORTA_PID%^).
+echo  [AVISO] Ja existe um servidor Node em execucao na porta %PORTA% ^(PID %PORTA_PID%^).
 echo          Provavelmente uma janela anterior ficou aberta ou rodando oculta.
 echo.
 choice /c SN /n /m "  Encerrar o servidor antigo e iniciar um novo? [S/N]: "
 if errorlevel 2 goto :cancelar_porta
-taskkill /pid %PORTA_PID% /t /f > nul 2>&1
-ping -n 2 127.0.0.1 > nul
+echo  Encerrando o servidor antigo ^(gravando dados pendentes^)...
+call :parar_servidor %PORTA_PID%
 echo.
 goto :iniciar_servidor
 
 :porta_ocupada_outro
-echo  [ERRO] A porta 7888 esta ocupada por outro programa ^(PID %PORTA_PID%^).
-echo         Feche esse programa e execute o .bat novamente.
+echo  [ERRO] A porta %PORTA% esta ocupada por outro programa ^(PID %PORTA_PID%^).
+echo         Feche esse programa ou defina outra "portaEstoque" no config.json.
 echo.
 pause
 exit /b 1
@@ -205,15 +241,15 @@ REM ---------------------------------------------------------------------------
 REM Iniciar servidor (visivel nesta janela) e aguardar a tecla 0
 REM ---------------------------------------------------------------------------
 :iniciar_servidor
-title Consulta Estoque - pressione 0 para encerrar tudo
+title Consulta Estoque - porta %PORTA% - pressione 0 para encerrar tudo
 
-REM Desativa o QuickEdit desta janela (ver @changelog). Falha aqui e ignorada:
-REM no pior caso o comportamento e o de antes.
+REM Desativa o QuickEdit desta janela: um clique no console iniciava uma
+REM selecao que CONGELAVA a saida do Node (e o servidor). Falha e ignorada.
 set "ESTOQUE_ACAO=quickedit"
 call :executar_ps > nul 2>&1
 set "ESTOQUE_ACAO="
 echo  Iniciando servidor...
-echo  Acesse: http://localhost:7888
+echo  Acesse: http://localhost:%PORTA%
 echo.
 echo  Pressione 0 nesta janela para encerrar tudo ^(ou Ctrl+C / fechar a janela^).
 echo.
@@ -221,7 +257,7 @@ echo.
 REM O servidor roda na MESMA janela (-NoNewWindow): os logs aparecem aqui. O
 REM PowerShell so o inicia e grava o PID num arquivo (nao pode devolver por
 REM stdout, senao a saida do servidor seria capturada em vez de aparecer).
-set "ESTOQUE_PIDFILE=%TEMP%\consulta_estoque_server.pid"
+set "ESTOQUE_PIDFILE=%TEMP%\consulta_estoque_%PORTA%.pid"
 del "%ESTOQUE_PIDFILE%" > nul 2>&1
 set "SERVER_PID="
 powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $p=Start-Process -FilePath 'node' -ArgumentList 'consulta-estoque.js' -WorkingDirectory (Get-Location).Path -NoNewWindow -PassThru; Set-Content -LiteralPath $env:ESTOQUE_PIDFILE -Value $p.Id -Encoding ASCII } catch { exit 1 }"
@@ -235,7 +271,7 @@ tasklist /fi "PID eq %SERVER_PID%" /fo csv /nh 2>nul | find /i "node.exe" > nul
 if errorlevel 1 goto :servidor_caiu
 
 REM Abre o navegador direto daqui: "start" com URL nao abre janela de cmd.
-start "" "http://localhost:7888"
+start "" "http://localhost:%PORTA%"
 
 :loop_menu
 REM Espera a tecla 0 por 3s; sem tecla, assume N e apenas verifica o servidor.
@@ -267,10 +303,41 @@ exit /b 1
 
 :encerrar_servidor
 echo.
-echo  Encerrando servidor...
-taskkill /pid %SERVER_PID% /t /f > nul 2>&1
+echo  Encerrando servidor ^(gravando dados pendentes^)...
+call :parar_servidor %SERVER_PID%
 del "%ESTOQUE_PIDFILE%" > nul 2>&1
 echo  Servidor encerrado.
+ping -n 2 127.0.0.1 > nul
+exit /b 0
+
+REM ===========================================================================
+REM  SUBROTINA: parar_servidor <PID>
+REM  1) Pede encerramento limpo via POST /api/encerrar: o servidor grava os
+REM     dados pendentes e sai. A rota so aceita 127.0.0.1 (esta maquina).
+REM  2) Espera ate ~8s o processo sumir.
+REM  3) So entao usa taskkill /f. Resposta diferente de 200 (servidor antigo,
+REM     sem a rota) ou sem resposta vai direto ao taskkill, sem esperar.
+REM ===========================================================================
+:parar_servidor
+set "PARAR_PID=%~1"
+if not defined PARAR_PID exit /b 0
+tasklist /fi "PID eq %PARAR_PID%" /fo csv /nh 2>nul | find /i "node.exe" > nul
+if errorlevel 1 exit /b 0
+
+node -e "const r=require('http').request({host:'127.0.0.1',port:Number(process.env.PORTA),path:'/api/encerrar',method:'POST',headers:{'X-Requested-With':'XMLHttpRequest'},timeout:3000},res=>process.exit(res.statusCode===200?0:2));r.on('error',()=>process.exit(1));r.on('timeout',()=>{r.destroy();process.exit(1)});r.end()" > nul 2>&1
+if errorlevel 1 goto :parar_forcar
+
+set "PARAR_TENT=0"
+:parar_aguardar
+tasklist /fi "PID eq %PARAR_PID%" /fo csv /nh 2>nul | find /i "node.exe" > nul
+if errorlevel 1 exit /b 0
+set /a "PARAR_TENT+=1"
+if %PARAR_TENT% GEQ 8 goto :parar_forcar
+ping -n 2 127.0.0.1 > nul
+goto :parar_aguardar
+
+:parar_forcar
+taskkill /pid %PARAR_PID% /t /f > nul 2>&1
 ping -n 2 127.0.0.1 > nul
 exit /b 0
 
@@ -331,10 +398,15 @@ set "PS_RC=%errorlevel%"
 echo.
 if not "%PS_RC%"=="0" exit /b 1
 
-REM O PATH desta sessao nao enxerga o Node recem-instalado: adiciona manualmente
-REM as pastas padrao para continuar sem precisar reabrir o terminal.
+REM O PATH desta sessao nao enxerga o Node recem-instalado. Primeiro as pastas
+REM padrao; se ainda nao achar, o PATH de sistema relido do registro (ideia do
+REM node-firebird.bat), que cobre instalacoes em pastas nao padrao.
 set "PATH=%ProgramFiles%\nodejs;%ProgramW6432%\nodejs;%APPDATA%\npm;%PATH%"
+where node > nul 2>&1
+if not errorlevel 1 goto :node_no_path
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('Path','Machine')"`) do set "PATH=%%P;%PATH%"
 
+:node_no_path
 where node > nul 2>&1
 if errorlevel 1 (
     echo  [AVISO] Node.js instalado, mas nao localizado no PATH desta sessao.
@@ -348,7 +420,8 @@ exit /b 0
 
 REM ===========================================================================
 REM  SUBROTINA: executar_ps
-REM  Executa o instalador PowerShell embutido no final deste arquivo.
+REM  Executa o bloco PowerShell embutido no final deste arquivo (instalador
+REM  do Node.js ou, com ESTOQUE_ACAO=quickedit, so o ajuste do console).
 REM ===========================================================================
 :executar_ps
 REM O marcador e montado em duas partes ('#PS1_' + 'INICIO') para que a propria
@@ -380,7 +453,7 @@ if ($env:ESTOQUE_ACAO -eq 'quickedit') {
 }
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
-$versao  = '20.19.0'
+$versao  = '22.22.0'
 $logFile = Join-Path $env:TEMP 'consulta_estoque_node_install.log'
 $msiLog  = Join-Path $env:TEMP 'consulta_estoque_node_msi.log'
 

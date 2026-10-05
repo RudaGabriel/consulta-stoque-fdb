@@ -3,14 +3,16 @@
 /**
  * consulta-estoque_test.js
  *
- * @version 2.4.0
+ * @version 2.5.0
  * @changelog
- *   2.4.0 - 2026-10-05 17:30 - Cobertura do servidor (consulta-estoque.js
- *     v5.33.0): helpers puros (config tolerante, sanitização/reconciliação da
- *     lista personalizada, SQL gerado, processamento de linhas), cópia
- *     embutida do engine idêntica ao arquivo, e a orquestração de
- *     carregarItens() com um driver Firebird falso (lpConfiavel, mapa
- *     preservado em falha, recarga pendente).
+ *   2.5.0 - 2026-10-05 19:00 - Cobertura do servidor (consulta-estoque.js
+ *     5.34.0): helpers puros (config tolerante, sanitização/reconciliação da
+ *     lista personalizada, SQL gerado, processamento de linhas, porta e
+ *     origem local do encerramento), cópia embutida do engine idêntica ao
+ *     arquivo e a orquestração de carregarItens() com um driver Firebird
+ *     falso (lpConfiavel, mapa preservado em falha, recarga pendente).
+ *     Roda sem banco, sem abrir porta e sem gravar arquivos — seguro para o
+ *     .bat executar a cada inicialização.
  *
  * EXECUÇÃO:
  *   node --test consulta-estoque_test.js
@@ -679,6 +681,16 @@ describe("servidor — helpers puros", () => {
         assert.deepEqual(r.itens.map(i => i.codigo), ["1", "4"]);
         assert.equal(r.nAcima, 1);
         assert.equal(r.nAbaixo, 1);
+    });
+
+    test("_requisicaoLocal: só loopback, pelo endereço do socket", () => {
+        const req = ip => ({ socket: { remoteAddress: ip } });
+        assert.equal(srv._requisicaoLocal(req("127.0.0.1")), true);
+        assert.equal(srv._requisicaoLocal(req("::1")), true);
+        assert.equal(srv._requisicaoLocal(req("::ffff:127.0.0.1")), true);
+        assert.equal(srv._requisicaoLocal(req("192.168.1.20")), false);
+        assert.equal(srv._requisicaoLocal(req("::ffff:192.168.1.20")), false);
+        assert.equal(srv._requisicaoLocal({}), false);
     });
 
     test("_portaValida", () => {
