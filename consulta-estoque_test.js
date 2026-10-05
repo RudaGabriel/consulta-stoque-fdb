@@ -1,18 +1,21 @@
 "use strict";
 
 /**
- * consulta-estoque.test.js
+ * consulta-estoque_test.js
  *
- * @version 2.3.0
+ * @version 2.5.0
  * @changelog
- *   2.3.0 - 2026-07-10 - Testes de regressão para o bug "Agrupar não
- *     funcionava": encontrarGruposAsync voltou ao algoritmo comprovadamente
- *     estável (apenas pares e triplas, sem a fase de subset-sum/DP que se
- *     mostrou não confiável). describe() de regressão atualizado para
- *     também garantir que nenhum grupo retornado tem mais de 3 itens.
+ *   2.5.0 - 2026-10-05 19:00 - Cobertura do servidor (consulta-estoque.js
+ *     5.34.0): helpers puros (config tolerante, sanitização/reconciliação da
+ *     lista personalizada, SQL gerado, processamento de linhas, porta e
+ *     origem local do encerramento), cópia embutida do engine idêntica ao
+ *     arquivo e a orquestração de carregarItens() com um driver Firebird
+ *     falso (lpConfiavel, mapa preservado em falha, recarga pendente).
+ *     Roda sem banco, sem abrir porta e sem gravar arquivos — seguro para o
+ *     .bat executar a cada inicialização.
  *
  * EXECUÇÃO:
- *   node --test consulta-estoque.test.js
+ *   node --test consulta-estoque_test.js
  *   (Node.js >= 18, sem dependências externas)
  *
  * MANUTENÇÃO FUTURA:
@@ -501,5 +504,253 @@ describe("regressão — Agrupar não duplica combinações (pares/triplas)", ()
                 done();
             } catch (e) { done(e); }
         }, null, null, { maxResultados: 50 });
+    });
+});
+// ═════════════════════════════════════════════════════════════════════════════
+// SERVIDOR (consulta-estoque.js) — carregado com um node-firebird FALSO
+// ═════════════════════════════════════════════════════════════════════════════
+const Module = require("node:module");
+const fs     = require("node:fs");
+const path   = require("node:path");
+
+// Banco falso, configurável por teste.
+const bancoFalso = {
+    linhas: [],          // linhas da tabela ESTOQUE
+    falharLp: false,     // consulta da lista personalizada devolve erro
+    attachs: 0,
+    sqls: []
+};
+
+function linhaBanco(codigo, descricao, estoque, preco, ativo) {
+    return { CODIGO: codigo, DESCRICAO: descricao, ESTOQUE: estoque, PRECO: preco,
+             CODBARRAS: "", ULTIMAVENDA: null, ATIVO: ativo == null ? null : ativo };
+}
+
+const firebirdFalso = {
+    ISOLATION_READ_UNCOMMITTED: 1,
+    ISOLATION_READ_COMMITTED: 2,
+    attach(opts, cb) {
+        bancoFalso.attachs++;
+        const db = {
+            detach() {},
+            transaction(iso, cbTx) {
+                cbTx(null, {
+                    rollback(cbR) { if (cbR) cbR(); },
+                    query(sql, params, cbQ) {
+                        bancoFalso.sqls.push(sql);
+                        setImmediate(() => {
+                            if (sql.includes("RDB$RELATIONS")) return cbQ(null, [{ T: "ESTOQUE" }]);
+                            if (sql.includes("RDB$RELATION_FIELDS")) {
+                                return cbQ(null, ["CODIGO", "DESCRICAO", "QTD_ATUAL", "PRECO", "ATIVO"].map(c => ({ C: c })));
+                            }
+                            if (sql.includes("SELECT FIRST")) {
+                                return cbQ(null, bancoFalso.linhas.filter(l => l.ESTOQUE > 0)
+                                    .filter(l => !["N", "I", "X", "F"].includes(l.ATIVO)));
+                            }
+                            if (sql.includes(" IN (")) {
+                                if (bancoFalso.falharLp) return cbQ(new Error("falha simulada"));
+                                return cbQ(null, bancoFalso.linhas.filter(l => params.includes(l.CODIGO)));
+                            }
+                            cbQ(new Error("SQL inesperado no teste: " + sql));
+                        });
+                    }
+                });
+            }
+        };
+        setImmediate(() => cb(null, db));
+    }
+};
+
+function carregarServidorComFirebirdFalso() {
+    const requireOriginal = Module.prototype.require;
+    Module.prototype.require = function(id) {
+        if (id === "node-firebird") return firebirdFalso;
+        return requireOriginal.apply(this, arguments);
+    };
+    try {
+        return require("./consulta-estoque.js");
+    } finally {
+        Module.prototype.require = requireOriginal;
+    }
+}
+
+const srv = carregarServidorComFirebirdFalso();
+
+describe("servidor — helpers puros", () => {
+    test("_parseJsonTolerante não altera texto válido com ':0' dentro de string", () => {
+        const cfg = srv._parseJsonTolerante('{"fbPassword":"abc:0123","fbPort":3050}');
+        assert.equal(cfg.fbPassword, "abc:0123");
+        assert.equal(cfg.fbPort, 3050);
+    });
+
+    test("_parseJsonTolerante corrige número com zero à esquerda (legado) e remove BOM", () => {
+        const cfg = srv._parseJsonTolerante("\uFEFF{\"fbPort\": 03050}");
+        assert.equal(cfg.fbPort, 3050);
+    });
+
+    test("_parseJsonTolerante lança em JSON realmente inválido", () => {
+        assert.throws(() => srv._parseJsonTolerante("{nao e json"));
+    });
+
+    test("_sanitizarListaPersonalizada: dedup, limite e estoqueParada inválido", () => {
+        const r = srv._sanitizarListaPersonalizada([
+            { codigo: " 01 ", estoqueParada: "3" },
+            { codigo: "01" },
+            { codigo: "02", estoqueParada: -1 },
+            null, { codigo: "" }, "lixo"
+        ]);
+        assert.deepEqual(r.itens, [{ codigo: "01", estoqueParada: 3 }, { codigo: "02", estoqueParada: null }]);
+        assert.equal(r.duplicatas, 1);
+        assert.equal(r.cortados, 0);
+    });
+
+    test("_sanitizarListaPersonalizada: excesso conta como 'cortados', não 'duplicatas'", () => {
+        const lista = [];
+        for (let i = 0; i < 1200; i++) lista.push({ codigo: "C" + i });
+        const r = srv._sanitizarListaPersonalizada(lista);
+        assert.equal(r.itens.length, 1000);
+        assert.equal(r.cortados, 200);
+        assert.equal(r.duplicatas, 0);
+    });
+
+    test("normalização de código (sem zeros / 5 dígitos)", () => {
+        assert.equal(srv._normalizarCodigoNumerico("00703"), "703");
+        assert.equal(srv._normalizarCodigoNumerico("000"), "0");
+        assert.equal(srv._normalizarCodigoNumerico("A1"), null);
+        assert.equal(srv._codigoPadrao5Digitos("703"), "00703");
+        assert.equal(srv._codigoPadrao5Digitos("123456"), "123456");
+        assert.equal(srv._codigoPadrao5Digitos("X"), null);
+    });
+
+    test("_valorColunaIndicaInativo: só marcador exato da blacklist", () => {
+        assert.equal(srv._valorColunaIndicaInativo("N"), true);
+        assert.equal(srv._valorColunaIndicaInativo(" I "), true);
+        assert.equal(srv._valorColunaIndicaInativo("INATIVO"), false);
+        assert.equal(srv._valorColunaIndicaInativo(null), false);
+        assert.equal(srv._valorColunaIndicaInativo("S"), false);
+    });
+
+    test("_reconciliarListaPersonalizada casa pelas 3 formas e indexa pelo código digitado", () => {
+        const mapa = srv._reconciliarListaPersonalizada(
+            [{ codigo: "04567" }, { codigo: "703" }, { codigo: "ZZ" }],
+            [{ CODIGO: "4567", ESTOQUE: 2, PRECO: 9.999, DESCRICAO: "A", ATIVO: "N" },
+             { CODIGO: "00703", ESTOQUE: -1, PRECO: 1, DESCRICAO: "B", ATIVO: null }],
+            true
+        );
+        assert.deepEqual(Object.keys(mapa).sort(), ["04567", "703"]);
+        assert.equal(mapa["04567"].ativo, false);
+        assert.equal(mapa["04567"].preco, 10);
+        assert.equal(mapa["703"].estoque, -1);
+        assert.equal(mapa["703"].ativo, true);
+    });
+
+    test("_formasBuscaCodigos inclui exata, sem zeros e 5 dígitos, sem duplicar", () => {
+        assert.deepEqual(srv._formasBuscaCodigos([{ codigo: "0703" }, { codigo: "703" }]).sort(),
+                         ["00703", "0703", "703"]);
+    });
+
+    test("_montarSqlPrincipal: ATIVO sem CAST(VARCHAR(1)) e DESCRICAO via SUBSTRING", () => {
+        const cols = srv._mapearColunas(new Set(["CODIGO", "DESCRICAO", "QTD_ATUAL", "SITUACAO"]));
+        assert.equal(cols.ativo, "SITUACAO");
+        const sql = srv._montarSqlPrincipal("ESTOQUE", cols);
+        assert.ok(!sql.includes("VARCHAR(1)"), sql);
+        assert.ok(sql.includes("TRIM(CAST(p.SITUACAO AS VARCHAR(255))) NOT IN ('N', 'I', 'X', 'F')"), sql);
+        assert.ok(sql.includes("SUBSTRING(p.DESCRICAO FROM 1 FOR 120)"), sql);
+    });
+
+    test("_montarSqlListaPersonalizada: sem FIRST e com um '?' por parâmetro", () => {
+        const cols = srv._mapearColunas(new Set(["CODIGO", "DESCRICAO", "QTD_ATUAL"]));
+        const sql = srv._montarSqlListaPersonalizada("ESTOQUE", cols, 3);
+        assert.ok(!sql.includes("FIRST"));
+        assert.ok(sql.includes("IN (?,?,?)"));
+        assert.ok(sql.includes("CAST(NULL AS VARCHAR(255)) AS ATIVO"));
+    });
+
+    test("_processarLinhasPrincipais: filtros, arredondamento, dedup e corte em maxItens", () => {
+        const rows = [
+            { CODIGO: "1", DESCRICAO: "ITEM A", ESTOQUE: 10, PRECO: 1.005 },
+            { CODIGO: "1", DESCRICAO: "ITEM A DUP", ESTOQUE: 9, PRECO: 1 },
+            { CODIGO: "2", DESCRICAO: "RACAO PEDIGREE", ESTOQUE: 8, PRECO: 1 },  // proibido embutido
+            { CODIGO: "3", DESCRICAO: "ITEM C", ESTOQUE: 0.0004, PRECO: 1 },    // vira 0 arredondado
+            { CODIGO: "4", DESCRICAO: "ITEM D", ESTOQUE: 2, PRECO: 1 },
+            { CODIGO: "5", DESCRICAO: "", ESTOQUE: 7, PRECO: 1 },
+            { CODIGO: "6", DESCRICAO: "ITEM F", ESTOQUE: 1, PRECO: 1 }
+        ];
+        const r = srv._processarLinhasPrincipais(rows, 5, 2);
+        assert.deepEqual(r.catalogo.map(i => i.codigo), ["1", "4", "6"]);
+        assert.deepEqual(r.itens.map(i => i.codigo), ["1", "4"]);
+        assert.equal(r.nAcima, 1);
+        assert.equal(r.nAbaixo, 1);
+    });
+
+    test("_requisicaoLocal: só loopback, pelo endereço do socket", () => {
+        const req = ip => ({ socket: { remoteAddress: ip } });
+        assert.equal(srv._requisicaoLocal(req("127.0.0.1")), true);
+        assert.equal(srv._requisicaoLocal(req("::1")), true);
+        assert.equal(srv._requisicaoLocal(req("::ffff:127.0.0.1")), true);
+        assert.equal(srv._requisicaoLocal(req("192.168.1.20")), false);
+        assert.equal(srv._requisicaoLocal(req("::ffff:192.168.1.20")), false);
+        assert.equal(srv._requisicaoLocal({}), false);
+    });
+
+    test("_portaValida", () => {
+        assert.equal(srv._portaValida(65535, 1024), true);
+        assert.equal(srv._portaValida(1023, 1024), false);
+        assert.equal(srv._portaValida(3050.5, 1), false);
+    });
+
+    test("cópia embutida do engine (_ENGINE_SRC) é idêntica a estoque-engine.js", () => {
+        const arquivo = fs.readFileSync(path.join(__dirname, "estoque-engine.js"), "utf8");
+        assert.equal(srv._ENGINE_SRC, arquivo,
+            "estoque-engine.js mudou sem atualizar _ENGINE_SRC em consulta-estoque.js (ou vice-versa)");
+    });
+});
+
+describe("servidor — carregarItens() com driver falso", () => {
+    test("carrega itens e reconcilia a lista personalizada (lpConfiavel = true)", async () => {
+        bancoFalso.linhas = [
+            linhaBanco("04567", "ITEM A", 10, 5, "S"),
+            linhaBanco("00703", "ITEM B", 0, 3, "S"),
+            linhaBanco("888", "ITEM INATIVO", 4, 2, "N")
+        ];
+        bancoFalso.falharLp = false;
+        srv._definirListaPersonalizadaParaTestes([{ codigo: "4567" }, { codigo: "703" }, { codigo: "888" }]);
+        assert.equal(await srv.carregarItens(), true);
+        const st = srv._estadoParaTestes();
+        assert.equal(st.loadLock, false);
+        assert.equal(st.erro, null);
+        assert.deepEqual(st.itens.map(i => i.codigo), ["04567"]);
+        assert.equal(st.lpConfiavel, true);
+        assert.equal(st.lpEstoquesReais["4567"].estoque, 10);
+        assert.equal(st.lpEstoquesReais["703"].estoque, 0);
+        assert.equal(st.lpEstoquesReais["888"].ativo, false);
+    });
+
+    test("falha na consulta da lista: mapa anterior preservado e lpConfiavel = false", async () => {
+        bancoFalso.falharLp = true;
+        srv._definirListaPersonalizadaParaTestes([{ codigo: "4567" }, { codigo: "NOVO" }]);
+        assert.equal(await srv.carregarItens(), true);
+        const st = srv._estadoParaTestes();
+        assert.equal(st.lpConfiavel, false, "ausência não pode ser tratada como 'não existe mais'");
+        assert.equal(st.lpEstoquesReais["4567"].estoque, 10, "mapa anterior deve ser preservado");
+        bancoFalso.falharLp = false;
+    });
+
+    test("recarga pedida durante uma carga fica pendente e roda em seguida", async () => {
+        const antes = bancoFalso.attachs;
+        const primeira = srv.carregarItens();
+        assert.equal(srv._estadoParaTestes().loadLock, true);
+        assert.equal(await srv.carregarItens(), false, "carga concorrente direta é recusada");
+        assert.equal(srv._solicitarRecarga("teste"), "agendada");
+        assert.equal(await primeira, true);
+        // A recarga pendente começou de forma síncrona ao fim da primeira.
+        assert.equal(srv._estadoParaTestes().loadLock, true);
+        await new Promise(resolve => {
+            const t = setInterval(() => {
+                if (!srv._estadoParaTestes().loadLock) { clearInterval(t); resolve(); }
+            }, 5);
+        });
+        assert.equal(bancoFalso.attachs - antes, 2);
+        assert.equal(srv._estadoParaTestes().lpConfiavel, true);
     });
 });
