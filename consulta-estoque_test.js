@@ -5,14 +5,13 @@
  *
  * @author Ruda Gabriel
  *
- * @version 2.7.0
+ * @version 2.8.0
  * @changelog
- *   2.7.0 - 2026-10-05 22:30 - Regressões do Agrupar e do Combinar
- *     (estoque-engine.js 1.5.0): a soma exata (par ou tripla) precisa vir
- *     primeiro mesmo quando dezenas de combinações "+R$1,00" aparecem antes
- *     na lista; resultados em ordem crescente de diferença; o Combinar não
- *     pode repetir o mesmo card. Suíte cobre engine + servidor sem
- *     banco, sem porta e sem gravar arquivos.
+ *   2.8.0 - 2026-10-06 15:00 - Testes de _normalizarListaProibidos
+ *     (estoque-engine.js 1.6.0): formato aceito preservado; vírgula, ponto e
+ *     vírgula, "|", tab e JSON convertidos; decimal "1,5" preservado; aspas,
+ *     espaços, vazios e repetidos tratados. Suíte cobre engine + servidor
+ *     sem banco, sem porta e sem gravar arquivos.
  *
  * EXECUÇÃO:
  *   node --test consulta-estoque_test.js
@@ -37,7 +36,8 @@ const {
     _autoEncontrarMelhor, _autoEncontrarMelhorComRepeticao,
     _ehProibidoCliente, _validarResultadoPadrao, _validarResultadoLista,
     _formatarCodigosCompactado, _diffTermosFaltantes, _itemBateAlgumTermo, _termosSemMatch,
-    encontrarGruposAsync, encontrarCombinacoesComRepeticaoAsync
+    encontrarGruposAsync, encontrarCombinacoesComRepeticaoAsync,
+    _normalizarListaProibidos
 } = engine;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -562,6 +562,40 @@ describe("regressão — Agrupar não duplica combinações (pares/triplas)", ()
         }, null, null, { maxResultados: 50 });
     });
 });
+// ── Palavras proibidas: detecção e ajuste automático do formato ─────────────
+describe("_normalizarListaProibidos", () => {
+    const n = _normalizarListaProibidos;
+    test("formato aceito (um por linha, maiúsculas) não é alterado", () => {
+        const r = n("FARO\nBIOFRESH");
+        assert.deepEqual(r.termos, ["FARO", "BIOFRESH"]);
+        assert.equal(r.alterado, false);
+    });
+    test("CRLF e linha final vazia contam como formato aceito", () => {
+        assert.equal(n("FARO\r\nBIOFRESH\n").alterado, false);
+    });
+    test("vírgula, ponto e vírgula, | e tab viram um por linha", () => {
+        const r = n("faro, biofresh;golden | pipicat\tsyntec");
+        assert.equal(r.texto, "FARO\nBIOFRESH\nGOLDEN\nPIPICAT\nSYNTEC");
+        assert.equal(r.alterado, true);
+    });
+    test("vírgula entre dígitos é decimal e não separa", () => {
+        assert.deepEqual(n("RACAO 1,5KG, PETISCO").termos, ["RACAO 1,5KG", "PETISCO"]);
+    });
+    test("lista JSON colada é aceita", () => {
+        assert.deepEqual(n('["faro", "Biofresh"]').termos, ["FARO", "BIOFRESH"]);
+    });
+    test("remove aspas, espaços extras, vazios e repetidos (conta repetidos)", () => {
+        const r = n('  "faro"  \n\n  nd   caes \nFARO');
+        assert.deepEqual(r.termos, ["FARO", "ND CAES"]);
+        assert.equal(r.duplicados, 1);
+    });
+    test("array e entrada vazia/nula", () => {
+        assert.deepEqual(n([" faro", "FARO", null]).termos, ["FARO"]);
+        assert.deepEqual(n("").termos, []);
+        assert.deepEqual(n(null).termos, []);
+    });
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // SERVIDOR (consulta-estoque.js) — carregado com um node-firebird FALSO
 // ═════════════════════════════════════════════════════════════════════════════

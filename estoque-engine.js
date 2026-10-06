@@ -3,25 +3,14 @@
  *
  * @author Ruda Gabriel
  *
- * @version 1.5.0
+ * @version 1.6.0
  * @changelog
- *   1.5.0 - 2026-10-05 22:30 - Agrupar nunca mostrava a soma EXATA:
- *     encontrarGruposAsync parava de procurar ao juntar 30 grupos, guardando
- *     os primeiros pares na ordem da lista (por estoque) e não os mais
- *     próximos do valor. Um par exato fora desses primeiros nunca aparecia
- *     ("R$ 101,00 +R$ 1,00" com R$ 100,00 disponível). Agora todas as bases
- *     são examinadas com busca binária pelos parceiros mais próximos
- *     (PARCEIROS_POR_BASE), a coleção é podada pelos melhores e o resultado
- *     sai ordenado por menor diferença e, no empate, por menos itens.
- *     Teto de candidatos: 250 -> 600 (MAX_CANDIDATOS_GRUPOS). Validado contra
- *     força bruta em 300 cenários aleatórios.
- *     Combinar / Modo Automático (_autoEncontrarMelhorComRepeticao): mesmo
- *     defeito por outro caminho — só os 30 primeiros itens da lista entravam
- *     na busca. Nova busca ampla de 1 a 3 itens (com repetição, respeitando
- *     o estoque disponível de cada código) sobre até 600 candidatos; soma
- *     exata é devolvida na hora, senão vence o mais próximo entre ela e a
- *     busca original. Combinar não repete mais o mesmo card: combinação
- *     repetida tira seus itens das buscas seguintes.
+ *   1.6.0 - 2026-10-06 15:00 - Nova _normalizarListaProibidos(): detecta e
+ *     converte para o formato aceito (um termo por linha, maiúsculas, sem
+ *     vazios nem repetidos) qualquer lista colada — separada por vírgula,
+ *     ponto e vírgula, "|", tab ou quebra de linha, ou como JSON. Vírgula
+ *     entre dígitos é decimal e não separa. Mesma função usada no navegador
+ *     e no servidor. Sem mudança nas demais funções.
  *
  * ARQUITETURA:
  *   - UMD wrapper: expõe via module.exports (Node) ou window globals (browser)
@@ -834,6 +823,65 @@
         setTimeout(_buscarProxima, 0);
     }
 
+    // ── _normalizarListaProibidos ────────────────────────────────────────────
+    // Formato ACEITO da lista de palavras proibidas: um termo por linha, em
+    // maiúsculas, sem espaços sobrando, sem vazios e sem repetidos. Aceita
+    // qualquer coisa colada pelo usuário e converte para esse formato:
+    //   - separadores: quebra de linha, vírgula, ponto e vírgula, "|", tab;
+    //   - vírgula ENTRE DÍGITOS é decimal e não separa ("RACAO 1,5KG");
+    //   - lista JSON colada (["A","B"]) ou array já pronto;
+    //   - aspas/colchetes soltos nas pontas de cada termo são removidos;
+    //   - espaços internos repetidos viram um só.
+    // Retorna { termos, duplicados, texto, alterado }:
+    //   texto    = termos.join("\n") (o formato aceito);
+    //   alterado = a entrada (texto) não estava no formato aceito.
+    // Usada pelo navegador (campo de Configurações) e pelo servidor
+    // (POST /api/config e config.json), garantindo a mesma regra nos dois.
+    function _normalizarListaProibidos(entrada) {
+        var PROTEGE_DECIMAL = "@@VIRGULA_DECIMAL@@";
+        var brutos = null;
+        var original = "";
+        if (Array.isArray(entrada)) {
+            brutos = entrada.map(function(t) { return String(t == null ? "" : t); });
+            original = null; // array não tem "formato de texto" a comparar
+        } else {
+            original = String(entrada == null ? "" : entrada);
+            var txt = original;
+            if (txt.charCodeAt(0) === 0xFEFF) txt = txt.slice(1);
+            txt = txt.trim();
+            if (txt.charAt(0) === "[") {
+                try {
+                    var arr = JSON.parse(txt);
+                    if (Array.isArray(arr)) brutos = arr.map(function(t) { return String(t == null ? "" : t); });
+                } catch (_) { /* não era JSON válido: segue como texto */ }
+            }
+            if (!brutos) {
+                txt = txt.replace(/(\d),(\d)/g, "$1" + PROTEGE_DECIMAL + "$2");
+                brutos = txt.split(/[\r\n;|\t,]+/).map(function(t) {
+                    return t.split(PROTEGE_DECIMAL).join(",");
+                });
+            }
+        }
+        var termos = [];
+        var vistos = Object.create(null);
+        var duplicados = 0;
+        for (var i = 0; i < brutos.length; i++) {
+            var t = brutos[i]
+                .replace(/^[\s"'`\[\]]+|[\s"'`\[\]]+$/g, "")
+                .replace(/\s+/g, " ")
+                .toUpperCase();
+            if (!t) continue;
+            if (vistos[t]) { duplicados++; continue; }
+            vistos[t] = true;
+            termos.push(t);
+        }
+        var texto = termos.join("\n");
+        var alterado = original === null
+            ? false
+            : original.replace(/\r\n?/g, "\n").trim() !== texto;
+        return { termos: termos, duplicados: duplicados, texto: texto, alterado: alterado };
+    }
+
     // ── API pública ───────────────────────────────────────────────────────────
     return {
         // Constantes
@@ -854,6 +902,7 @@
         _diffTermosFaltantes               : _diffTermosFaltantes,
         _itemBateAlgumTermo                : _itemBateAlgumTermo,
         _termosSemMatch                    : _termosSemMatch,
+        _normalizarListaProibidos          : _normalizarListaProibidos,
         // Funções assíncronas de busca
         encontrarGruposAsync                        : encontrarGruposAsync,
         encontrarCombinacoesComRepeticaoAsync        : encontrarCombinacoesComRepeticaoAsync
