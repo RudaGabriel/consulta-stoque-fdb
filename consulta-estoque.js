@@ -5,19 +5,16 @@
  *
  * @author Ruda Gabriel
  *
- * @version 5.38.0
+ * @version 5.39.0
  * @changelog
- *   5.38.0 - 2026-10-06 15:00 - Configurações > Palavras Proibidas:
- *     [1] Removido "Ver termos embutidos" (HTML, CSS e preenchimento): a
- *         lista embutida é vazia no padrão de fábrica e não é mais usada.
- *     [2] Título renomeado para "Palavras Proibidas".
- *     [3] Detecção e ajuste automático do formato: o campo aceita um termo
- *         por linha (maiúsculas, sem repetidos); texto colado com vírgula,
- *         ponto e vírgula, "|", tab ou JSON é convertido ao sair do campo,
- *         ao colar e antes de salvar, com aviso do que foi ajustado. O
- *         servidor aplica a MESMA regra (engine._normalizarListaProibidos)
- *         no POST /api/config e ao ler "proibidos" do config.json (aceita
- *         texto ou array).
+ *   5.39.0 - 2026-10-06 16:00 - Dois ajustes pedidos:
+ *     [1] Palavras Proibidas: contador no título ("N palavras"), atualizado
+ *         ao digitar, colar, sair do campo e abrir as Configurações. Conta
+ *         os termos válidos (sem repetidos nem linhas vazias) — o mesmo
+ *         número que será salvo.
+ *     [2] Cards Agrupar/Combinar: .grp-card-item .nm conforme definido pelo
+ *         usuário — flex:1 0 100% com max-width:25% (nome na mesma linha do
+ *         código, limitado a 1/4 da largura; descrição completa no title).
  *
  * Servidor de relatório de estoque disponível (Firebird + Node.js).
  * NÃO depende de gerar-relatorio-html.js nem servidor-relatorio.js.
@@ -1786,6 +1783,7 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 .cfg-note{font-size:10.5px;color:var(--txt3);line-height:1.5;display:flex;align-items:flex-start;gap:5px}
 .cfg-note-warn{color:#f6b048}
 .cfg-proib-info{font-size:10.5px;color:var(--grn);min-height:14px;margin-top:4px}
+.cfg-proib-count{margin-left:auto;font-size:10px;font-weight:700;letter-spacing:0;text-transform:none;color:var(--acc);background:var(--bg);border:1px solid var(--brd);border-radius:10px;padding:1px 8px}
 .cfg-ftr{padding:12px 18px;border-top:1px solid var(--brd);
          display:flex;align-items:center;justify-content:space-between;
          gap:10px;flex-shrink:0;min-height:56px}
@@ -1840,7 +1838,7 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 .grp-bar{font-family:Consolas,monospace;font-size:10px;color:var(--txt3);flex:1 1 0;min-width:0;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* Nome em linha própria, largura total: com qtd + código + EAN + preço na
    mesma linha sobravam ~30px (Combinar) / ~60px (Agrupar) para o nome. */
-.grp-card-item .nm{color:var(--txt);order:10;flex:1 0 100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help}
+.grp-card-item .nm{color:var(--txt);flex:1 0 100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help;max-width:25%}
 .grp-card-item .pv{color:var(--acc);font-weight:700;flex-shrink:0;text-align:right;white-space:nowrap}
 .grp-total{display:flex;justify-content:space-between;align-items:center;margin-top:7px;padding-top:7px;border-top:1px solid var(--brd)}
 .grp-total .lbl{font-size:11px;color:var(--txt2)}
@@ -2124,11 +2122,12 @@ html.perf-baixa .spin-svg{animation:sp 1.6s linear infinite!important}
         <div class="cfg-sec-ttl">
           <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M2 4h12M4 8h8M6 12h4"/></svg>
           Palavras Proibidas
+          <span class="cfg-proib-count" id="cfgProibCount" title="Termos v&aacute;lidos que ser&atilde;o salvos (sem repetidos nem linhas vazias)">0 palavras</span>
         </div>
         <div class="cfg-grid-1">
           <div class="cfg-field">
             <label class="cfg-lbl" for="cfgProib">Um termo por linha &mdash; itens cuja descri&ccedil;&atilde;o contenha o termo n&atilde;o s&atilde;o sugeridos. Pode colar separado por v&iacute;rgula ou ponto e v&iacute;rgula: o formato &eacute; ajustado automaticamente.</label>
-            <textarea class="cfg-inp cfg-ta" id="cfgProib" placeholder="PRODUTO EXEMPLO&#10;OUTRA MARCA&#10;ITEM ESPECIFICO" onblur="_formatarCampoProibidos()" onpaste="setTimeout(_formatarCampoProibidos, 0)"></textarea>
+            <textarea class="cfg-inp cfg-ta" id="cfgProib" placeholder="PRODUTO EXEMPLO&#10;OUTRA MARCA&#10;ITEM ESPECIFICO" oninput="_aoDigitarProibidos()" onblur="_formatarCampoProibidos()" onpaste="setTimeout(_formatarCampoProibidos, 0)"></textarea>
             <div class="cfg-proib-info" id="cfgProibInfo" aria-live="polite"></div>
           </div>
         </div>
@@ -5696,6 +5695,7 @@ function _carregarConfigs(tentativa) {
         _cfgSetVal('cfgProib',   _normalizarListaProibidos(Array.isArray(r.proibidosExtra) ? r.proibidosExtra : []).texto);
         var proibInfo = document.getElementById('cfgProibInfo');
         if (proibInfo) proibInfo.textContent = '';
+        _atualizarContadorProibidos();
 
         if (st) { st.textContent = ''; st.className = 'cfg-status'; }
     }).catch(function(e) {
@@ -5708,6 +5708,27 @@ function _carregarConfigs(tentativa) {
 // por linha, maiúsculas, sem repetidos) e, se não estiver, converte na hora
 // — ao sair do campo, ao colar e antes de salvar. Regra única: engine
 // (_normalizarListaProibidos), a mesma usada pelo servidor.
+// Contador de palavras proibidas: quantos termos VÁLIDOS o campo tem agora —
+// o mesmo número que será salvo (repetidos e linhas vazias não contam).
+function _atualizarContadorProibidos(resultado) {
+    var el = document.getElementById('cfgProibCount');
+    if (!el) return;
+    if (!resultado) {
+        var campo = document.getElementById('cfgProib');
+        resultado = _normalizarListaProibidos(campo ? campo.value : '');
+    }
+    var n = resultado.termos.length;
+    el.textContent = n + (n === 1 ? ' palavra' : ' palavras');
+}
+
+// Ao digitar: atualiza o contador e apaga o aviso de ajuste anterior (que
+// descrevia o conteúdo de ANTES da edição e ficaria desatualizado).
+function _aoDigitarProibidos() {
+    var info = document.getElementById('cfgProibInfo');
+    if (info) info.textContent = '';
+    _atualizarContadorProibidos();
+}
+
 function _formatarCampoProibidos() {
     var campo = document.getElementById('cfgProib');
     var info  = document.getElementById('cfgProibInfo');
@@ -5720,6 +5741,7 @@ function _formatarCampoProibidos() {
                 (r.duplicados ? ' (' + r.duplicados + ' repetido' + (r.duplicados === 1 ? '' : 's') + ' removido' + (r.duplicados === 1 ? '' : 's') + ')' : '') + '.';
         }
     }
+    _atualizarContadorProibidos(r);
     return r;
 }
 
