@@ -5,16 +5,19 @@
  *
  * @author Ruda Gabriel
  *
- * @version 5.36.0
+ * @version 5.37.0
  * @changelog
- *   5.36.0 - 2026-10-05 22:30 - Dois defeitos relatados no uso:
- *     [1] Agrupar e Combinar não mostravam a soma exata (sempre "+R$ 1,00"
- *         ou mais) e o Combinar repetia o mesmo card: corrigido no
- *         estoque-engine.js 1.5.0, embutido aqui (_ENGINE_SRC).
- *     [2] Cards do Combinar/Agrupar: o nome do item ficava com ~30-60px (a
- *         linha tinha qtd, código, EAN e preço), invisível e sem onde passar
- *         o mouse. Agora o nome ocupa uma linha própria, com a largura toda
- *         do card, e o title mostra a descrição completa.
+ *   5.37.0 - 2026-10-06 00:30 - Cards do Agrupar/Combinar: código de barras
+ *     sempre colado no preço. .grp-bar passou de largura fixa (110px) para
+ *     "flex:1 1 0" alinhado à direita — ocupa o espaço livre da 1ª linha sem
+ *     nunca forçar quebra; código/quantidade/preço com largura do conteúdo;
+ *     EAN que não couber termina em "…" com title completo. Medido no
+ *     Chromium em 9 larguras de tela (360 a 2560px, cards de 240 a 340px),
+ *     Agrupar e Combinar: vão EAN-preço de 6px em todas, sempre 2 linhas,
+ *     nome com >= 210px, nada transbordando. (Alternativa testada e
+ *     descartada: nome em linha com max-width:34% + justify-content:
+ *     space-between — vão EAN-preço variava de 30 a 130px e o preço caía
+ *     de linha no Agrupar em cards largos.)
  *
  * Servidor de relatório de estoque disponível (Firebird + Node.js).
  * NÃO depende de gerar-relatorio-html.js nem servidor-relatorio.js.
@@ -1829,12 +1832,15 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
 .grp-card:hover{border-color:var(--grn)}
 .grp-card-item{display:flex;flex-wrap:wrap;align-items:center;padding:4px 0;font-size:11px;border-bottom:1px solid var(--brd);gap:2px 6px}
 .grp-card-item:last-of-type{border-bottom:none}
-.grp-cod{font-family:Consolas,monospace;font-size:10px;color:var(--txt2);width:54px;flex-shrink:0;text-align:right}
-.grp-bar{font-family:Consolas,monospace;font-size:10px;color:var(--txt3);width:110px;flex-shrink:0;text-align:right}
+.grp-cod{font-family:Consolas,monospace;font-size:10px;color:var(--txt2);min-width:30px;flex-shrink:0;text-align:right}
+/* Código de barras: ocupa o espaço livre da 1ª linha (base 0 = nunca força
+   quebra), alinhado à direita, colado no preço em qualquer largura de card.
+   Se não couber inteiro, termina em "…" e o title mostra o valor completo. */
+.grp-bar{font-family:Consolas,monospace;font-size:10px;color:var(--txt3);flex:1 1 0;min-width:0;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* Nome em linha própria, largura total: com qtd + código + EAN + preço na
    mesma linha sobravam ~30px (Combinar) / ~60px (Agrupar) para o nome. */
 .grp-card-item .nm{color:var(--txt);order:10;flex:1 0 100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help}
-.grp-card-item .pv{color:var(--acc);font-weight:700;flex-shrink:0;width:70px;text-align:right;margin-left:auto}
+.grp-card-item .pv{color:var(--acc);font-weight:700;flex-shrink:0;text-align:right;white-space:nowrap}
 .grp-total{display:flex;justify-content:space-between;align-items:center;margin-top:7px;padding-top:7px;border-top:1px solid var(--brd)}
 .grp-total .lbl{font-size:11px;color:var(--txt2)}
 .grp-total .val{font-size:13px;font-weight:700;color:var(--grn)}
@@ -3470,7 +3476,7 @@ function renderCombinar(combos, valor, usosSimulados) {
             row.className = 'grp-card-item';
 
             var qtdEl = document.createElement('span');
-            qtdEl.style.cssText = 'color:var(--acc);font-weight:700;min-width:24px;flex-shrink:0';
+            qtdEl.style.cssText = 'color:var(--acc);font-weight:700;min-width:18px;flex-shrink:0';
             qtdEl.textContent = c.qtd + '\u00d7';
 
             var codEl = document.createElement('span');
@@ -3485,6 +3491,7 @@ function renderCombinar(combos, valor, usosSimulados) {
             var barEl = document.createElement('span');
             barEl.className = 'grp-bar';
             barEl.textContent = c.it.codbarras || '-';
+            barEl.title = c.it.codbarras || '';
 
             var pvEl = document.createElement('span');
             pvEl.className = 'pv';
@@ -3605,6 +3612,7 @@ function renderGrupos(grupos, valor) {
             var barEl = document.createElement('span');
             barEl.className = 'grp-bar';
             barEl.textContent = it.codbarras || '-';
+            barEl.title = it.codbarras || '';
 
             var pv = document.createElement('span');
             pv.className = 'pv';
