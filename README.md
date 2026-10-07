@@ -24,6 +24,7 @@ Ele roda num PC da loja e é acessado pelo navegador, nessa máquina ou em qualq
 - [Testes e verificações](#testes-e-verificações)
 - [Segurança](#segurança)
 - [Solução de problemas](#solução-de-problemas)
+- [Histórico de versões](#histórico-de-versões)
 - [Créditos](#créditos)
 
 ---
@@ -263,6 +264,12 @@ A suíte cobre o motor de cálculo e o servidor. No servidor, testa a leitura da
 | "Porta 7888 já está em uso" | Um servidor antigo continua aberto. O `.bat` oferece encerrá-lo; ou mude `portaEstoque`. |
 | Nenhum item aparece | Veja no log a linha `Colunas:`, que mostra a tabela e as colunas detectadas. |
 | Clicar na janela do `.bat` trava o sistema | Já resolvido: o `.bat` desativa o "Modo de Edição Rápida" do console. |
+
+---
+
+## Histórico de versões
+
+O histórico completo de cada arquivo está em [`CHANGELOG.md`](CHANGELOG.md). Dentro dos arquivos, o cabeçalho traz apenas o changelog da versão atual.
 
 ---
 
