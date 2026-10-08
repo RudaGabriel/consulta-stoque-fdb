@@ -5,16 +5,12 @@
  *
  * @author Ruda Gabriel
  *
- * @version 5.39.0
+ * @version 5.40.0
  * @changelog
- *   5.39.0 - 2026-10-06 16:00 - Dois ajustes pedidos:
- *     [1] Palavras Proibidas: contador no título ("N palavras"), atualizado
- *         ao digitar, colar, sair do campo e abrir as Configurações. Conta
- *         os termos válidos (sem repetidos nem linhas vazias) — o mesmo
- *         número que será salvo.
- *     [2] Cards Agrupar/Combinar: .grp-card-item .nm conforme definido pelo
- *         usuário — flex:1 0 100% com max-width:25% (nome na mesma linha do
- *         código, limitado a 1/4 da largura; descrição completa no title).
+ *   5.40.0 - 2026-10-08 - Modo Automático: clicar em "Iniciar"
+ *     (#autoIniciarBtn) limpa a caixa de resultados (#autoOutput), esconde
+ *     o resultado/botão de copiar e descarta os códigos pendentes de
+ *     marcação do processamento anterior antes de começar o novo.
  *
  * Servidor de relatório de estoque disponível (Firebird + Node.js).
  * NÃO depende de gerar-relatorio-html.js nem servidor-relatorio.js.
@@ -4765,6 +4761,18 @@ function iniciarModoAuto(faixaExtraOverride, tentativaExtensaoOverride) {
     var inputEl  = document.getElementById('autoInput');
     var statusEl = document.getElementById('autoStatus');
     var btn      = document.getElementById('autoIniciarBtn');
+    // Cada clique em "Iniciar" começa do zero: limpa a caixa de resultados e
+    // descarta os códigos pendentes de marcação do processamento anterior
+    // (evita copiar/marcar um resultado velho enquanto o novo é calculado).
+    // Só esta função pública é chamada pelo botão — a ampliação de busca usa
+    // _iniciarModoAutoAposSync() direto e tem sua própria limpeza.
+    var outputEl = document.getElementById('autoOutput');
+    var resWrap  = document.getElementById('autoResultWrap');
+    var copyBtn  = document.getElementById('autoCopyBtn');
+    if (outputEl) outputEl.value = '';
+    if (resWrap)  resWrap.style.display = 'none';
+    if (copyBtn)  copyBtn.style.display = 'none';
+    _autoCodsParaMarcar = [];
     if (!inputEl) return;
     if (!inputEl.value.trim()) {
         if (statusEl) { statusEl.textContent = 'Cole a lista antes de iniciar.'; statusEl.className = 'auto-status er'; }
