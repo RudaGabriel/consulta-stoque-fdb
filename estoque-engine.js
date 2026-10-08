@@ -3,14 +3,21 @@
  *
  * @author Ruda Gabriel
  *
- * @version 1.6.0
+ * @version 1.7.0
  * @changelog
- *   1.6.0 - 2026-10-06 15:00 - Nova _normalizarListaProibidos(): detecta e
- *     converte para o formato aceito (um termo por linha, maiúsculas, sem
- *     vazios nem repetidos) qualquer lista colada — separada por vírgula,
- *     ponto e vírgula, "|", tab ou quebra de linha, ou como JSON. Vírgula
- *     entre dígitos é decimal e não separa. Mesma função usada no navegador
- *     e no servidor. Sem mudança nas demais funções.
+ *   1.7.0 - 2026-10-08 - Limites de estoque garantidos em toda combinação
+ *     com repetição (lista personalizada, Combinar e "Reaproveitar código"):
+ *     [1] DP: a reconstrução seguia o índice dp[v - custo], que era
+ *         sobrescrito por moedas posteriores — o mesmo bloco de unidades
+ *         entrava duas vezes e o item passava do estoque de parada, do
+ *         mínimo ou do zero (ex.: estoque 4 usado 5 vezes). Agora cada
+ *         estado guarda a referência imutável do anterior.
+ *     [2] Busca de até 3 itens conta o limite por código, não por posição
+ *         (pool com o mesmo código duas vezes).
+ *     [3] _autoEncontrarMelhorComRepeticao só devolve combinação que passa
+ *         em _grupoRespeitaLimites (antes a lista personalizada descartava a
+ *         linha inteira na validação, mesmo havendo alternativa válida).
+ *     [4] Combinar também filtra proibidos (cfg.proibidosEmbutidos/Extra).
  *
  * ARQUITETURA:
  *   - UMD wrapper: expõe via module.exports (Node) ou window globals (browser)
@@ -258,11 +265,14 @@
             var diff = +(soma - valor).toFixed(2);
             if (diff < -EPS || soma > alvoMax + EPS) return;
             if (melhor && (diff > melhor.diff || (diff === melhor.diff && idx.length >= melhor.idx.length))) return;
-            // Quantidade por código dentro do disponível (repetição: a == b etc.)
+            // Quantidade por CÓDIGO dentro do disponível (repetição: a == b etc.).
+            // Conta pelo código, não pela posição: o pool pode trazer o mesmo
+            // código mais de uma vez, e o limite de estoque é do produto.
             var cont = {};
             for (var k = 0; k < idx.length; k++) {
-                cont[idx[k]] = (cont[idx[k]] || 0) + 1;
-                if (cont[idx[k]] > cands[idx[k]].q) return;
+                var _cod = String(cands[idx[k]].it.codigo);
+                cont[_cod] = (cont[_cod] || 0) + 1;
+                if (cont[_cod] > cands[idx[k]].q) return;
             }
             melhor = { idx: idx, soma: soma, diff: diff };
         }
@@ -310,10 +320,14 @@
     function _autoEncontrarMelhorComRepeticao(pool, valor, faixaExtra, usosAcumulados, estoqueParadaPorCod, pisoPadrao) {
         if (!valor || valor <= 0 || !pool || !pool.length) return null;
         var _extraAmplo = (typeof faixaExtra === "number" && faixaExtra >= 0) ? faixaExtra : 0;
-        var amplo = _melhorAteTresItensAmplo(pool, valor, valor + FAIXA_COMBINAR + _extraAmplo,
-                                             usosAcumulados || {}, estoqueParadaPorCod || {}, pisoPadrao);
+        var _ok = function(r) {
+            return r && r.itens && r.itens.length &&
+                _grupoRespeitaLimites(r.itens, usosAcumulados, estoqueParadaPorCod, pisoPadrao) ? r : null;
+        };
+        var amplo = _ok(_melhorAteTresItensAmplo(pool, valor, valor + FAIXA_COMBINAR + _extraAmplo,
+                                                 usosAcumulados || {}, estoqueParadaPorCod || {}, pisoPadrao));
         if (amplo && amplo.diff < FLOAT_EPS) return amplo; // soma exata: nada pode ser melhor
-        var base = _melhorComRepeticaoBase(pool, valor, faixaExtra, usosAcumulados, estoqueParadaPorCod, pisoPadrao);
+        var base = _ok(_melhorComRepeticaoBase(pool, valor, faixaExtra, usosAcumulados, estoqueParadaPorCod, pisoPadrao));
         if (!amplo) return base;
         if (!base) return amplo;
         // Fica com o mais próximo do alvo; no empate, o de menos itens.
@@ -372,14 +386,20 @@
             if (moedas.length) {
                 var dp = new Array(maxCents + 1);
                 for (var _zi = 0; _zi <= maxCents; _zi++) dp[_zi] = null;
-                dp[0] = { count: 0, lastMoeda: -1, prevV: -1 };
+                // Cada estado guarda a REFERÊNCIA do estado anterior (objeto nunca
+                // alterado depois de criado), e não o índice dp[v - custo]: esse
+                // índice é sobrescrito por moedas posteriores, e a reconstrução
+                // seguia um caminho diferente do calculado — a mesma moeda entrava
+                // duas vezes e o item passava do estoque permitido (mínimo,
+                // parada ou zero).
+                dp[0] = { count: 0, moeda: -1, prev: null };
                 for (var mIdx = 0; mIdx < moedas.length; mIdx++) {
                     var moeda = moedas[mIdx];
                     for (var v = maxCents; v >= moeda.custo; v--) {
                         if (dp[v - moeda.custo]) {
                             var cnt = dp[v - moeda.custo].count + moeda.qtd;
                             if (!dp[v] || cnt < dp[v].count) {
-                                dp[v] = { count: cnt, lastMoeda: mIdx, prevV: v - moeda.custo };
+                                dp[v] = { count: cnt, moeda: mIdx, prev: dp[v - moeda.custo] };
                             }
                         }
                     }
@@ -392,15 +412,15 @@
                 }
                 if (melhorV >= 0) {
                     var itensResult = [];
-                    var cur = melhorV;
+                    var _est = dp[melhorV];
                     var _guard = 0;
-                    while (cur > 0 && dp[cur] && _guard < 5000) {
-                        var _mu = moedas[dp[cur].lastMoeda];
+                    while (_est && _est.moeda >= 0 && _guard < 5000) {
+                        var _mu = moedas[_est.moeda];
                         for (var _rep = 0; _rep < _mu.qtd; _rep++) itensResult.push(_mu.item);
-                        cur = dp[cur].prevV;
+                        _est = _est.prev;
                         _guard++;
                     }
-                    if (itensResult.length) {
+                    if (itensResult.length && _grupoRespeitaLimites(itensResult, usosAcumulados, estoqueParadaPorCod, pisoPadrao)) {
                         var sf = melhorV / 100;
                         return { itens: itensResult, soma: +sf.toFixed(2), diff: +(sf - valor).toFixed(2) };
                     }
@@ -442,7 +462,8 @@
                 if (!_achouAlgum) break;
                 if (_somaG >= alvoCents) break;
             }
-            if (_itensG.length && _somaG >= alvoCents - EPS * 100 && _somaG <= maxCents + EPS * 100) {
+            if (_itensG.length && _somaG >= alvoCents - EPS * 100 && _somaG <= maxCents + EPS * 100 &&
+                _grupoRespeitaLimites(_itensG, usosAcumulados, estoqueParadaPorCod, pisoPadrao)) {
                 var sfG = _somaG / 100;
                 return { itens: _itensG, soma: +sfG.toFixed(2), diff: +(sfG - valor).toFixed(2) };
             }
@@ -760,6 +781,8 @@
     function encontrarCombinacoesComRepeticaoAsync(itens, valor, onDone, cfg) {
         cfg = cfg || {};
         var estoqueMinimo   = typeof cfg.estoqueMinimo   === "number" ? cfg.estoqueMinimo   : 0;
+        var proibidosEmbutidos = cfg.proibidosEmbutidos != null ? cfg.proibidosEmbutidos : null;
+        var proibidosExtra     = cfg.proibidosExtra     != null ? cfg.proibidosExtra     : null;
         var maxResultados   = typeof cfg.maxResultados   === "number" ? cfg.maxResultados   : MAX_COMBINAR_RESULTADOS;
         var faixaCombinar   = typeof cfg.faixaCombinar   === "number" ? cfg.faixaCombinar   : FAIXA_COMBINAR;
         var precoSentinel   = typeof cfg.precoSentinel   === "number" ? cfg.precoSentinel   : PRECO_SENTINEL_ZERADO;
@@ -771,7 +794,8 @@
         if (onStatus) onStatus("Calculando...");
 
         var pool = itens.filter(function(it) {
-            return Number(it.preco || 0) > precoSentinel && Number(it.estoque || 0) > 0 && !it.usado;
+            return Number(it.preco || 0) > precoSentinel && Number(it.estoque || 0) > 0 && !it.usado
+                && !_ehProibidoCliente(it.descricao, proibidosEmbutidos, proibidosExtra);
         });
 
         var usosSimulados = {};
