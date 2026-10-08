@@ -9,7 +9,7 @@ Versões anteriores às listadas não estão no histórico deste repositório.
 
 ## Arquivos
 
-- [`consulta-estoque.js`](#consulta-estoquejs): Servidor e interface web. Versão atual **5.39.0**.
+- [`consulta-estoque.js`](#consulta-estoquejs): Servidor e interface web. Versão atual **5.41.0**.
 - [`estoque-engine.js`](#estoque-enginejs): Motor de cálculo (Agrupar, Combinar, Modo Automático). Versão atual **1.6.0**.
 - [`consulta-estoque.bat`](#consulta-estoquebat): Inicializador para Windows. Versão atual **5.30.0**.
 - [`consulta-estoque_test.js`](#consulta-estoque_testjs): Suíte de testes. Versão atual **2.8.0**.
@@ -21,6 +21,29 @@ Versões anteriores às listadas não estão no histórico deste repositório.
 ## consulta-estoque.js
 
 _Servidor e interface web_
+
+### 5.41.0 (2026-10-08)
+
+```text
+Configurações alinhadas: nas grades de 2 colunas
+  os rótulos ficam em 1 linha (curtos; completo no title) e as
+  explicações longas viraram dicas (.cfg-hint) abaixo das caixas — antes
+  rótulos de 1 e 3 linhas lado a lado desalinhavam as caixas de "Servidor
+  HTTP". Grade com colunas minmax(0,1fr) e caixas com largura automática
+  (box-sizing/min-width:0), sem estourar a coluna. Corrigido também o
+  bug de as caixas de texto/número ficarem com 150px: a regra global
+  input[type=text|number]{width:150px} vencia .cfg-inp por
+  especificidade; agora .cfg-field .cfg-inp força a largura total.
+```
+
+### 5.40.0 (2026-10-08)
+
+```text
+Modo Automático: clicar em "Iniciar"
+  (#autoIniciarBtn) limpa a caixa de resultados (#autoOutput), esconde
+  o resultado/botão de copiar e descarta os códigos pendentes de
+  marcação do processamento anterior antes de começar o novo.
+```
 
 ### 5.39.0 (2026-10-06 16:00)
 

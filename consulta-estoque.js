@@ -5,12 +5,17 @@
  *
  * @author Ruda Gabriel
  *
- * @version 5.40.0
+ * @version 5.41.0
  * @changelog
- *   5.40.0 - 2026-10-08 - Modo Automático: clicar em "Iniciar"
- *     (#autoIniciarBtn) limpa a caixa de resultados (#autoOutput), esconde
- *     o resultado/botão de copiar e descarta os códigos pendentes de
- *     marcação do processamento anterior antes de começar o novo.
+ *   5.41.0 - 2026-10-08 - Configurações alinhadas: nas grades de 2 colunas
+ *     os rótulos ficam em 1 linha (curtos; completo no title) e as
+ *     explicações longas viraram dicas (.cfg-hint) abaixo das caixas — antes
+ *     rótulos de 1 e 3 linhas lado a lado desalinhavam as caixas de "Servidor
+ *     HTTP". Grade com colunas minmax(0,1fr) e caixas com largura automática
+ *     (box-sizing/min-width:0), sem estourar a coluna. Corrigido também o
+ *     bug de as caixas de texto/número ficarem com 150px: a regra global
+ *     input[type=text|number]{width:150px} vencia .cfg-inp por
+ *     especificidade; agora .cfg-field .cfg-inp força a largura total.
  *
  * Servidor de relatório de estoque disponível (Firebird + Node.js).
  * NÃO depende de gerar-relatorio-html.js nem servidor-relatorio.js.
@@ -1766,14 +1771,21 @@ td{padding:7px 12px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis
          display:flex;flex-direction:column;gap:10px}
 .cfg-sec-ttl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;
               color:var(--txt2);margin-bottom:2px;display:flex;align-items:center;gap:6px}
-.cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.cfg-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px;align-items:start}
 .cfg-grid-1{display:grid;grid-template-columns:1fr;gap:8px}
-.cfg-field{display:flex;flex-direction:column;gap:4px}
+.cfg-field{display:flex;flex-direction:column;gap:4px;min-width:0}
+/* Nas grades de 2 colunas o rótulo tem sempre 1 linha: rótulos de alturas
+   diferentes desalinhavam as caixas da mesma linha. Texto longo vai para
+   a dica (.cfg-hint) abaixo da caixa; o rótulo completo fica no title. */
+.cfg-grid .cfg-lbl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cfg-hint{font-size:10px;color:var(--txt3);line-height:1.35}
 .cfg-lbl{font-size:11px;color:var(--txt2);font-weight:600}
-.cfg-inp{background:var(--bg);border:1px solid var(--brd);color:var(--txt);
+.cfg-inp{box-sizing:border-box;min-width:0;background:var(--bg);border:1px solid var(--brd);color:var(--txt);
          padding:7px 10px;border-radius:6px;font-size:12.5px;outline:none;
          transition:border-color .15s;width:100%;font-family:Consolas,monospace}
 .cfg-inp:focus{border-color:var(--acc)}
+/* Especificidade (0,2,0) vence input[type=text|number]{width:150px} global (0,1,1) */
+.cfg-field .cfg-inp{width:100%;max-width:100%;align-self:stretch}
 .cfg-inp::placeholder{color:var(--txt3);opacity:1}
 .cfg-ta{resize:vertical;min-height:88px;font-family:Consolas,monospace;line-height:1.65;font-size:12px}
 .cfg-note{font-size:10.5px;color:var(--txt3);line-height:1.5;display:flex;align-items:flex-start;gap:5px}
@@ -2091,20 +2103,24 @@ html.perf-baixa .spin-svg{animation:sp 1.6s linear infinite!important}
         </div>
         <div class="cfg-grid">
           <div class="cfg-field">
-            <label class="cfg-lbl" for="cfgPorta">Porta HTTP</label>
+            <label class="cfg-lbl" for="cfgPorta" title="Porta HTTP">Porta HTTP</label>
             <input class="cfg-inp" id="cfgPorta" type="number" placeholder="7888" min="1024" max="65534" style="font-family:inherit">
+            <span class="cfg-hint">Padr&atilde;o: 7888 &middot; exige reiniciar</span>
           </div>
           <div class="cfg-field">
-            <label class="cfg-lbl" for="cfgEstMin">Estoque m&iacute;nimo &mdash; itens com quantidade abaixo s&atilde;o exclu&iacute;dos da listagem (padr&atilde;o: 5)</label>
+            <label class="cfg-lbl" for="cfgEstMin" title="Estoque m&iacute;nimo">Estoque m&iacute;nimo</label>
             <input class="cfg-inp" id="cfgEstMin" type="number" placeholder="5" min="0" max="9999" step="1" style="font-family:inherit">
+            <span class="cfg-hint">Abaixo disso o item sai da listagem (padr&atilde;o: 5)</span>
           </div>
           <div class="cfg-field">
-            <label class="cfg-lbl" for="cfgMaxItens">M&aacute;x. itens carregados do banco (100&ndash;20000, padr&atilde;o: 2000) &mdash; aplicado imediatamente</label>
+            <label class="cfg-lbl" for="cfgMaxItens" title="M&aacute;ximo de itens carregados do banco">M&aacute;x. itens do banco</label>
             <input class="cfg-inp" id="cfgMaxItens" type="number" placeholder="2000" min="100" max="20000" step="100" style="font-family:inherit">
+            <span class="cfg-hint">100&ndash;20000 (padr&atilde;o: 2000) &middot; aplicado na hora</span>
           </div>
           <div class="cfg-field">
-            <label class="cfg-lbl" for="cfgAppName">Nome da aplica&ccedil;&atilde;o</label>
+            <label class="cfg-lbl" for="cfgAppName" title="Nome da aplica&ccedil;&atilde;o">Nome da aplica&ccedil;&atilde;o</label>
             <input class="cfg-inp" id="cfgAppName" type="text" placeholder="Consulta Estoque">
+            <span class="cfg-hint">Exige reiniciar</span>
           </div>
         </div>
         <span class="cfg-note cfg-note-warn">
