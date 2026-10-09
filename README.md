@@ -49,7 +49,7 @@ Ele roda num PC da loja e é acessado pelo navegador, nessa máquina ou em qualq
 | **Busca por valor (R$)** | Informe um valor para ativar o **Agrupar** ou o **Combinar**. |
 | **Agrupar** | Encontra **pares e trios de itens diferentes** cuja soma fica entre o valor e o valor + R$ 40, respeitando o estoque mínimo. |
 | **Combinar** | Encontra combinações **com repetição do mesmo item** (ex.: `3×08395`), respeitando o estoque disponível. Os itens só são marcados como usados depois que você confirma. |
-| **Usar** | Copia o código para a área de transferência e marca o item como usado. Antes disso, avisa se o estoque está abaixo do mínimo. |
+| **Usar** | Copia o código para a área de transferência e marca o item como usado. Antes disso, avisa se o uso deixaria o estoque abaixo do mínimo. |
 | **Ordenação** | Por estoque, preço ou data da última venda, crescente ou decrescente (a escolha fica salva no navegador). |
 | **Copiar coluna** | Um clique no cabeçalho **Código** ou **Cód. Barras** copia todos os valores do filtro atual, não só as linhas visíveis. |
 | **Itens exibidos** | Limite de linhas na tabela. A tabela é desenhada aos poucos, conforme a rolagem, para não travar com milhares de itens. |
@@ -173,7 +173,7 @@ O arquivo é **opcional**: sem ele, o sistema detecta o banco sozinho. Quase tod
 | `fdbPath` | detectado | Caminho do `.FDB` **no servidor do banco**. |
 | `fbUser` / `fbPassword` | `SYSDBA` / padrão de instalação | Credenciais do Firebird. Sem senha configurada, o log mostra um aviso de segurança. |
 | `portaEstoque` | `7888` | Porta HTTP da interface, de 1024 a 65535 (mudar exige reiniciar). |
-| `estoqueMinimo` | `5` | Itens abaixo desse valor só entram para completar a lista. |
+| `estoqueMinimo` | `5` | Itens abaixo desse valor só entram para completar a lista. Nas sugestões (Agrupar, Combinar e Modo Automático), um item só é usado se, depois do uso, o estoque continuar maior ou igual a esse valor. |
 | `maxItens` | `2000` | Itens enviados à interface, de 100 a 20.000. |
 | `proibidos` | `[]` | Termos a excluir das sugestões (a lista de fábrica é vazia). |
 

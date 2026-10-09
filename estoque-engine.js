@@ -3,21 +3,16 @@
  *
  * @author Ruda Gabriel
  *
- * @version 1.7.0
+ * @version 1.8.0
  * @changelog
- *   1.7.0 - 2026-10-08 - Limites de estoque garantidos em toda combinação
- *     com repetição (lista personalizada, Combinar e "Reaproveitar código"):
- *     [1] DP: a reconstrução seguia o índice dp[v - custo], que era
- *         sobrescrito por moedas posteriores — o mesmo bloco de unidades
- *         entrava duas vezes e o item passava do estoque de parada, do
- *         mínimo ou do zero (ex.: estoque 4 usado 5 vezes). Agora cada
- *         estado guarda a referência imutável do anterior.
- *     [2] Busca de até 3 itens conta o limite por código, não por posição
- *         (pool com o mesmo código duas vezes).
- *     [3] _autoEncontrarMelhorComRepeticao só devolve combinação que passa
- *         em _grupoRespeitaLimites (antes a lista personalizada descartava a
- *         linha inteira na validação, mesmo havendo alternativa válida).
- *     [4] Combinar também filtra proibidos (cfg.proibidosEmbutidos/Extra).
+ *   1.8.0 - 2026-10-09 - Estoque mínimo com regra única em todos os modos:
+ *     depois do uso o estoque nunca fica abaixo do mínimo (mesma lógica do
+ *     estoque de parada). Antes, Agrupar e o modo padrão aceitavam item com
+ *     estoque IGUAL ao mínimo (que ficava 1 abaixo), enquanto Combinar e
+ *     "Reaproveitar código" o recusavam. Ex.: mínimo 5 → estoque 5 não é
+ *     usado, estoque 6 libera 1 unidade, estoque 5,5 não é usado.
+ *     encontrarGruposAsync e _validarResultadoPadrao passam a usar
+ *     _qtdMaximaDisponivel / _grupoRespeitaLimites com piso = mínimo.
  *
  * ARQUITETURA:
  *   - UMD wrapper: expõe via module.exports (Node) ou window globals (browser)
@@ -556,6 +551,10 @@
     // Camada defensiva: rejeita resultado que viola código duplicado, estoque
     // mínimo ou itens proibidos. Aceita listas de proibidos explicitamente
     // (para testes determinísticos) com fallback para globais no browser.
+    // Estoque mínimo (regra única, v1.8.0): depois do uso o estoque nunca fica
+    // abaixo do mínimo — mesma lógica do estoque de parada. Ex.: mínimo 5,
+    // estoque 5 → não pode usar; estoque 6 → 1 unidade. pisoPadrao é aceito
+    // por compatibilidade; o piso efetivo é o maior entre ele e estoqueMinimo.
     function _validarResultadoPadrao(resultado, estoqueMinimo, usosAcumulados, pisoPadrao, proibidosEmbutidos, proibidosExtra) {
         if (!resultado || !resultado.itens || !resultado.itens.length) return null;
         var permiteRepeticao = !!usosAcumulados;
@@ -564,12 +563,12 @@
             var it = resultado.itens[i];
             if (vistos[it.codigo] && !permiteRepeticao) return null;
             vistos[it.codigo] = true;
-            if (Number(it.estoque || 0) < Number(estoqueMinimo || 0)) return null;
             if (_ehProibidoCliente(it.descricao, proibidosEmbutidos, proibidosExtra)) return null;
         }
-        if (permiteRepeticao && !_grupoRespeitaLimites(resultado.itens, usosAcumulados, null, pisoPadrao)) {
-            return null;
-        }
+        var _min  = Number(estoqueMinimo || 0);
+        var _piso = (typeof pisoPadrao === "number" && pisoPadrao > _min) ? pisoPadrao : _min;
+        if (!Number.isFinite(_piso) || _piso < 0) _piso = 0;
+        if (!_grupoRespeitaLimites(resultado.itens, usosAcumulados || {}, null, _piso)) return null;
         return resultado;
     }
 
@@ -672,7 +671,8 @@
             var cands = itens.filter(function(it) {
                 var p = Number(it.preco || 0);
                 if (!(p > PRECO_SENTINEL_ZERADO && p <= alvoMax + EPS && !it.usado)) return false;
-                if (Number(it.estoque || 0) < estoqueMinimo) return false;
+                // Cada item entra uma vez: precisa de 1 unidade ACIMA do mínimo.
+                if (_qtdMaximaDisponivel(it, null, null, estoqueMinimo) < 1) return false;
                 if (_ehProibidoCliente(it.descricao, proibidosEmbutidos, proibidosExtra)) return false;
                 return true;
             });

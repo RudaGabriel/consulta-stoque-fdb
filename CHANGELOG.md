@@ -9,10 +9,10 @@ Versões anteriores às listadas não estão no histórico deste repositório.
 
 ## Arquivos
 
-- [`consulta-estoque.js`](#consulta-estoquejs): Servidor e interface web. Versão atual **5.42.0**.
-- [`estoque-engine.js`](#estoque-enginejs): Motor de cálculo (Agrupar, Combinar, Modo Automático). Versão atual **1.7.0**.
+- [`consulta-estoque.js`](#consulta-estoquejs): Servidor e interface web. Versão atual **5.43.0**.
+- [`estoque-engine.js`](#estoque-enginejs): Motor de cálculo (Agrupar, Combinar, Modo Automático). Versão atual **1.8.0**.
 - [`consulta-estoque.bat`](#consulta-estoquebat): Inicializador para Windows. Versão atual **5.30.0**.
-- [`consulta-estoque_test.js`](#consulta-estoque_testjs): Suíte de testes. Versão atual **2.9.0**.
+- [`consulta-estoque_test.js`](#consulta-estoque_testjs): Suíte de testes. Versão atual **2.10.0**.
 - [`validar-client.js`](#validar-clientjs): Validador do JavaScript da interface. Versão atual **1.0.0**.
 - [`node-firebird.bat`](#node-firebirdbat): Instalador avulso do Node.js e do node-firebird. Versão atual **1.1.1**.
 
@@ -21,6 +21,17 @@ Versões anteriores às listadas não estão no histórico deste repositório.
 ## consulta-estoque.js
 
 _Servidor e interface web_
+
+### 5.43.0 (2026-10-09)
+
+```text
+Estoque mínimo com regra única (motor 1.8.0):
+  um item só é sugerido se, depois do uso, o estoque continuar maior ou
+  igual ao mínimo — em Agrupar, Combinar, Modo Automático (com ou sem
+  "Reaproveitar código"). O aviso do botão "Usar" segue a mesma regra:
+  avisa quando o uso DEIXARIA o estoque abaixo do mínimo, contando as
+  repetições do mesmo código, e mostra com quanto o item ficaria.
+```
 
 ### 5.42.0 (2026-10-08)
 
@@ -381,6 +392,19 @@ BUG REAL corrigido: alerta "código não existe
 
 _Motor de cálculo (Agrupar, Combinar, Modo Automático)_
 
+### 1.8.0 (2026-10-09)
+
+```text
+Estoque mínimo com regra única em todos os modos:
+  depois do uso o estoque nunca fica abaixo do mínimo (mesma lógica do
+  estoque de parada). Antes, Agrupar e o modo padrão aceitavam item com
+  estoque IGUAL ao mínimo (que ficava 1 abaixo), enquanto Combinar e
+  "Reaproveitar código" o recusavam. Ex.: mínimo 5 → estoque 5 não é
+  usado, estoque 6 libera 1 unidade, estoque 5,5 não é usado.
+  encontrarGruposAsync e _validarResultadoPadrao passam a usar
+  _qtdMaximaDisponivel / _grupoRespeitaLimites com piso = mínimo.
+```
+
 ### 1.7.0 (2026-10-08)
 
 ```text
@@ -536,6 +560,14 @@ Passa a rodar as verificacoes de integridade
 ## consulta-estoque_test.js
 
 _Suíte de testes_
+
+### 2.10.0 (2026-10-09)
+
+```text
+Testes da regra única do estoque mínimo (motor
+  1.8.0): estoque igual ao mínimo recusado, mínimo + 1 aceito, estoque
+  fracionado, repetição do mesmo código e Agrupar no limite exato.
+```
 
 ### 2.9.0 (2026-10-08)
 
