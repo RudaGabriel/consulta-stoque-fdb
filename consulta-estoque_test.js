@@ -5,13 +5,12 @@
  *
  * @author Ruda Gabriel
  *
- * @version 2.8.0
+ * @version 2.9.0
  * @changelog
- *   2.8.0 - 2026-10-06 15:00 - Testes de _normalizarListaProibidos
- *     (estoque-engine.js 1.6.0): formato aceito preservado; vírgula, ponto e
- *     vírgula, "|", tab e JSON convertidos; decimal "1,5" preservado; aspas,
- *     espaços, vazios e repetidos tratados. Suíte cobre engine + servidor
- *     sem banco, sem porta e sem gravar arquivos.
+ *   2.9.0 - 2026-10-08 - Testes de limites de estoque (motor 1.7.0): caso
+ *     mínimo do bug do DP (estoque 4 usado 5 vezes), 400 cenários aleatórios
+ *     com consumo acumulado, estoque de parada e mínimo, mesmo código em duas
+ *     posições do pool, e Combinar com estoque mínimo e proibidos.
  *
  * EXECUÇÃO:
  *   node --test consulta-estoque_test.js
@@ -848,5 +847,70 @@ describe("servidor — carregarItens() com driver falso", () => {
         });
         assert.equal(bancoFalso.attachs - antes, 2);
         assert.equal(srv._estadoParaTestes().lpConfiavel, true);
+    });
+});
+
+describe("limites de estoque respeitados em toda combinação com repetição", () => {
+    test("DP não usa o mesmo item além do estoque (bug da reconstrução por índice)", () => {
+        // Antes: C1 (estoque 4) saía 5 vezes — o caminho reconstruído reutilizava
+        // um bloco de unidades que o DP já tinha consumido.
+        const pool = [
+            { codigo: "C0", estoque: 5, preco: 12 },
+            { codigo: "C1", estoque: 4, preco: 24 }
+        ];
+        const r = _autoEncontrarMelhorComRepeticao(pool, 127, 0, {}, {}, 0);
+        if (r) assert.ok(_grupoRespeitaLimites(r.itens, {}, {}, 0), JSON.stringify(r.itens.map(i => i.codigo)));
+    });
+
+    test("estoque de parada, mínimo e zero: aleatório com consumo acumulado", () => {
+        let seed = 99;
+        const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+        const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+        for (let t = 0; t < 400; t++) {
+            const pool = [];
+            const n = ri(2, 8);
+            for (let i = 0; i < n; i++) pool.push({ codigo: "K" + i, estoque: ri(0, 12), preco: ri(1, 40) });
+            const parada = {};
+            pool.forEach(it => { if (rnd() < 0.5) parada[it.codigo] = ri(0, 6); });
+            const piso = ri(0, 4);
+            const usos = {};
+            for (let l = 0; l < 5; l++) {
+                const r = _autoEncontrarMelhorComRepeticao(pool, ri(10, 300), 0, usos, parada, piso);
+                if (!r) continue;
+                assert.ok(_grupoRespeitaLimites(r.itens, usos, parada, piso), "combinação acima do permitido");
+                r.itens.forEach(it => { usos[it.codigo] = (usos[it.codigo] || 0) + 1; });
+            }
+            pool.forEach(it => {
+                const u = usos[it.codigo] || 0;
+                const limite = parada[it.codigo] != null ? parada[it.codigo] : piso;
+                if (u) assert.ok(it.estoque - u >= limite, it.codigo + " passou do limite");
+            });
+        }
+    });
+
+    test("mesmo código em duas posições do pool conta UM limite (busca de até 3 itens)", () => {
+        const a = { codigo: "D1", estoque: 1, preco: 50 };
+        const b = { codigo: "D1", estoque: 1, preco: 50 };
+        const r = _autoEncontrarMelhorComRepeticao([a, b], 100, 0, {}, {}, 0);
+        if (r) assert.ok(r.itens.filter(i => i.codigo === "D1").length <= 1);
+    });
+
+    test("Combinar respeita o estoque mínimo e ignora proibidos", async () => {
+        const itens = [
+            { codigo: "M1", descricao: "ITEM BOM",      estoque: 7, preco: 24 },
+            { codigo: "M2", descricao: "MARCA VETADA",  estoque: 50, preco: 25 },
+            { codigo: "M3", descricao: "OUTRO ITEM",    estoque: 6, preco: 12 }
+        ];
+        const combos = await new Promise(res => encontrarCombinacoesComRepeticaoAsync(itens, 96, res,
+            { estoqueMinimo: 4, proibidosEmbutidos: [], proibidosExtra: ["VETADA"] }));
+        for (const c of combos) {
+            const cont = {};
+            c.itens.forEach(it => { cont[it.codigo] = (cont[it.codigo] || 0) + 1; });
+            assert.ok(!cont.M2, "item proibido não pode aparecer");
+            for (const cod in cont) {
+                const it = itens.find(x => x.codigo === cod);
+                assert.ok(it.estoque - cont[cod] >= 4, cod + " ficou abaixo do mínimo");
+            }
+        }
     });
 });

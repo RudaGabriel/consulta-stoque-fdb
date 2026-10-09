@@ -9,10 +9,10 @@ Versões anteriores às listadas não estão no histórico deste repositório.
 
 ## Arquivos
 
-- [`consulta-estoque.js`](#consulta-estoquejs): Servidor e interface web. Versão atual **5.41.0**.
-- [`estoque-engine.js`](#estoque-enginejs): Motor de cálculo (Agrupar, Combinar, Modo Automático). Versão atual **1.6.0**.
+- [`consulta-estoque.js`](#consulta-estoquejs): Servidor e interface web. Versão atual **5.42.0**.
+- [`estoque-engine.js`](#estoque-enginejs): Motor de cálculo (Agrupar, Combinar, Modo Automático). Versão atual **1.7.0**.
 - [`consulta-estoque.bat`](#consulta-estoquebat): Inicializador para Windows. Versão atual **5.30.0**.
-- [`consulta-estoque_test.js`](#consulta-estoque_testjs): Suíte de testes. Versão atual **2.8.0**.
+- [`consulta-estoque_test.js`](#consulta-estoque_testjs): Suíte de testes. Versão atual **2.9.0**.
 - [`validar-client.js`](#validar-clientjs): Validador do JavaScript da interface. Versão atual **1.0.0**.
 - [`node-firebird.bat`](#node-firebirdbat): Instalador avulso do Node.js e do node-firebird. Versão atual **1.1.1**.
 
@@ -21,6 +21,21 @@ Versões anteriores às listadas não estão no histórico deste repositório.
 ## consulta-estoque.js
 
 _Servidor e interface web_
+
+### 5.42.0 (2026-10-08)
+
+```text
+Auditoria de estoque mínimo, estoque de parada e
+  proibidos em todos os modos (motor 1.7.0):
+  [1] Combinar e lista personalizada não passam mais do estoque permitido
+      (bug da reconstrução do DP no motor — ver estoque-engine.js 1.7.0).
+  [2] Combinar recebe a lista de proibidos (defesa caso a lista mude
+      antes da próxima recarga dos itens).
+  [3] Lista personalizada: o mesmo produto escrito de formas diferentes
+      ("703" e "00703") entra uma vez só no pool — antes cada forma tinha
+      o próprio contador e, somadas, passavam do estoque de parada/zero.
+      O estoque de parada fica ligado ao código que de fato entrou no pool.
+```
 
 ### 5.41.0 (2026-10-08)
 
@@ -366,6 +381,24 @@ BUG REAL corrigido: alerta "código não existe
 
 _Motor de cálculo (Agrupar, Combinar, Modo Automático)_
 
+### 1.7.0 (2026-10-08)
+
+```text
+Limites de estoque garantidos em toda combinação
+  com repetição (lista personalizada, Combinar e "Reaproveitar código"):
+  [1] DP: a reconstrução seguia o índice dp[v - custo], que era
+      sobrescrito por moedas posteriores — o mesmo bloco de unidades
+      entrava duas vezes e o item passava do estoque de parada, do
+      mínimo ou do zero (ex.: estoque 4 usado 5 vezes). Agora cada
+      estado guarda a referência imutável do anterior.
+  [2] Busca de até 3 itens conta o limite por código, não por posição
+      (pool com o mesmo código duas vezes).
+  [3] _autoEncontrarMelhorComRepeticao só devolve combinação que passa
+      em _grupoRespeitaLimites (antes a lista personalizada descartava a
+      linha inteira na validação, mesmo havendo alternativa válida).
+  [4] Combinar também filtra proibidos (cfg.proibidosEmbutidos/Extra).
+```
+
 ### 1.6.0 (2026-10-06 15:00)
 
 ```text
@@ -503,6 +536,15 @@ Passa a rodar as verificacoes de integridade
 ## consulta-estoque_test.js
 
 _Suíte de testes_
+
+### 2.9.0 (2026-10-08)
+
+```text
+Testes de limites de estoque (motor 1.7.0): caso
+  mínimo do bug do DP (estoque 4 usado 5 vezes), 400 cenários aleatórios
+  com consumo acumulado, estoque de parada e mínimo, mesmo código em duas
+  posições do pool, e Combinar com estoque mínimo e proibidos.
+```
 
 ### 2.8.0 (2026-10-06 15:00)
 
