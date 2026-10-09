@@ -5,12 +5,11 @@
  *
  * @author Ruda Gabriel
  *
- * @version 2.9.0
+ * @version 2.10.0
  * @changelog
- *   2.9.0 - 2026-10-08 - Testes de limites de estoque (motor 1.7.0): caso
- *     mínimo do bug do DP (estoque 4 usado 5 vezes), 400 cenários aleatórios
- *     com consumo acumulado, estoque de parada e mínimo, mesmo código em duas
- *     posições do pool, e Combinar com estoque mínimo e proibidos.
+ *   2.10.0 - 2026-10-09 - Testes da regra única do estoque mínimo (motor
+ *     1.8.0): estoque igual ao mínimo recusado, mínimo + 1 aceito, estoque
+ *     fracionado, repetição do mesmo código e Agrupar no limite exato.
  *
  * EXECUÇÃO:
  *   node --test consulta-estoque_test.js
@@ -912,5 +911,29 @@ describe("limites de estoque respeitados em toda combinação com repetição", 
                 assert.ok(it.estoque - cont[cod] >= 4, cod + " ficou abaixo do mínimo");
             }
         }
+    });
+});
+
+describe("estoque mínimo — regra única: depois do uso nunca fica abaixo do mínimo", () => {
+    test("_validarResultadoPadrao: estoque = mínimo é recusado; mínimo + 1 passa", () => {
+        assert.equal(_validarResultadoPadrao({ itens: [item("A", 10, 5, "X")] }, 5, null, null, []), null);
+        assert.ok(_validarResultadoPadrao({ itens: [item("A", 10, 6, "X")] }, 5, null, null, []));
+        // fracionado: 5,5 com mínimo 5 → usar 1 deixaria 4,5
+        assert.equal(_validarResultadoPadrao({ itens: [item("A", 10, 5.5, "X")] }, 5, null, null, []), null);
+    });
+
+    test("_validarResultadoPadrao com repetição: conta as unidades do mesmo código", () => {
+        const a = item("A", 10, 7, "X");
+        assert.ok(_validarResultadoPadrao({ itens: [a, a] }, 5, {}, 5, []));
+        assert.equal(_validarResultadoPadrao({ itens: [a, a, a] }, 5, {}, 5, []), null);
+    });
+
+    test("Agrupar: item com estoque igual ao mínimo não entra", (_, done) => {
+        const itens = [item("A", 20, 5, "X"), item("B", 30, 9, "Y"), item("C", 20, 6, "Z")];
+        encontrarGruposAsync(itens, 50, function(grupos) {
+            for (const g of grupos) assert.ok(!g.itens.some(i => i.codigo === "A"), "A está no mínimo");
+            assert.ok(grupos.some(g => g.itens.some(i => i.codigo === "C")), "C (mínimo + 1) deve poder entrar");
+            done();
+        }, null, null, { estoqueMinimo: 5, proibidosEmbutidos: [], proibidosExtra: [] });
     });
 });
